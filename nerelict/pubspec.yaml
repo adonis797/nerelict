@@ -1,0 +1,27 @@
+name: nerelict
+description: "Browse the web, sniff HLS (m3u8) streams, download them offline."
+publish_to: 'none'
+version: 0.4.0+20
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  webview_flutter: ^4.10.0
+  webview_flutter_android: ^4.14.1
+  dio: ^5.7.0
+  path_provider: ^2.1.5
+  provider: ^6.1.0
+  pointycastle: ^3.9.1
+  shared_preferences: ^2.5.6
+  video_player: ^2.14.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
