@@ -156,9 +156,10 @@ flutter build apk --release --target-platform android-arm64
 adb install -r build/app/outputs/flutter-apk/app-release.apk
 ```
 
-产物：`build/app/outputs/flutter-apk/app-release.apk`（约 21 MB，arm64-v8a 单架构，debug 签名）。
-只面向 64 位 ARM 新设备，不含 32 位与 x86_64 原生库；如需模拟器支持，
-把参数改为 `--target-platform android-arm64,android-x64`，详见根目录 `README.md` 的构建说明。
+产物：`build/app/outputs/flutter-apk/app-release.apk`（约 20 MB，arm64-v8a 单架构，
+由本机 `android/key.properties` 指定的 keystore 签名，未配置时回退 debug 签名）。
+只面向 64 位 ARM 新设备，`armeabi-v7a` 与 `x86_64` 的插件 so 已在打包阶段剔除；如需模拟器支持，
+把参数改为 `--target-platform android-arm64,android-x64` 并调整 `packaging` 排除规则，详见根目录 `README.md`。
 应用名来自 `android/app/src/main/res/values/strings.xml` 的 `app_name`，
 桌面显示「Nerelict」，`applicationId` 为 `com.nerelict.nerelict`。
 
@@ -263,7 +264,7 @@ m3u8 命中 fetch/XHR/performance/video/页面地址任一即可；mp4 等直链
   原 `.ts` 文件仍然可用。fMP4 分片本身输出就是 `.mp4`，不显示转换按钮。
 - Service Worker、WebSocket 推流或 blob 地址的站点可能嗅探不到。
 - 直播流（无 `#EXT-X-ENDLIST`）只下载当前列表里的分片。
-- 应用图标仍是 Flutter 默认图标；release 包使用 debug 签名，未上架配置。
+- 应用图标仍是 Flutter 默认图标；release 包由本机 keystore 签名，未上传应用商店。
 - 播放器：DRM（Widevine / ChinaDRM / SAMPLE-AES）、MSE/EME、`blob:` 地址、短时效签名 URL 不承诺支持；
   AV1、杜比视界、AC3/E-AC3 等编解码能力随设备而异；DASH 由系统解码器决定，未做专门适配。
 - 投屏只提供系统投屏设置入口，未接入设备发现 / DLNA / Cast 协议；网络流无法截取纹理画面，

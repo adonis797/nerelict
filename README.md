@@ -72,7 +72,29 @@ x86_64 模拟器暂不在支持范围（标准镜像会报 `INSTALL_FAILED_NO_MA
 将来需要模拟器时，把参数换成 `--target-platform android-arm64,android-x64` 即可，
 无需改动源码，产物会相应增大约 21 MB。
 
-当前 release 使用 debug 签名，仅供本地验证，未配置上架签名。
+## 签名
+
+release 构建会读取 `nerelict/android/key.properties`（本机文件，已忽略）中的 keystore 信息，
+用它给 `app-release.apk` 做正式签名；该文件不存在时自动回退 debug 签名，
+因此克隆仓库后不做任何签名配置也能直接构建。
+
+要自己出发布包，用 `keytool` 生成一份 keystore，再新建 `nerelict/android/key.properties`：
+
+```properties
+storePassword=你的库密码
+keyPassword=你的库密码
+keyAlias=你的别名
+storeFile=/keystore/的绝对路径/release.jks
+```
+
+路径用正斜杠或双反斜杠。keystore 与密码放在仓库之外并做好备份——
+**换一份签名后，已安装用户无法覆盖升级，只能卸载重装**。
+验证签名是否生效：
+
+```bash
+"$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs \
+  nerelict/build/app/outputs/flutter-apk/app-release.apk
+```
 
 ## 国内网络（可选，本机配置，不要提交）
 
