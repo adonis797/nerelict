@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
@@ -32,11 +34,41 @@ android {
         versionName = flutter.versionName
     }
 
+    // 发布构建只保留 arm64-v8a：Flutter 引擎只有这一套，其它 ABI 只剩插件的小 so，
+    // 设备能装但启动会崩。这里在打包阶段剔除，让不支持的设备直接报不兼容。
+    // 需要模拟器时删掉这两条，或按 README 用 --target-platform 指定。
+    packaging {
+        jniLibs {
+            excludes += listOf("lib/armeabi-v7a/**", "lib/x86_64/**")
+        }
+    }
+
+    signingConfigs {
+        create("release") {
+            // 签名材料放在 android/key.properties（含本机路径与密码，已忽略、不入库）。
+            // 文件缺失时留空，由下面的 buildTypes 回退到 debug 签名，
+            // 保证他人 clone 后无需任何配置也能构建。
+            val propsFile = rootProject.file("key.properties")
+            if (propsFile.exists()) {
+                val props = Properties().apply {
+                    propsFile.inputStream().use { load(it) }
+                }
+                props.getProperty("storeFile")?.let { storeFile = file(it) }
+                storePassword = props.getProperty("storePassword")
+                keyAlias = props.getProperty("keyAlias")
+                keyPassword = props.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            // 配了正式签名就用它发布；没配则回退 debug 签名，便于本地验证与他人构建。
+            signingConfig = if (signingConfigs.getByName("release").storeFile != null) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 }
