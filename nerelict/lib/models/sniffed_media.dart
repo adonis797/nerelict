@@ -1,6 +1,6 @@
 /// 聚合后的一类媒体资源。
 enum MediaKind {
-  /// HLS 播放列表（master / media playlist），可直接交给 MA8N播放
+  /// HLS 播放列表（master / media playlist），可直接交给 Nerelict 播放
   playlist,
 
   /// 一组同视频的分片（没有配套播放列表时），只能作为整体下载
@@ -56,7 +56,7 @@ class SniffedMedia {
   int get segmentCount => _segments.length;
   List<String> get segmentUrls => List.unmodifiable(_segments.toList());
 
-  /// 只有 HLS 播放列表能直接交给 MA8N
+  /// 只有 HLS 播放列表能直接交给 Nerelict
   bool get isPlayable => kind == MediaKind.playlist;
 
   /// 分片组没有播放列表，需要把已收集的分片作为一个整体下载

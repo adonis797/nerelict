@@ -81,7 +81,7 @@ class MediaSource {
       final name = parts.isEmpty ? '' : parts.last;
       return name.isEmpty ? '本地视频' : name;
     }
-    return uri.host.isEmpty ? 'MA8N' : uri.host;
+    return uri.host.isEmpty ? 'Nerelict' : uri.host;
   }
 
   String get badge => local ? '本地' : kind.label;

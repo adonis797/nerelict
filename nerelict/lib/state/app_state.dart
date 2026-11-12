@@ -504,7 +504,7 @@ class AppState extends ChangeNotifier {
 
   int get activeCount => _tasks.where((t) => t.status.isActive).length;
 
-  // ---- MA8N浮层：不跳转路由，保持当前页面不变 ----
+  // ---- Nerelict 浮层：不跳转路由，保持当前页面不变 ----
   PlayerRequest? _player;
   PlayerRequest? get player => _player;
 

@@ -6,6 +6,7 @@ import '../services/apk_installer.dart';
 import '../services/app_log.dart';
 import '../services/player_core.dart' show kPlaybackSpeeds;
 import '../services/storage_service.dart';
+import '../services/streaming_proxy.dart';
 import '../state/app_state.dart';
 import '../state/settings_state.dart';
 import 'app_theme.dart';
@@ -18,7 +19,7 @@ import 'widgets/app_menu.dart';
 class SettingsTab extends StatefulWidget {
   const SettingsTab({super.key});
 
-  static const String appVersion = '0.4.0';
+  static const String appVersion = '0.4.1';
 
   @override
   State<SettingsTab> createState() => _SettingsTabState();
@@ -89,7 +90,7 @@ class _SettingsTabState extends State<SettingsTab> {
         ),
         _SettingsEntry(
           title: '通知栏 / 锁屏媒体控制',
-          category: 'MA8N',
+          category: 'Nerelict 播放器',
           icon: Icons.notifications_active_outlined,
           keywords: const <String>['媒体', '通知', '锁屏', '播放控制'],
           value: s.playerMediaControls ? '已开启' : '已关闭',
@@ -97,7 +98,7 @@ class _SettingsTabState extends State<SettingsTab> {
         ),
         _SettingsEntry(
           title: '自动续播',
-          category: 'MA8N',
+          category: 'Nerelict 播放器',
           icon: Icons.replay_circle_filled_outlined,
           keywords: const <String>['续播', '记忆', '进度', '继续'],
           value: s.playerAutoResume ? '已开启' : '已关闭',
@@ -105,7 +106,7 @@ class _SettingsTabState extends State<SettingsTab> {
         ),
         _SettingsEntry(
           title: '画面手势',
-          category: 'MA8N',
+          category: 'Nerelict 播放器',
           icon: Icons.touch_app_outlined,
           keywords: const <String>['手势', '双击', '快进', '音量', '亮度', '倍速'],
           value: s.playerGestures ? '已开启' : '已关闭',
@@ -113,15 +114,23 @@ class _SettingsTabState extends State<SettingsTab> {
         ),
         _SettingsEntry(
           title: '边下边播缓存',
-          category: 'MA8N',
+          category: 'Nerelict 播放器',
           icon: Icons.cached_outlined,
           keywords: const <String>['缓存', '边下边播', '代理'],
           value: s.playerStreamingCache ? '已开启' : '已关闭',
           page: _playerPage,
         ),
         _SettingsEntry(
+          title: '播放缓存',
+          category: 'Nerelict 播放器',
+          icon: Icons.storage_outlined,
+          keywords: const <String>['缓存', '占用', '清理', '上限', '分片'],
+          value: '上限 ${s.playerCacheLimitMb}MB',
+          page: _playerPage,
+        ),
+        _SettingsEntry(
           title: '默认倍速',
-          category: 'MA8N',
+          category: 'Nerelict 播放器',
           icon: Icons.speed,
           keywords: const <String>['倍速', '速度', '播放速度'],
           value: s.playerSpeedLabel,
@@ -275,10 +284,10 @@ class _SettingsTabState extends State<SettingsTab> {
                 Divider(height: 1, color: p.border),
                 _CategoryTile(
                   icon: Icons.play_circle_outline,
-                  title: 'MA8N',
+                  title: 'Nerelict 播放器',
                   value: settings.playerMediaControls ? '媒体控制 开' : '媒体控制 关',
                   p: p,
-                  onTap: () => _open(context, 'MA8N', _playerPage),
+                  onTap: () => _open(context, 'Nerelict 播放器', _playerPage),
                 ),
               ],
             ),
@@ -598,7 +607,7 @@ List<Widget> _playbackPage(
           title: const Text('自动接管网页视频'),
           subtitle: Text(
             settings.autoTakeover
-                ? '已启用 · 检测到视频时在当前页打开 MA8N'
+                ? '已启用 · 检测到视频时在当前页打开 Nerelict'
                 : '已关闭 · 视频继续在网页内播放，仅保留嗅探',
           ),
           secondary: Icon(Icons.smart_display_outlined, color: p.accent),
@@ -616,7 +625,14 @@ List<Widget> _playerPage(
 ) {
   return <Widget>[
     _SettingCard(
-      titles: ['通知栏 / 锁屏媒体控制', '自动续播', '画面手势', '边下边播缓存', '默认倍速'],
+      titles: [
+        '通知栏 / 锁屏媒体控制',
+        '自动续播',
+        '画面手势',
+        '边下边播缓存',
+        '播放缓存',
+        '默认倍速',
+      ],
       children: <Widget>[
         SwitchListTile(
           value: settings.playerMediaControls,
@@ -649,10 +665,13 @@ List<Widget> _playerPage(
           value: settings.playerStreamingCache,
           onChanged: settings.setPlayerStreamingCache,
           title: const Text('边下边播缓存'),
-          subtitle: const Text('HLS 分片经本地代理缓存复用，上限 256MB；关闭时直连播放'),
+          subtitle: Text(
+              'HLS 分片经本地代理缓存复用，上限 ${settings.playerCacheLimitMb}MB；关闭时直连播放'),
           secondary: Icon(Icons.cached_outlined, color: p.accent),
           contentPadding: const EdgeInsets.symmetric(horizontal: 14),
         ),
+        Divider(height: 1, color: p.border),
+        _PlaybackCacheTile(p: p),
         Divider(height: 1, color: p.border),
         _PickerRow<double>(
           icon: Icons.speed,
@@ -1241,6 +1260,121 @@ class _InfoRow extends StatelessWidget {
           Text(label, style: TextStyle(fontSize: 13, color: p.textSub)),
           const Spacer(),
           Text(value, style: TextStyle(fontSize: 12, color: p.textFaint)),
+        ],
+      ),
+    );
+  }
+}
+
+/// 播放缓存：展示真实占用、切换上限档位、手动清理。
+///
+/// 占用量直接问 `StreamingProxy`，不缓存估算值；清理后重新统计并给出反馈。
+class _PlaybackCacheTile extends StatefulWidget {
+  const _PlaybackCacheTile({required this.p});
+
+  final AppPalette p;
+
+  @override
+  State<_PlaybackCacheTile> createState() => _PlaybackCacheTileState();
+}
+
+class _PlaybackCacheTileState extends State<_PlaybackCacheTile> {
+  int _bytes = 0;
+  bool _loading = true;
+  bool _clearing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+  }
+
+  Future<void> _refresh() async {
+    final bytes = await StreamingProxy.instance.cacheSizeBytes();
+    if (!mounted) return;
+    setState(() {
+      _bytes = bytes;
+      _loading = false;
+    });
+  }
+
+  Future<void> _clear() async {
+    if (_clearing) return;
+    setState(() => _clearing = true);
+    final freed = await StreamingProxy.instance.clearCache();
+    await _refresh();
+    if (!mounted) return;
+    setState(() => _clearing = false);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(freed > 0
+            ? '已清理播放缓存 ${_formatSize(freed)}'
+            : '没有需要清理的播放缓存'),
+      ),
+    );
+  }
+
+  static String _formatSize(int bytes) {
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(0)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final settings = context.watch<SettingsState>();
+    final p = widget.p;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Icon(Icons.storage_outlined, size: 20, color: p.accent),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text('播放缓存',
+                    style: TextStyle(fontSize: 13.5, color: p.text)),
+              ),
+              Text(
+                _loading ? '统计中…' : '已占用 ${_formatSize(_bytes)}',
+                style: TextStyle(fontSize: 11.5, color: p.textFaint),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text('缓存上限', style: TextStyle(fontSize: 11.5, color: p.textFaint)),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 8,
+            runSpacing: 2,
+            children: <Widget>[
+              for (final mb in kCacheLimitOptionsMb)
+                Builder(builder: (context) {
+                  final selected = settings.playerCacheLimitMb == mb;
+                  return ChoiceChip(
+                    label: Text('$mb MB'),
+                    labelStyle: TextStyle(
+                        fontSize: 11, color: selected ? p.text : p.textFaint),
+                    selected: selected,
+                    selectedColor: p.accent.withValues(alpha: 0.22),
+                    backgroundColor: p.surfaceAlt,
+                    side: BorderSide(
+                        color: selected ? p.accent : p.border, width: 0.8),
+                    onSelected: (_) async {
+                      await settings.setPlayerCacheLimitMb(mb);
+                      await _refresh();
+                    },
+                  );
+                }),
+            ],
+          ),
+          const SizedBox(height: 10),
+          OutlinedButton.icon(
+            onPressed: _clearing ? null : _clear,
+            icon: const Icon(Icons.cleaning_services_outlined, size: 16),
+            label: Text(_clearing ? '清理中…' : '清理播放缓存'),
+          ),
         ],
       ),
     );

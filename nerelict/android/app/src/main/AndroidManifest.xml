@@ -15,7 +15,8 @@
         android:label="@string/app_name"
         android:usesCleartextTraffic="true"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round">
         <activity
             android:name="com.nerelict.nerelict.MainActivity"
             android:exported="true"

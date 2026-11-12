@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 与深色主题 surfaceDeep 一致，用于自适应图标背景与启动图底色 -->
+    <color name="ic_launcher_background">#FF10141B</color>
+</resources>

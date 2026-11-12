@@ -33,7 +33,7 @@ class LocalFile {
     return dot > 0 ? name.substring(0, dot) : name;
   }
 
-  /// 只有视频能在 MA8N 里直接播放；其他类型走文件管理（信息 / 重命名 / 删除）
+  /// 只有视频能在 Nerelict 里直接播放；其他类型走文件管理（信息 / 重命名 / 删除）
   bool get isPlayable => kind == LocalFileKind.video;
 
   bool get isMp4 => extension == '.mp4';

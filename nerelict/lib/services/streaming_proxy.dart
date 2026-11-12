@@ -13,27 +13,53 @@ import 'playlist_rewriter.dart';
 /// 播放器指向 127.0.0.1 的代理地址，代理回源 playlist / 分片时把分片
 /// 落到应用私有缓存目录；下次播放同一地址直接命中本地文件。
 /// 默认关闭（设置项），关闭时播放链路完全走原来的直连地址。
-/// 缓存有 256MB 上限并会在启动时清理，避免和「下载完成导出」双份占空间。
+/// 缓存上限默认 256MB，可在设置里调整；启动时按上限裁剪旧分片，
+/// 避免和「下载完成导出」双份占空间。占用与清理对设置页公开。
 class StreamingProxy {
   StreamingProxy._();
 
   static final StreamingProxy instance = StreamingProxy._();
 
   static const int kMaxCacheBytes = 256 * 1024 * 1024;
+  static const String kCacheDirName = 'nerelict_play_cache';
+  static const String kLegacyCacheDirName = 'ma8_play_cache';
 
   HttpServer? _server;
   int _port = 0;
   Directory? _cacheDir;
   int _writes = 0;
   int _cacheSeq = 0;
+  int _maxCacheBytes = kMaxCacheBytes;
+  bool _legacyPurged = false;
 
   bool get running => _server != null;
+
+  int get maxCacheBytes => _maxCacheBytes;
+
+  set maxCacheBytes(int value) =>
+      _maxCacheBytes = value > 0 ? value : kMaxCacheBytes;
+
+  /// 换名前的缓存目录：首次访问缓存时一次性删掉，避免旧分片白占空间。
+  Future<void> _purgeLegacyDir() async {
+    if (_legacyPurged) return;
+    _legacyPurged = true;
+    try {
+      final base = await getTemporaryDirectory();
+      final legacy = Directory(joinPath(base.path, kLegacyCacheDirName));
+      if (await legacy.exists()) await legacy.delete(recursive: true);
+    } catch (_) {}
+  }
+
+  Future<Directory> _cacheDirectory() async {
+    final base = await getTemporaryDirectory();
+    return Directory(joinPath(base.path, kCacheDirName));
+  }
 
   Future<Directory> _dir() async {
     final dir = _cacheDir;
     if (dir != null) return dir;
-    final base = await getTemporaryDirectory();
-    final created = Directory(joinPath(base.path, 'ma8_play_cache'));
+    await _purgeLegacyDir();
+    final created = await _cacheDirectory();
     if (!await created.exists()) await created.create(recursive: true);
     _cacheDir = created;
     await trimCache();
@@ -167,7 +193,7 @@ class StreamingProxy {
       request.response.headers
           .set(HttpHeaders.contentTypeHeader, cachedContentType(target));
       request.response.headers.set(HttpHeaders.contentLengthHeader, bytes.length);
-      request.response.headers.set('X-MA8N-Cache', 'HIT');
+      request.response.headers.set('X-Nerelict-Cache', 'HIT');
       request.response.add(bytes);
       await request.response.close();
       return;
@@ -203,7 +229,7 @@ class StreamingProxy {
         final Uint8List bytes = builder.takeBytes();
         request.response.headers
             .set(HttpHeaders.contentLengthHeader, bytes.length);
-        request.response.headers.set('X-MA8N-Cache', 'MISS');
+        request.response.headers.set('X-Nerelict-Cache', 'MISS');
         request.response.add(bytes);
         await request.response.close();
         try {
@@ -236,10 +262,45 @@ class StreamingProxy {
     }
   }
 
+  /// 当前缓存占用字节数（供设置页展示）；顺带清理换名前的旧目录。
+  Future<int> cacheSizeBytes() async {
+    try {
+      await _purgeLegacyDir();
+      final dir = await _cacheDirectory();
+      if (!await dir.exists()) return 0;
+      var total = 0;
+      await for (final entity in dir.list(followLinks: false)) {
+        if (entity is! File) continue;
+        try {
+          total += (await entity.stat()).size;
+        } catch (_) {}
+      }
+      return total;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /// 清空播放缓存并返回释放的字节数；已打开的响应流不受影响。
+  Future<int> clearCache() async {
+    final before = await cacheSizeBytes();
+    try {
+      final dir = await _cacheDirectory();
+      if (!await dir.exists()) return 0;
+      await for (final entity in dir.list(followLinks: false)) {
+        try {
+          await entity.delete(recursive: true);
+        } catch (_) {}
+      }
+    } catch (_) {}
+    _cacheDir = null;
+    return before;
+  }
+
   /// 按修改时间从新到旧保留，超过上限的旧分片删除。
   Future<void> trimCache() async {
     try {
-      final dir = await _dir0();
+      final dir = await _cacheDirectory();
       if (!await dir.exists()) return;
       final files = await dir
           .list()
@@ -254,18 +315,13 @@ class StreamingProxy {
       var total = 0;
       for (final e in stats) {
         total += e.value.size;
-        if (total > kMaxCacheBytes) {
+        if (total > _maxCacheBytes) {
           try {
             await e.key.delete();
           } catch (_) {}
         }
       }
     } catch (_) {}
-  }
-
-  Future<Directory> _dir0() async {
-    final base = await getTemporaryDirectory();
-    return Directory(joinPath(base.path, 'ma8_play_cache'));
   }
 
   Future<void> stop() async {

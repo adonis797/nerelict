@@ -6,7 +6,7 @@
 /// 3. 扫描 <video>/<source> 的 src —— 兜住直接用标签播放的页面。
 ///
 /// 上报分两类：
-/// - `playlist`：m3u8（含 master / 码率变体），可直接交给 MA8N播放与统一下载；
+/// - `playlist`：m3u8（含 master / 码率变体），可直接交给 Nerelict 播放与统一下载；
 /// - `segment`：`.ts` / `.m4s` / fMP4 分片，由 Dart 侧聚合到所属视频，不单独成项。
 ///
 /// mp4 等直链视频仍由 PlayerChannel 独立处理，保持原有播放行为不变。

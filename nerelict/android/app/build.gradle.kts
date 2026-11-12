@@ -28,7 +28,7 @@ android {
         // You can force using the value of versionCode by specifying the `-P force-version-code-ignoring-abi=true`
         // flag during build.
         // 版本号统一以 pubspec 的三段版本为唯一来源：
-        // version = 0.4.0+20 → versionName 0.4.0 / versionCode 20。
+        // version = 0.4.1+21 → versionName 0.4.1 / versionCode 21。
         // 不再覆盖第四段，避免设置页、README 与设备显示三处不一致。
         versionCode = flutter.versionCode
         versionName = flutter.versionName

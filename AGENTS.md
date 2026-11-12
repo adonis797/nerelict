@@ -57,6 +57,7 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 | `verify_p0.dart` | 重定向 base、直播标记、续传不串片、直链 `If-Range` |
 | `verify_p1.dart` | `ss_*` 残留清理、直链背压写盘、中途暂停状态收敛 |
 | `verify_download.dart` | 真实公开测试流跑“解析 → 分片 → 解密 → 合并”（依赖公网，可能超时） |
+| `smoke_device.dart` | 真机冒烟：冷启动、三页切换、截图、崩溃日志（需要 adb + 设备，**不进常规回归链**） |
 | `verify_file_manager.dart` / `verify_v2_features.dart` / `verify_v34.dart` / `verify_v334.dart` | 文件管理、直链分流、转换策略、文件类型与主题解析 |
 | `serve_test_hls.dart` | 起本地 HLS 服务，配合 `adb reverse` 做真机端到端 |
 
@@ -64,7 +65,7 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 
 ## 版本号规则（用户已定，不要自行发挥）
 
-- 三段式：`pubspec.yaml` 的 `version: 0.4.0+20`，`+20` 是 Android `versionCode`，整数、只增不减，每次发版 +1。
+- 三段式：`pubspec.yaml` 的 `version: 0.4.1+21`，`+21` 是 Android `versionCode`，整数、只增不减，每次发版 +1。
 - `versionName` 由 `android/app/build.gradle.kts` 的 `flutter.versionName` 直取三段，**不覆盖第四段**。
 - 第三段按整数顺延（`0.4.0` → `0.4.9` → `0.4.10`），**不逢十进一**；提升第二、第一段必须先得到用户明确同意。
 - 发版需同步四处：`pubspec.yaml`、`lib/ui/settings_tab.dart` 的 `appVersion`、`README.md`（`nerelict/` 内）的版本历史、`tool/verify_v35.dart` 第 9 节断言。以下路径均相对 `nerelict/`。
@@ -80,6 +81,9 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 
 ## 代码约定
 
+- **对外品牌统一为 `Nerelict`**：播放器在设置里叫「Nerelict 播放器」，源码注释、
+  文案、缓存目录、通知渠道与持久化键一律不用历史代号。旧键只能以「迁移常量」形式出现，
+  `verify_v35.dart` 第 23 节会扫描并阻止回归。
 - **状态管理用 `provider` + `ChangeNotifier`**（`lib/state/` 下 `AppState` / `SettingsState` / `HistoryState` / `WebFavoritesState`），不引入其他状态库。
 - **JS 注入脚本与 Dart 通信走 `JavaScriptChannel`**：`SniffChannel`（嗅探）、`PlayerChannel`（可播放视频探测与接管）、`FloatChannel`（网页 `<video>` 长按浮标）。三个脚本各自包一层 `fetch` / `XHR` / `media src`，链式调用必须互不干扰。
 - **原生能力走 `MethodChannel`，两端名字必须同步改**：`com.nerelict/mp4`、`com.nerelict/storage`、`com.nerelict/player`、`com.nerelict/screen`、`com.nerelict/install`、`com.nerelict/network`。Dart 端在 `lib/services/*.dart`，Kotlin 端在 `MainActivity.kt` 注册。

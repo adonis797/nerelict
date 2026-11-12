@@ -183,7 +183,7 @@ class _FileManagerSheetState extends State<_FileManagerSheet> {
             _InfoLine('类型', file.typeLabel, p),
             _InfoLine('大小', file.sizeText, p),
             _InfoLine('修改时间', file.dateText, p),
-            _InfoLine('播放', file.isPlayable ? '可由 MA8N播放' : '不支持直接播放', p),
+            _InfoLine('播放', file.isPlayable ? '可由 Nerelict 播放' : '不支持直接播放', p),
             _InfoLine('关联任务', linked > 0 ? '$linked 个' : '无（独立文件）', p),
           ],
         ),

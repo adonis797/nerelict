@@ -100,7 +100,7 @@ class M8BrowserApp extends StatelessWidget {
   }
 }
 
-/// 负责 MA8N浮层的定位与拖动。
+/// 负责 Nerelict 浮层的定位与拖动。
 ///
 /// 默认仍贴在底部（保持原布局）；用户从标题栏拖动后改用绝对定位，
 /// 位置写入 SharedPreferences，关闭再打开、甚至重启应用都保持不变。

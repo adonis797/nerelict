@@ -194,14 +194,14 @@ void main() {
 
   stdout.writeln('=== 9. 版本号与二级设置 ===');
   final pubspec = read('pubspec.yaml');
-  check(pubspec.contains('version: 0.4.0+20'), 'pubspec 基础版本为 0.4.0 / code 20');
+  check(pubspec.contains('version: 0.4.1+21'), 'pubspec 基础版本为 0.4.1 / code 21');
   final gradle = read('android/app/build.gradle.kts');
   check(gradle.contains('versionName = flutter.versionName'),
       '展示版本统一取 pubspec 三段版本');
   check(!gradle.contains('versionName = "0.3.9.0"'), '不再覆盖第四段展示版本');
   final settingsFile = read('lib/ui/settings_tab.dart');
-  check(settingsFile.contains("appVersion = '0.4.0'"), '设置页版本为 0.4.0');
-  check(read('README.md').contains('v0.4.0'), 'README 版本号已同步');
+  check(settingsFile.contains("appVersion = '0.4.1'"), '设置页版本为 0.4.1');
+  check(read('README.md').contains('v0.4.1'), 'README 版本号已同步');
   check(settingsFile.contains('_CategoryTile'), '设置改为分类入口');
   check(settingsFile.contains('_SettingsPage'), '存在二级设置页');
   check(settingsFile.contains("'常规'") && settingsFile.contains("'播放'"),
@@ -462,6 +462,114 @@ void main() {
       '转换 / 导出 / 完成链路各 await 点都有脱离守卫');
   check(projectFile('tool/verify_p1.dart').existsSync(),
       '提供可运行的 P1 行为测试');
+
+  stdout.writeln('=== 23. 发版护栏、品牌命名与 0.4.1 资源 ===');
+  // 已正式发布的最高 versionCode；每次 Release 后上调，防止忘记 +1 或复用旧码
+  const int publishedVersionCode = 20;
+  final pubspecText = read('pubspec.yaml');
+  final settingsText = read('lib/ui/settings_tab.dart');
+  final gradleText = read('android/app/build.gradle.kts');
+  final readmeText = read('README.md');
+  final versionLine = RegExp(
+          r'^version:\s*([0-9]+\.[0-9]+\.[0-9]+)\+([0-9]+)\s*$',
+          multiLine: true)
+      .firstMatch(pubspecText);
+  final semver = versionLine?.group(1) ?? '';
+  final currentCode = int.tryParse(versionLine?.group(2) ?? '') ?? 0;
+  check(semver == '0.4.1', '当前展示版本为 0.4.1');
+  check(currentCode > publishedVersionCode,
+      'versionCode $currentCode 严格大于已发布最高值 $publishedVersionCode');
+  check(settingsText.contains("appVersion = '$semver'"),
+      '设置页版本与 pubspec 三段版本一致');
+  check(readmeText.contains('v$semver'), 'README 版本历史含 v$semver');
+  check(gradleText.contains('versionCode = flutter.versionCode') &&
+          gradleText.contains('versionName = flutter.versionName'),
+      'Gradle 版本号统一由 pubspec 派生');
+  check(!RegExp(r'versionName\s*=\s*"').hasMatch(gradleText),
+      'Gradle 未硬编码展示版本');
+
+  // MA8N 代号只允许以「迁移旧键」的形式残留，其余一律视为回归
+  const legacyBrandKeys = <String>{
+    'ma8_player_favorites',
+    'ma8_playback_memory',
+    'ma8_play_cache',
+    'ma8_player_media',
+  };
+  final brandSources = <File>[
+    ...Directory(joinPath(projectRoot, 'lib')).listSync(recursive: true).whereType<File>(),
+    ...Directory(joinPath(projectRoot, 'tool')).listSync(recursive: true).whereType<File>(),
+    ...Directory(joinPath(projectRoot, 'android/app/src/main'))
+        .listSync(recursive: true)
+        .whereType<File>(),
+    projectFile('README.md'),
+    projectFile('../README.md'),
+    projectFile('../AGENTS.md'),
+  ];
+  final brandResidue = <String>[];
+  for (final f in brandSources) {
+    if (!f.existsSync()) continue;
+    // 检查器自身持有旧代号字面量，跳过以免自我命中
+    if (f.path.endsWith('verify_v35.dart')) continue;
+    if (!RegExp(r'\.(dart|kt|md|xml)$').hasMatch(f.path)) continue;
+    final text = f.readAsStringSync();
+    // 只查大写代号，避免把小写迁移键（`ma8_...`）误判成回归
+    if (RegExp(r'MA8N|MA8播放器|MA8Player|"MA8"|MA8_').hasMatch(text) ||
+        text.toLowerCase().contains('ma8n')) {
+      brandResidue.add(f.path);
+    }
+    for (final m
+        in RegExp(r'ma8_[a-z_]+', caseSensitive: false).allMatches(text)) {
+      final key = m.group(0)!.toLowerCase();
+      if (!legacyBrandKeys.contains(key)) brandResidue.add('${f.path}: $key');
+    }
+  }
+  check(brandResidue.isEmpty,
+      '源码与文档已统一为 Nerelict（残留 ${brandResidue.take(3).join(' / ')}）');
+  final favoritesText = read('lib/services/favorites.dart');
+  final memoryText = read('lib/services/playback_memory.dart');
+  check(favoritesText.contains('kLegacyStorageKey') &&
+          favoritesText.contains('_migrate(prefs)'),
+      '收藏键换名带一次性迁移，不丢历史收藏');
+  check(memoryText.contains('kLegacyStorageKey') &&
+          memoryText.contains('_migrate(prefs)'),
+      '续播记忆键换名带一次性迁移');
+  check(read('android/app/src/main/kotlin/com/nerelict/nerelict/PlayerPlatform.kt')
+          .contains('deleteNotificationChannel(LEGACY_CHANNEL_ID)'),
+      '旧通知渠道会被主动删除，不残留孤儿渠道');
+
+  const res = 'android/app/src/main/res/';
+  check(projectFile('${res}mipmap-anydpi-v26/ic_launcher.xml').existsSync() &&
+          projectFile('${res}mipmap-anydpi-v26/ic_launcher_round.xml').existsSync(),
+      '提供 Android 12+ 自适应图标');
+  check(projectFile('${res}drawable/ic_launcher_foreground.xml').existsSync(),
+      '自适应图标前景为矢量资源');
+  check(read('android/app/src/main/AndroidManifest.xml')
+      .contains('android:roundIcon'), '清单声明圆形图标');
+  var iconsOk = true;
+  for (final dpi in const <String>[
+    'mdpi', 'hdpi', 'xhdpi', 'xxhdpi', 'xxxhdpi'
+  ]) {
+    final f = projectFile('${res}mipmap-$dpi/ic_launcher.png');
+    if (!f.existsSync() || f.lengthSync() < 1500) iconsOk = false;
+  }
+  check(iconsOk, '五档密度图标均已替换默认 Flutter 图标');
+
+  final proxyText = read('lib/services/streaming_proxy.dart');
+  check(proxyText.contains('Future<int> cacheSizeBytes()') &&
+          proxyText.contains('Future<int> clearCache()'),
+      '播放代理提供占用统计与清理');
+  check(proxyText.contains('set maxCacheBytes') &&
+          proxyText.contains('total > _maxCacheBytes'),
+      '缓存上限可配置且裁剪按生效值执行');
+  check(proxyText.contains("kLegacyCacheDirName = 'ma8_play_cache'"),
+      '旧缓存目录换名后有清理入口');
+  final settingsStateText = read('lib/state/settings_state.dart');
+  check(settingsStateText.contains('kCacheLimitOptionsMb') &&
+          settingsStateText.contains('setPlayerCacheLimitMb'),
+      '设置层持久化缓存上限档位');
+  check(settingsText.contains('_PlaybackCacheTile'), '设置页展示缓存占用与清理');
+  check(projectFile('tool/smoke_device.dart').existsSync(),
+      '提供可独立运行的真机冒烟脚本');
 
   stdout.writeln();
   if (failures.isEmpty) {

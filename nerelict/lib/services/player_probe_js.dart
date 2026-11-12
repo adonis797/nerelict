@@ -1,7 +1,7 @@
 /// 注入到 WebView 的「可播放视频」探测脚本。
 ///
 /// 与 kSniffJs 互相独立：SniffChannel 只负责 m3u8 嗅探下载列表，
-/// PlayerChannel 负责发现可交给 MA8N播放的视频地址
+/// PlayerChannel 负责发现可交给 Nerelict 播放的视频地址
 /// （m3u8 / mp4 等直链），两者互不干扰。
 ///
 /// 判定策略（尽量少误触发普通网页浏览）：
@@ -120,7 +120,7 @@ const String kPlayerProbeJs = r'''
 })();
 ''';
 
-/// 打开 MA8N前，暂停网页里所有 <video>，避免同时出声
+/// 打开 Nerelict 前，暂停网页里所有 <video>，避免同时出声
 const String kPauseWebVideosJs = r'''
 (function () {
   try {

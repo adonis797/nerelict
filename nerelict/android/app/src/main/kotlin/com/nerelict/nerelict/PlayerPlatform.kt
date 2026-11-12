@@ -35,7 +35,7 @@ import java.io.FileOutputStream
 import kotlin.math.roundToInt
 
 /**
- * media_session 层：把系统级播放能力以 MethodChannel 暴露给 MA8播放器。
+ * media_session 层：把系统级播放能力以 MethodChannel 暴露给 Nerelict 播放器。
  *
  * 只包含 framework API，不新增第三方依赖；能力不支持或权限缺失时降级返回，
  * 不会影响 Flutter 侧的播放链路。
@@ -45,7 +45,8 @@ class PlayerPlatform(
     private val channel: MethodChannel
 ) {
     companion object {
-        private const val CHANNEL_ID = "ma8_player_media"
+        private const val CHANNEL_ID = "nerelict_player_media"
+        private const val LEGACY_CHANNEL_ID = "ma8_player_media"
         private const val NOTIFICATION_ID = 8801
         private const val ACTION_MEDIA = "com.nerelict.nerelict.MEDIA_ACTION"
         private const val REQ_NOTIFICATION = 2002
@@ -62,7 +63,7 @@ class PlayerPlatform(
     private var receiverRegistered = false
     private var sessionEnabled = false
 
-    private var lastTitle = "MA8播放器"
+    private var lastTitle = "Nerelict 播放器"
     private var lastPlaying = false
     private var lastPositionMs = 0L
     private var lastDurationMs = 0L
@@ -164,7 +165,7 @@ class PlayerPlatform(
             receiverRegistered = true
         }
         if (mediaSession == null) {
-            val session = MediaSession(activity, "MA8Player")
+            val session = MediaSession(activity, "NerelictPlayer")
             session.setFlags(
                 MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or
                     MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS
@@ -221,7 +222,7 @@ class PlayerPlatform(
         session.setMetadata(
             MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_TITLE, lastTitle)
-                .putString(MediaMetadata.METADATA_KEY_ARTIST, "MA8播放器 · Nerelict")
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, "Nerelict · 媒体播放")
                 .putLong(MediaMetadata.METADATA_KEY_DURATION, lastDurationMs)
                 .build()
         )
@@ -247,7 +248,7 @@ class PlayerPlatform(
         )
         builder.setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle(lastTitle)
-            .setContentText("MA8播放器")
+            .setContentText("Nerelict 播放器")
             .setContentIntent(open)
             .setOngoing(lastPlaying)
             .setOnlyAlertOnce(true)
@@ -298,11 +299,14 @@ class PlayerPlatform(
 
     private fun ensureChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // 通知渠道 ID 一旦创建便常驻系统设置；换名后主动删掉旧渠道，
+            // 避免残留两条同名渠道、用户之前的通知开关失效。
+            notificationManager.deleteNotificationChannel(LEGACY_CHANNEL_ID)
             val existing = notificationManager.getNotificationChannel(CHANNEL_ID)
             if (existing == null) {
                 val c = NotificationChannel(
                     CHANNEL_ID,
-                    "MA8播放器",
+                    "Nerelict 播放器",
                     NotificationManager.IMPORTANCE_LOW
                 )
                 c.description = "播放控制与媒体按键"
@@ -478,10 +482,10 @@ class PlayerPlatform(
                 if (bitmap == null) throw IllegalStateException("该位置没有可解码画面")
                 val dir = File(
                     activity.getExternalFilesDir(Environment.DIRECTORY_PICTURES),
-                    "MA8"
+                    "Nerelict"
                 )
                 if (!dir.exists()) dir.mkdirs()
-                val out = File(dir, "MA8_${System.currentTimeMillis()}.jpg")
+                val out = File(dir, "Nerelict_${System.currentTimeMillis()}.jpg")
                 FileOutputStream(out).use { stream ->
                     bitmap!!.compress(Bitmap.CompressFormat.JPEG, 90, stream)
                 }

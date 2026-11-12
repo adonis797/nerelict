@@ -46,7 +46,7 @@ class ManagedFile {
         _ => '${extension.substring(1).toUpperCase()} 文件',
       };
 
-  /// 只有视频能交给 MA8N 播放，其余类型用于文件管理
+  /// 只有视频能交给 Nerelict 播放，其余类型用于文件管理
   bool get isPlayable => const <String>{
         '.mp4',
         '.m4v',

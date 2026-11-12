@@ -2,7 +2,7 @@
 ///
 /// 与 kSniffJs / kPlayerProbeJs 完全独立：不 Hook fetch/XHR、不改 DOM 属性、
 /// 不做自动上报，只在用户长按（或长按菜单）网页里的 <video> 时通过
-/// FloatChannel 上报一次当前视频地址，由 Flutter 侧显示「用 MA8N打开」浮标。
+/// FloatChannel 上报一次当前视频地址，由 Flutter 侧显示「用 Nerelict 打开」浮标。
 /// 因此不会改变原有自动嗅探、自动接管与资源聚合行为。
 const String kVideoFloatJs = r'''
 (function () {

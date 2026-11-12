@@ -72,11 +72,26 @@ class PlaybackRecord {
 
 /// 播放进度记忆：SharedPreferences 持久化，最多保留 50 条。
 class PlaybackMemory {
-  static const String kStorageKey = 'ma8_playback_memory';
+  static const String kStorageKey = 'nerelict_playback_memory';
+
+  /// 旧版键：首次读取时一次性搬到新键并删除旧键，避免换名后续播记录丢失。
+  static const String kLegacyStorageKey = 'ma8_playback_memory';
+  static bool _migrationDone = false;
+
+  static Future<void> _migrate(SharedPreferences prefs) async {
+    if (_migrationDone) return;
+    _migrationDone = true;
+    if (prefs.containsKey(kStorageKey)) return;
+    final legacy = prefs.getString(kLegacyStorageKey);
+    if (legacy == null) return;
+    await prefs.setString(kStorageKey, legacy);
+    await prefs.remove(kLegacyStorageKey);
+  }
 
   Future<List<PlaybackRecord>> all() async {
     try {
       final prefs = await SharedPreferences.getInstance();
+      await _migrate(prefs);
       final raw = prefs.getString(kStorageKey);
       if (raw == null) return <PlaybackRecord>[];
       final list = (jsonDecode(raw) as List<dynamic>)
@@ -138,6 +153,7 @@ class PlaybackMemory {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(kStorageKey);
+      await prefs.remove(kLegacyStorageKey);
     } catch (_) {}
   }
 }

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  自适应图标前景：108dp viewport，图形全部落在中心 66dp 安全区内。
+  开口圆环象征「打捞网」，白色三角是播放，下方小点是被捞起的流媒体片段。
+  与 mipmap-*/ic_launcher.png 的几何保持一致。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:pathData="M 44.02,65.85 A 17.4,17.4 0 1,1 63.98,65.85"
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#FF00E5FF"
+        android:strokeWidth="3.3"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M 50.4,45.6 L 50.4,60 L 61.2,52.8 Z"
+        android:fillColor="#FFF4F7FC" />
+    <path
+        android:pathData="M 51.9,71.4 A 2.1,2.1 0 1,0 56.1,71.4 A 2.1,2.1 0 1,0 51.9,71.4 Z"
+        android:fillColor="#FF4C8DFF" />
+</vector>

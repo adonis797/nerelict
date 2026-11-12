@@ -86,7 +86,7 @@ class DownloadTask {
       filePath!.toLowerCase().endsWith('.ts') &&
       conversion != ConversionState.converting;
 
-  /// 可在 MA8N里直接播放的成品（优先 MP4）
+  /// 可在 Nerelict 里直接播放的成品（优先 MP4）
   String? get playablePath => mp4Path ?? filePath;
 
   /// 发现该源的页面地址，下载时作为 Referer 带上（很多 CDN 会校验）

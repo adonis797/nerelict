@@ -46,7 +46,7 @@ class MainActivity : FlutterActivity() {
         configureNetworkChannel(flutterEngine)
     }
 
-    /** MA8播放器：通知栏媒体控制、音频焦点、亮度、PIP、截帧、分享。 */
+    /** Nerelict 播放器：通知栏媒体控制、音频焦点、亮度、PIP、截帧、分享。 */
     private fun configurePlayerChannel(flutterEngine: FlutterEngine) {
         val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, PLAYER_CHANNEL)
         val platform = PlayerPlatform(this, channel)

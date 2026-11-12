@@ -45,10 +45,10 @@ class _BrowserTabState extends State<BrowserTab> {
   /// 当前网页地址（用于网页收藏星标状态）
   String? _currentUrl;
 
-  /// 当前页面里已经处理过的视频地址，避免关闭 MA8N后反复接管
+  /// 当前页面里已经处理过的视频地址，避免关闭 Nerelict 后反复接管
   final Set<String> _handled = <String>{};
 
-  /// 网页视频长按后出现的「用 MA8N打开」浮标
+  /// 网页视频长按后出现的「用 Nerelict 打开」浮标
   String? _floatUrl;
   String _floatPage = '';
   String _floatTitle = '';
@@ -216,7 +216,7 @@ class _BrowserTabState extends State<BrowserTab> {
     }
   }
 
-  /// 网页里检测到可播放视频 -> 在当前页面上打开 MA8N浮层。
+  /// 网页里检测到可播放视频 -> 在当前页面上打开 Nerelict 浮层。
   /// 不做任何路由跳转，WebView 页面、滚动位置与浏览状态都不被打断。
   Future<void> _onPlayerMessage(String raw) async {
     if (!mounted || _state.player != null) return;
@@ -238,7 +238,7 @@ class _BrowserTabState extends State<BrowserTab> {
       final page = (data['page'] as String?) ?? '';
       final title = (data['title'] as String?) ?? '';
 
-      // 先暂停网页里的 <video>，避免和 MA8N同时出声
+      // 先暂停网页里的 <video>，避免和 Nerelict 同时出声
       try {
         await _controller.runJavaScript(kPauseWebVideosJs);
       } catch (_) {}
@@ -648,7 +648,7 @@ class _StartPage extends StatelessWidget {
             p: p,
             index: '2',
             title: '自动接管播放',
-            desc: '检测到可播放视频时在当前页打开 MA8N，支持 HLS / MP4',
+            desc: '检测到可播放视频时在当前页打开 Nerelict，支持 HLS / MP4',
           ),
           _Step(
             p: p,
@@ -1306,7 +1306,7 @@ class _VideoFloatEntry extends StatelessWidget {
             GestureDetector(
               onTap: onOpen,
               child: const Text(
-                '用 MA8N打开',
+                '用 Nerelict 打开',
                 style: TextStyle(
                   fontSize: 12,
                   color: Colors.white,
@@ -1862,7 +1862,7 @@ class _SniffSheetState extends State<_SniffSheet> {
         children: <Widget>[
           if (m.isPlayable)
             IconButton(
-              tooltip: '用 MA8N打开',
+              tooltip: '用 Nerelict 打开',
               icon: Icon(Icons.play_circle_outline, color: p.accent),
               onPressed: () {
                 Navigator.of(context).pop();

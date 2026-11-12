@@ -31,7 +31,7 @@ enum _MoreAction {
   clearMemory,
 }
 
-/// MA8N：浮层 / 全屏 / 迷你小窗三态共用同一个播放内核。
+/// Nerelict：浮层 / 全屏 / 迷你小窗三态共用同一个播放内核。
 ///
 /// 位置与置顶层级由 material app builder 里的 _PlayerLayer 负责；
 /// 本组件只处理播放、交互与不同形态下的布局。
@@ -683,7 +683,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
         break;
       case _MoreAction.share:
         final text = _source.local
-            ? '${_source.displayTitle} · 来自 Nerelict MA8N'
+            ? '${_source.displayTitle} · 来自 Nerelict 播放器'
             : '${_source.displayTitle}\n${widget.request.url}';
         await PlayerPlatform.instance.shareText(text);
         break;
@@ -1272,7 +1272,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
             IconButton(
               visualDensity: VisualDensity.compact,
               icon: Icon(Icons.close, size: 19, color: p.textSub),
-              tooltip: '关闭 MA8N',
+              tooltip: '关闭 Nerelict',
               onPressed: widget.onClose,
             ),
           ],
@@ -1463,7 +1463,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
             Padding(
               padding: const EdgeInsets.only(top: 6),
               child: Text(
-                'MA8N无法直接播放该内容：$_error',
+                'Nerelict 无法直接播放该内容：$_error',
                 textAlign: TextAlign.center,
                 style: const TextStyle(fontSize: 10.5, color: kDanger),
               ),
@@ -1634,7 +1634,7 @@ class _PlayerError extends StatelessWidget {
           const Icon(Icons.error_outline, color: Colors.orangeAccent, size: 30),
           const SizedBox(height: 8),
           const Text(
-            'MA8N无法直接播放该内容',
+            'Nerelict 无法直接播放该内容',
             style: TextStyle(color: Colors.white, fontSize: 12.5),
           ),
           const SizedBox(height: 5),

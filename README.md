@@ -72,6 +72,20 @@ x86_64 模拟器暂不在支持范围（标准镜像会报 `INSTALL_FAILED_NO_MA
 将来需要模拟器时，把参数换成 `--target-platform android-arm64,android-x64` 即可，
 无需改动源码，产物会相应增大约 21 MB。
 
+### 真机冒烟
+
+装机后可用独立脚本跑一遍冷启动、底部三页切换、截图与崩溃日志检查：
+
+```bash
+cd nerelict
+dart run tool/smoke_device.dart
+# adb 不在 PATH 时：
+dart run tool/smoke_device.dart --adb /path/to/adb --shots /path/to/shots --expect 0.4.1
+```
+
+截图默认写到 `.tmp/smoke-shots/`。脚本需要一台已安装本应用的设备，
+不依赖 Flutter 引擎，也不进常规回归链。
+
 ## 签名
 
 release 构建会读取 `nerelict/android/key.properties`（本机文件，已忽略）中的 keystore 信息，

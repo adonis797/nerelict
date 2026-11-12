@@ -2,6 +2,11 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/theme_mode.dart';
+import '../services/streaming_proxy.dart';
+
+/// 播放缓存上限的可选档位（MB），设置页与持久化共用。
+const List<int> kCacheLimitOptionsMb = <int>[64, 128, 256, 512, 1024];
+const int kDefaultCacheLimitMb = 256;
 
 /// 地址栏搜索使用的搜索引擎。
 enum SearchEngine { google, bing }
@@ -37,11 +42,12 @@ class SettingsState extends ChangeNotifier {
   static const _kMp4Conversion = 'mp4_conversion';
   static const _kSearchEngine = 'search_engine';
 
-  // MA8N（第 6 项方案）新增偏好，全部有保守默认值
+  // 播放器与运行偏好，全部有保守默认值
   static const _kPlayerMediaControls = 'player_media_controls';
   static const _kPlayerAutoResume = 'player_auto_resume';
   static const _kPlayerGestures = 'player_gestures';
   static const _kPlayerStreamingCache = 'player_streaming_cache';
+  static const _kPlayerCacheLimitMb = 'player_cache_limit_mb';
   static const _kPlayerSpeed = 'player_speed';
   static const _kKeepScreenOn = 'keep_screen_on';
   static const _kDownloadConcurrency = 'download_concurrency';
@@ -64,6 +70,7 @@ class SettingsState extends ChangeNotifier {
   bool _playerAutoResume = true;
   bool _playerGestures = true;
   bool _playerStreamingCache = false;
+  int _playerCacheLimitMb = kDefaultCacheLimitMb;
   double _playerSpeed = 1.0;
 
   /// 应用在前台时保持屏幕常亮（默认开启，避免下载/转换被息屏打断）
@@ -106,6 +113,9 @@ class SettingsState extends ChangeNotifier {
   /// 边下边播：本地代理缓存 HLS 分片（默认关闭）
   bool get playerStreamingCache => _playerStreamingCache;
 
+  /// 播放缓存上限（MB），默认 256；写入时同步给本地代理
+  int get playerCacheLimitMb => _playerCacheLimitMb;
+
   /// 默认倍速，播放器中调整后会记住
   double get playerSpeed => _playerSpeed;
 
@@ -140,6 +150,10 @@ class SettingsState extends ChangeNotifier {
       _playerAutoResume = prefs.getBool(_kPlayerAutoResume) ?? true;
       _playerGestures = prefs.getBool(_kPlayerGestures) ?? true;
       _playerStreamingCache = prefs.getBool(_kPlayerStreamingCache) ?? false;
+      final savedLimitMb = prefs.getInt(_kPlayerCacheLimitMb) ?? kDefaultCacheLimitMb;
+      _playerCacheLimitMb = kCacheLimitOptionsMb.contains(savedLimitMb)
+          ? savedLimitMb
+          : kDefaultCacheLimitMb;
       _playerSpeed = prefs.getDouble(_kPlayerSpeed) ?? 1.0;
       _keepScreenOn = prefs.getBool(_kKeepScreenOn) ?? true;
       _downloadConcurrency =
@@ -150,6 +164,8 @@ class SettingsState extends ChangeNotifier {
     } catch (_) {
       // 读不到就用默认值，不影响启动
     }
+    // 设置层把上限同步给代理，避免代理首次启动时仍用默认 256MB
+    StreamingProxy.instance.maxCacheBytes = _playerCacheLimitMb * 1024 * 1024;
     _ready = true;
     notifyListeners();
   }
@@ -253,6 +269,17 @@ class SettingsState extends ChangeNotifier {
     _playerStreamingCache = value;
     notifyListeners();
     await _save(_kPlayerStreamingCache, value);
+  }
+
+  /// 调整播放缓存上限；调小后立即按新上限裁剪，不必等下次播放。
+  Future<void> setPlayerCacheLimitMb(int value) async {
+    if (!kCacheLimitOptionsMb.contains(value)) return;
+    if (_playerCacheLimitMb == value) return;
+    _playerCacheLimitMb = value;
+    StreamingProxy.instance.maxCacheBytes = value * 1024 * 1024;
+    notifyListeners();
+    await _saveInt(_kPlayerCacheLimitMb, value);
+    await StreamingProxy.instance.trimCache();
   }
 
   Future<void> setKeepScreenOn(bool value) async {

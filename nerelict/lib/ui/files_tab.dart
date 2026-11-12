@@ -418,7 +418,7 @@ class _ResumeBanner extends StatelessWidget {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  'MA8N · 上次看到 ${record.progressText}',
+                  'Nerelict · 上次看到 ${record.progressText}',
                   style: TextStyle(fontSize: 10.5, color: p.textFaint),
                 ),
               ],
@@ -469,7 +469,7 @@ class _EmptyState extends StatelessWidget {
             Text(
               hasTasks
                   ? '任务还在进行，去「下载」查看进度；完成后无需手动刷新'
-                  : '在「浏览器」里打开视频页面，\n用 MA8N 播放后点「下载当前视频」即可',
+                  : '在「浏览器」里打开视频页面，\n用 Nerelict 播放后点「下载当前视频」即可',
               textAlign: TextAlign.center,
               style: TextStyle(color: p.textFaint, fontSize: 12, height: 1.5),
             ),
@@ -534,7 +534,7 @@ class _FilterEmpty extends StatelessWidget {
   }
 }
 
-/// 点击整条直接用 MA8N播放：视频可播放，其他类型打开文件管理（信息 / 重命名 / 删除）
+/// 点击整条直接用 Nerelict 播放：视频可播放，其他类型打开文件管理（信息 / 重命名 / 删除）
 class _LocalFileTile extends StatelessWidget {
   const _LocalFileTile({required this.file, required this.onFilesChanged});
 

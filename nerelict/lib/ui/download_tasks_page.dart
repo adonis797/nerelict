@@ -347,7 +347,7 @@ class _TaskCard extends StatelessWidget {
                     local: true,
                   ),
                   icon: const Icon(Icons.play_circle_outline, size: 17),
-                  label: const Text('MA8N播放'),
+                  label: const Text('Nerelict 播放'),
                   style: TextButton.styleFrom(
                     visualDensity: VisualDensity.compact,
                   ),
@@ -375,7 +375,7 @@ class _TaskCard extends StatelessWidget {
             else if (task.conversion == ConversionState.done &&
                 task.mp4Path != null)
               Text(
-                '转换完成 · ${task.mp4Info ?? '可用 MA8N播放'}',
+                '转换完成 · ${task.mp4Info ?? '可用 Nerelict 播放'}',
                 style: const TextStyle(fontSize: 11, color: kSuccess),
               )
             else ...[
