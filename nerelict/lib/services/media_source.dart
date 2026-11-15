@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import 'hls_parser.dart';
+import 'header_policy.dart';
+import 'user_agent.dart';
 
 /// 播放器能交给系统解码器直接播放的封装格式。
 /// 覆盖范围按 ExoPlayer 常见能力扩展：常见容器、音视频单轨、老式封装都算在内，
@@ -44,6 +46,7 @@ class MediaSource {
     required this.local,
     required this.kind,
     required this.unsupportedReason,
+    this.customHeaders = const <String, String>{},
   });
 
   /// 原始地址。本地文件可能是纯路径而非合法 URI，播放与截图都用它。
@@ -56,14 +59,19 @@ class MediaSource {
   final MediaKind kind;
   final String? unsupportedReason;
 
+  /// 页面侧带来的鉴权头（已过 HeaderPolicy 白名单）。
+  /// 直连时交给 ExoPlayer，走代理时由代理回源注入。
+  final Map<String, String> customHeaders;
+
   String get url => uri.toString();
   bool get supported => unsupportedReason == null;
 
   /// 传给 ExoPlayer 的请求头。带签名参数的站点常校验 Referer / UA。
   Map<String, String> get headers => <String, String>{
-        'User-Agent': kDefaultUserAgent,
+        'User-Agent': userAgent,
         if (referer != null && referer!.startsWith('http'))
           'Referer': referer!,
+        ...customHeaders,
       };
 
   /// 播放进度记忆的 key：去掉易变的签名参数，保留路径与主机名。
@@ -86,15 +94,18 @@ class MediaSource {
 
   String get badge => local ? '本地' : kind.label;
 
-  static const String kDefaultUserAgent =
-      'Mozilla/5.0 (Linux; Android 15; M8Browser) AppleWebKit/537.36 '
-      '(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36';
+  /// 出站请求（播放代理 / 下载器 / ExoPlayer 直连）统一使用的 User-Agent。
+  ///
+  /// 实际值在 [UserAgent.current]：WebView 建好后会换成它的真实 UA，
+  /// 源站是按那个 UA 发的地址，换一个去取容易被判成盗链。
+  static String get userAgent => UserAgent.current;
 
   static MediaSource parse({
     required String url,
     String title = '',
     String? referer,
     bool local = false,
+    Map<String, String> headers = const <String, String>{},
   }) {
     final raw = url.trim();
     final uri = Uri.tryParse(raw);
@@ -107,6 +118,7 @@ class MediaSource {
         local: local,
         kind: MediaKind.unknown,
         unsupportedReason: '地址格式不正确',
+        customHeaders: HeaderPolicy.sanitize(headers),
       );
     }
 
@@ -140,6 +152,7 @@ class MediaSource {
       local: local,
       kind: kind,
       unsupportedReason: reason,
+      customHeaders: HeaderPolicy.sanitize(headers),
     );
   }
 }

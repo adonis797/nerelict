@@ -56,6 +56,8 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 | `verify_playback.dart` | 播放代理链路：302 回源、最终 URI、m3u8 改写、MIME、缓存键 |
 | `verify_p0.dart` | 重定向 base、直播标记、续传不串片、直链 `If-Range` |
 | `verify_p1.dart` | `ss_*` 残留清理、直链背压写盘、中途暂停状态收敛 |
+| `verify_v042.dart` | 本地 HTTP 服务跑「选流 / Cookie 鉴权 / 字节区间 / 断点」真实下载（不依赖公网） |
+| `verify_mp4_timeline.dart` | 转封装时间轴算法：B 帧重排识别、等间隔网格重建、缺段缺口（纯算法，不依赖设备） |
 | `verify_download.dart` | 真实公开测试流跑“解析 → 分片 → 解密 → 合并”（依赖公网，可能超时） |
 | `smoke_device.dart` | 真机冒烟：冷启动、三页切换、截图、崩溃日志（需要 adb + 设备，**不进常规回归链**） |
 | `verify_file_manager.dart` / `verify_v2_features.dart` / `verify_v34.dart` / `verify_v334.dart` | 文件管理、直链分流、转换策略、文件类型与主题解析 |
@@ -65,7 +67,7 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 
 ## 版本号规则（用户已定，不要自行发挥）
 
-- 三段式：`pubspec.yaml` 的 `version: 0.4.1+21`，`+21` 是 Android `versionCode`，整数、只增不减，每次发版 +1。
+- 三段式：`pubspec.yaml` 的 `version: 0.4.2+22`，`+22` 是 Android `versionCode`，整数、只增不减，每次发版 +1。
 - `versionName` 由 `android/app/build.gradle.kts` 的 `flutter.versionName` 直取三段，**不覆盖第四段**。
 - 第三段按整数顺延（`0.4.0` → `0.4.9` → `0.4.10`），**不逢十进一**；提升第二、第一段必须先得到用户明确同意。
 - 发版需同步四处：`pubspec.yaml`、`lib/ui/settings_tab.dart` 的 `appVersion`、`README.md`（`nerelict/` 内）的版本历史、`tool/verify_v35.dart` 第 9 节断言。以下路径均相对 `nerelict/`。

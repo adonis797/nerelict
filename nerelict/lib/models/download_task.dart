@@ -1,5 +1,7 @@
 import 'dart:math';
 
+import '../services/header_policy.dart';
+
 enum TaskStatus {
   queued,
   parsing,
@@ -92,8 +94,30 @@ class DownloadTask {
   /// 发现该源的页面地址，下载时作为 Referer 带上（很多 CDN 会校验）
   String? referer;
 
+  /// 页面发起该请求时带的鉴权头（Authorization / X-*），下载时回放。
+  ///
+  /// 与 Cookie 的区别：Cookie 由 CookieStore 按站点实时读取、不落盘；
+  /// 这里的头在页面上没有别的来源，只能随任务一起持久化，否则重启后续传
+  /// 会退化成匿名请求，直接 403。已经过 HeaderPolicy 白名单过滤。
+  Map<String, String> requestHeaders = const <String, String>{};
+
   /// 实际选中的码率（主播放列表时）
   String? variant;
+
+  /// 用户选定码率的稳定标识（`带宽@分辨率`）。
+  /// 用下标会出错：站点刷新播放列表后顺序可能变化，续传时按下标还原会选错档。
+  String? variantKey;
+
+  /// 该码率声明了哪些字幕（仅展示，不参与下载）
+  String? subtitleNote;
+
+  /// 档位被自动调整时的说明，例如「最高清晰度音轨独立，已自动改用 720p」。
+  /// 让降级是可见的，而不是静默发生。
+  String? variantNote;
+
+  /// 播放列表里 #EXT-X-DISCONTINUITY 的处数。大于 0 表示时间轴中途跳变，
+  /// 产物能播但时间戳不连续，转 MP4 后时长可能对不上。
+  int discontinuities = 0;
 
   /// 播放列表没有 #EXT-X-ENDLIST：本次只保存了当前窗口的片段，并非完整视频。
   /// 下载页与完成提示据此明确告知用户，避免误以为拿到了完整录像。
@@ -173,7 +197,12 @@ class DownloadTask {
         'mp4Info': mp4Info,
         'exported': exported,
         'referer': referer,
+        if (requestHeaders.isNotEmpty) 'headers': requestHeaders,
         'variant': variant,
+        'variantKey': variantKey,
+        'subtitleNote': subtitleNote,
+        'variantNote': variantNote,
+        'discontinuities': discontinuities,
         'isLive': isLive,
         'segments': segments,
       };
@@ -231,7 +260,25 @@ class DownloadTask {
     task.mp4Info = raw['mp4Info'] is String ? raw['mp4Info'] as String : null;
     task.exported = raw['exported'] == true;
     task.referer = raw['referer'] is String ? raw['referer'] as String : null;
+    final savedHeaders = raw['headers'];
+    if (savedHeaders is Map) {
+      final clean = <String, String>{};
+      for (final entry in savedHeaders.entries) {
+        final name = entry.key;
+        final value = entry.value;
+        if (name is String && value is String) clean[name] = value;
+      }
+      // 磁盘上的内容可能是旧版本或被手工改过的，重新过一遍白名单
+      task.requestHeaders = HeaderPolicy.sanitize(clean);
+    }
     task.variant = raw['variant'] is String ? raw['variant'] as String : null;
+    task.variantKey =
+        raw['variantKey'] is String ? raw['variantKey'] as String : null;
+    task.subtitleNote =
+        raw['subtitleNote'] is String ? raw['subtitleNote'] as String : null;
+    task.variantNote =
+        raw['variantNote'] is String ? raw['variantNote'] as String : null;
+    task.discontinuities = asInt(raw['discontinuities']);
     task.isLive = raw['isLive'] == true;
     final segs = raw['segments'];
     if (segs is List) {

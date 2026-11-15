@@ -11,11 +11,15 @@ import '../models/download_task.dart';
 import '../models/player_request.dart' show PlayerMode, PlayerRequest;
 import '../models/sniffed_media.dart';
 import '../services/app_log.dart';
+import '../services/click_sniff.dart';
 import '../services/conversion_policy.dart';
 import '../services/download_store.dart';
 import '../services/favorites.dart';
 import '../services/file_manager.dart';
 import '../services/hls_downloader.dart';
+import '../services/hls_parser.dart' show HlsMasterPlaylist;
+import '../services/header_policy.dart';
+import '../services/cookie_store.dart';
 import '../services/local_media_scanner.dart';
 import '../services/mp4_converter.dart';
 import '../services/network_status.dart';
@@ -37,6 +41,11 @@ class AppState extends ChangeNotifier {
     _downloader = HlsDownloader(
       resolveTempDir: _partsDir,
       resolveOutputDir: appDownloadDir,
+      // 需要登录态的分片：用 WebView 里同一份 Cookie 下载，否则只能 403
+      resolveCookie: (url) => CookieStore.instance.cookiesFor(url),
+      // 403 时让缓存失效，下一次重试才会回源重读（人机验证 Cookie 会轮换）
+      invalidateCookie: (url) =>
+          CookieStore.instance.invalidate(Uri.tryParse(url)?.host),
     );
     // 切后台 / 被系统回收前再落盘一次，尽量不丢最后几秒的进度
     _lifecycle = AppLifecycleListener(
@@ -526,12 +535,14 @@ class AppState extends ChangeNotifier {
     String title = '',
     String? referer,
     bool local = false,
+    Map<String, String> headers = const <String, String>{},
   }) {
     _player = PlayerRequest(
       url: url,
       title: title,
       referer: referer,
       local: local,
+      headers: headers,
     );
     _playerMode = PlayerMode.panel;
     notifyListeners();
@@ -543,8 +554,15 @@ class AppState extends ChangeNotifier {
     String title = '',
     String? referer,
     bool local = false,
+    Map<String, String> headers = const <String, String>{},
   }) =>
-      openPlayer(url: url, title: title, referer: referer, local: local);
+      openPlayer(
+        url: url,
+        title: title,
+        referer: referer,
+        local: local,
+        headers: headers,
+      );
 
   void closePlayer() {
     if (_player == null && _playerMode == PlayerMode.panel) return;
@@ -623,6 +641,9 @@ class AppState extends ChangeNotifier {
     _sniffed.clear();
     _latest = null;
     _selectedUrl = null;
+    // 换页后点击捕获从 #1 重新计数，跨域播放器候选也一并丢弃
+    _lastClick = null;
+    _clickHints.clear();
     // 迷你小窗视为后台播放：任何一次页面重置都不应顶掉它
     if (keepPlayer || _playerMode == PlayerMode.mini) {
       logD('Page', 'reset kept player (mode=${_playerMode.name})');
@@ -640,23 +661,110 @@ class AppState extends ChangeNotifier {
       final Map<String, dynamic> data = jsonDecode(raw) as Map<String, dynamic>;
       final url = (data['url'] as String?)?.trim();
       if (url == null || url.isEmpty) return;
-      final changed = _aggregator.accept(
+      final result = _aggregator.accept(
         url: url,
         kind: (data['kind'] as String?) ?? 'playlist',
         page: (data['page'] as String?) ?? '',
         source: (data['from'] as String?) ?? 'unknown',
         title: (data['title'] as String?) ?? '',
         parent: data['parent'] as String?,
+        headers: _readHeaders(data['headers']),
       );
-      if (!changed) return;
-      _sniffed
-        ..clear()
-        ..addAll(_aggregator.items);
-      _latest = _sniffed.isEmpty ? null : _sniffed.first;
+      if (!result.changed) return;
+      _syncSniffed();
       notifyListeners();
     } catch (_) {
       // 忽略非法消息
     }
+  }
+
+  /// 页面脚本带来的鉴权头：只收字符串键值对，其余形态直接忽略。
+  /// 真正的白名单过滤在 HeaderPolicy.sanitize（SniffedMedia.mergeHeaders）
+  /// 里做，这里只做类型收敛，避免脏数据一路传到播放器。
+  Map<String, String>? _readHeaders(Object? raw) {
+    if (raw is! Map) return null;
+    final out = <String, String>{};
+    for (final entry in raw.entries) {
+      final name = entry.key;
+      final value = entry.value;
+      if (name is String && value is String) out[name] = value;
+    }
+    return out.isEmpty ? null : out;
+  }
+
+  /// 真实条目在前、疑似广告沉底：站点常把广告排在列表顶部，
+  /// 按地址形态把它们压到后面，用户第一眼看到的就是正片入口。
+  void _syncSniffed() {    _sniffed
+      ..clear()
+      ..addAll(orderForDisplay(_aggregator.items));
+    _latest = _sniffed.isEmpty ? null : _sniffed.first;
+  }
+
+  // ---- 点击捕获：识别「点开才加载」的浮层播放器 ----
+  //
+  // 页面脚本只在归因窗口内上报，所以这里几乎不会收到无关消息。
+  // 命中 m3u8 / 分片时并入同一个资源列表（被动嗅探先建好的项会被原地补标记）；
+  // mp4 直链不并入列表，避免和 HLS 的下载链路混在一起，但仍会返回给 UI
+  // 用于弹出「浮层视频已捕获」浮标。
+  ClickSniffEvent? _lastClick;
+  final List<ClickSniffEvent> _clickHints = <ClickSniffEvent>[];
+
+  ClickSniffEvent? get lastClick => _lastClick;
+
+  /// 跨域 iframe 播放器地址：读不到内容，只能提供「打开它继续嗅探」的入口
+  List<ClickSniffEvent> get clickHints => List.unmodifiable(_clickHints);
+
+  int get clickSession => _lastClick?.sessionId ?? 0;
+
+  /// 处理一条点击捕获消息，返回事件本身供 UI 决定是否提示 / 弹浮标。
+  ClickSniffEvent? onClickSniffMessage(String raw) {
+    final event = ClickSniffEvent.parse(raw);
+    if (event == null) return null;
+
+    switch (event.type) {
+      case ClickEventType.click:
+        _lastClick = event;
+        break;
+      case ClickEventType.hit:
+        _lastClick = event;
+        if (event.kind == 'playlist' || event.kind == 'segment') {
+          final result = _aggregator.accept(
+            url: event.url,
+            kind: event.kind,
+            page: event.page,
+            source: '点击/${event.from.isEmpty ? 'click' : event.from}',
+            title: event.title,
+            attribution: ClickAttribution(
+              sessionId: event.sessionId,
+              overlayScore: event.overlayScore,
+              label: event.label,
+            ),
+          );
+          if (result.changed) _syncSniffed();
+        }
+        break;
+      case ClickEventType.overlay:
+      case ClickEventType.mse:
+      case ClickEventType.shield:
+        // 广告防护事件只用于提示，不参与资源聚合
+        _lastClick = event;
+        break;
+      case ClickEventType.iframe:
+        _lastClick = event;
+        if (!_clickHints.any((h) => h.url == event.url)) {
+          _clickHints.insert(0, event);
+          if (_clickHints.length > 6) _clickHints.removeLast();
+        }
+        break;
+    }
+    notifyListeners();
+    return event;
+  }
+
+  void clearClickHints() {
+    if (_clickHints.isEmpty) return;
+    _clickHints.clear();
+    notifyListeners();
   }
 
   void clearSniffed() {
@@ -678,6 +786,9 @@ class AppState extends ChangeNotifier {
     String? title,
     String? referer,
     List<String>? segments,
+    String? variantKey,
+    String? variantLabel,
+    Map<String, String> headers = const <String, String>{},
   }) {
     final task = DownloadTask(
       id: DownloadTask.newId(),
@@ -685,16 +796,33 @@ class AppState extends ChangeNotifier {
       title: (title == null || title.trim().isEmpty) ? 'video' : title.trim(),
     )
       ..referer = referer
-      ..segments = segments;
+      ..segments = segments
+      ..variantKey = variantKey
+      ..variant = variantLabel
+      ..requestHeaders = HeaderPolicy.sanitize(headers);
 
     _tasks.insert(0, task);
     logD('Download', 'enqueue ${task.id} ${task.url}');
+    if (task.requestHeaders.isNotEmpty) {
+      logD('Download', 'pass ${task.requestHeaders.length} auth headers');
+    }
     notifyListeners();
     _persistNow();
 
     unawaited(_pump());
     return task;
   }
+
+  /// 下载前探测主播放列表：有几档清晰度、音轨是否独立成流。
+  ///
+  /// 返回 null 表示不是主播放列表（单码率 / 直链 / 探测失败），
+  /// 调用方据此跳过选流直接下载，不打扰用户。
+  Future<HlsMasterPlaylist?> probeDownloadOptions(
+    String url, {
+    String? referer,
+    Map<String, String> headers = const <String, String>{},
+  }) =>
+      _downloader.probeMaster(url, referer: referer, headers: headers);
 
   Future<void> _runTask(DownloadTask task, {bool resume = false}) async {
     try {
@@ -716,6 +844,12 @@ class AppState extends ChangeNotifier {
       if (!task.detached && task.status == TaskStatus.done) {
         if (task.isLive) {
           showToast('直播流只保存了当前片段，可能不是完整视频',
+              duration: const Duration(seconds: 4));
+        } else if (task.variantNote != null) {
+          showToast(task.variantNote!, duration: const Duration(seconds: 4));
+        } else if (task.discontinuities > 0) {
+          showToast(
+              '已下载，但含 ${task.discontinuities} 处片段断点，时间轴可能跳变',
               duration: const Duration(seconds: 4));
         }
         await _autoConvertIfEnabled(task);

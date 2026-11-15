@@ -19,7 +19,7 @@ import 'widgets/app_menu.dart';
 class SettingsTab extends StatefulWidget {
   const SettingsTab({super.key});
 
-  static const String appVersion = '0.4.1';
+  static const String appVersion = '0.4.4';
 
   @override
   State<SettingsTab> createState() => _SettingsTabState();
@@ -89,6 +89,14 @@ class _SettingsTabState extends State<SettingsTab> {
           page: _playbackPage,
         ),
         _SettingsEntry(
+          title: '点击捕获浮层视频',
+          category: '视频播放',
+          icon: Icons.ads_click_outlined,
+          keywords: const <String>['点击', '浮层', '弹窗', '嗅探', '点开才加载'],
+          value: s.clickCapture ? '已开启' : '已关闭',
+          page: _playbackPage,
+        ),
+        _SettingsEntry(
           title: '通知栏 / 锁屏媒体控制',
           category: 'Nerelict 播放器',
           icon: Icons.notifications_active_outlined,
@@ -110,6 +118,14 @@ class _SettingsTabState extends State<SettingsTab> {
           icon: Icons.touch_app_outlined,
           keywords: const <String>['手势', '双击', '快进', '音量', '亮度', '倍速'],
           value: s.playerGestures ? '已开启' : '已关闭',
+          page: _playerPage,
+        ),
+        _SettingsEntry(
+          title: '播放时拦截网页弹窗',
+          category: 'Nerelict 播放器',
+          icon: Icons.block_outlined,
+          keywords: const <String>['弹窗', '广告', 'window.open', 'alert', '对话框'],
+          value: s.playerBlockPagePopups ? '已开启' : '已关闭',
           page: _playerPage,
         ),
         _SettingsEntry(
@@ -599,7 +615,7 @@ List<Widget> _playbackPage(
 ) {
   return <Widget>[
     _SettingCard(
-      titles: ['自动接管网页视频'],
+      titles: ['自动接管网页视频', '点击捕获浮层视频'],
       children: <Widget>[
         SwitchListTile(
           value: settings.autoTakeover,
@@ -611,6 +627,19 @@ List<Widget> _playbackPage(
                 : '已关闭 · 视频继续在网页内播放，仅保留嗅探',
           ),
           secondary: Icon(Icons.smart_display_outlined, color: p.accent),
+          contentPadding: const EdgeInsets.symmetric(horizontal: 14),
+        ),
+        Divider(height: 1, color: p.border),
+        SwitchListTile(
+          value: settings.clickCapture,
+          onChanged: settings.setClickCapture,
+          title: const Text('点击捕获浮层视频'),
+          subtitle: Text(
+            settings.clickCapture
+                ? '已启用 · 点开封面后加载的浮层播放器会被记录下来，只读地址、不拦截点击'
+                : '已关闭 · 只能嗅探页面加载时就发出的视频请求',
+          ),
+          secondary: Icon(Icons.ads_click_outlined, color: p.accent),
           contentPadding: const EdgeInsets.symmetric(horizontal: 14),
         ),
       ],
@@ -629,6 +658,7 @@ List<Widget> _playerPage(
         '通知栏 / 锁屏媒体控制',
         '自动续播',
         '画面手势',
+        '播放时拦截网页弹窗',
         '边下边播缓存',
         '播放缓存',
         '默认倍速',
@@ -658,6 +688,17 @@ List<Widget> _playerPage(
           title: const Text('画面手势'),
           subtitle: const Text('左右快进、左侧亮度、右侧音量、双击暂停、长按 2x、锁定控件'),
           secondary: Icon(Icons.touch_app_outlined, color: p.accent),
+          contentPadding: const EdgeInsets.symmetric(horizontal: 14),
+        ),
+        Divider(height: 1, color: p.border),
+        SwitchListTile(
+          value: settings.playerBlockPagePopups,
+          onChanged: settings.setPlayerBlockPagePopups,
+          title: const Text('播放时拦截网页弹窗'),
+          subtitle: const Text('播放器打开期间挡住网页的新窗口与 alert 对话框，'
+              '避免弹窗压住播放器、点按钮却点到弹窗；关闭播放器立即还原'),
+          secondary:
+              Icon(Icons.block_outlined, color: p.accent),
           contentPadding: const EdgeInsets.symmetric(horizontal: 14),
         ),
         Divider(height: 1, color: p.border),

@@ -13,6 +13,7 @@ import android.os.Looper
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.view.WindowManager
+import android.webkit.CookieManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
@@ -28,6 +29,7 @@ class MainActivity : FlutterActivity() {
         private const val SCREEN_CHANNEL = "com.nerelict/screen"
         private const val INSTALL_CHANNEL = "com.nerelict/install"
         private const val NETWORK_CHANNEL = "com.nerelict/network"
+        private const val COOKIE_CHANNEL = "com.nerelict/cookie"
         private const val REQ_PICK_DIR = 1001
         private const val REQ_PICK_APK = 1002
     }
@@ -44,6 +46,42 @@ class MainActivity : FlutterActivity() {
         configureScreenChannel(flutterEngine)
         configureInstallChannel(flutterEngine)
         configureNetworkChannel(flutterEngine)
+        configureCookieChannel(flutterEngine)
+    }
+
+    /**
+     * 把 WebView 里的 Cookie 交给 Dart 侧的下载器与播放代理。
+     *
+     * 下载器此前只发 Referer / UA，需要登录态的分片会被 CDN 判 403，
+     * 而同一地址在 WebView 里能播——差别就是浏览器自己带了 Cookie。
+     * 这里只做读取，不写入、不持久化；凭证由 Dart 侧存内存，用完即弃。
+     */
+    private fun configureCookieChannel(flutterEngine: FlutterEngine) {
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, COOKIE_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "get" -> {
+                        val url = call.argument<String>("url")
+                        if (url.isNullOrEmpty()) {
+                            result.success(null)
+                            return@setMethodCallHandler
+                        }
+                        // CookieManager 只能在主线程访问
+                        runOnUiThread {
+                            try {
+                                val manager = CookieManager.getInstance()
+                                manager.setAcceptCookie(true)
+                                result.success(manager.getCookie(url))
+                            } catch (_: Exception) {
+                                // 取不到就按匿名请求继续，不阻断下载
+                                result.success(null)
+                            }
+                        }
+                    }
+
+                    else -> result.notImplemented()
+                }
+            }
     }
 
     /** Nerelict 播放器：通知栏媒体控制、音频焦点、亮度、PIP、截帧、分享。 */

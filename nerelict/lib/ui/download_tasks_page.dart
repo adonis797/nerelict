@@ -307,6 +307,22 @@ class _TaskCard extends StatelessWidget {
                   ),
               ],
             ),
+            // 时间轴中途跳变（插播 / 换源）：产物能播但时间戳不连续，
+            // 转 MP4 后时长可能对不上，先在这里如实说明。
+            if (task.variantNote != null) ...[
+              const SizedBox(height: 4),
+              Text(
+                task.variantNote!,
+                style: TextStyle(fontSize: 10.5, color: p.textSub),
+              ),
+            ],
+            if (task.discontinuities > 0) ...[
+              const SizedBox(height: 4),
+              Text(
+                '含 ${task.discontinuities} 处片段断点，时间轴可能跳变',
+                style: TextStyle(fontSize: 10.5, color: kDanger),
+              ),
+            ],
           ],
           if (task.status == TaskStatus.failed && task.error != null) ...[
             const SizedBox(height: 6),

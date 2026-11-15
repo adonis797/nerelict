@@ -20,11 +20,16 @@ class PlayerRequest {
     this.title = '',
     this.referer,
     this.local = false,
+    this.headers = const <String, String>{},
   });
 
   final String url;
   final String title;
   final String? referer;
+
+  /// 页面发起该请求时带的鉴权头（Authorization / X-*）。
+  /// 由嗅探链路传入，播放代理与直连都会回放；为空表示匿名可访问。
+  final Map<String, String> headers;
 
   /// true 表示播放设备上的本地文件（已下载 / 已转换的内容）
   final bool local;

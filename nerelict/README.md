@@ -74,6 +74,58 @@
 > 设置改为二级分类菜单（常规 / 播放 / 下载与存储 / 其他），关于页去掉包名与更新说明，仅保留「安装应用更新」入口；
 > 版本号改为四位迭代号 0.3.5.2（pubspec 仍为 0.3.5+14，Gradle 覆盖 versionName）。
 
+> v0.4.4 请求头透传：一部分站点不用 Cookie 鉴权，而是靠 `Authorization: Bearer …` 或
+> 自定义 `X-*` 头——页面里能播，Nerelict 只带 UA / Referer / Cookie，于是在播放器里 403。
+> 现在包装 `fetch` 时读 `init.headers` / `Request.headers`，hook `XMLHttpRequest.setRequestHeader`
+> 并在 `send` 时上报，按白名单（`Authorization`、`X-*`、`Origin`）挑头随嗅探结果带回；
+> 首屏播放器常先被 performance 扫描发现（只有地址），之后才被网络 hook 命中，这里会在补报时
+> 把头补上而不再新建一条；从 POST 响应体里捞到的地址也继承发起该请求的头。
+> 播放走本地代理时，头只存在内存登记表里，URL 上只带 12 位地址摘要令牌，m3u8 里的分片与
+> `#EXT-X-KEY` 沿用同一令牌，重写播放列表不会把鉴权丢掉；关闭缓存直连时同样交给 ExoPlayer。
+> 下载任务随任务持久化这批头（否则重启续传会退化成匿名请求），回读磁盘时再次过白名单。
+> `Cookie` / `Range` / `Referer` / `User-Agent` 由链路自己生成，明确排除；值超过 1024 字节或
+> 含换行的头直接丢弃（防头注入，也避免带着半个 token 去 403）；日志只记头的数量，不记值。
+> 资源列表里这类条目会标「已带鉴权头」，一眼能看出它为什么能播。
+
+> v0.4.3 抓不到 / 播不了的补齐：`#EXT-X-MAP` 从「只认第一个」改为挂在分片上，
+> 播放列表中段换 init（多段 MAP / 换编码 / 插播）与 `BYTERANGE` 形式都能正确拼接，
+> fMP4 下载不再产出缺少 moov 的坏文件；只嗅探到分片的视频（MSE / `blob:`）可以直接播放——
+> 用已收分片合成一份 VOD 播放列表交给本地代理，分片仍带 Cookie / Referer 边下边播，
+> fMP4 分片组因缺 init 会明确提示下载而不是硬凑；包装 `fetch` / `XHR` 时读取响应体，
+> 把只存在于 POST JSON 里的播放地址（`/api/play`、GraphQL）也捞出来（限 512KB、只扫文本类响应）；
+> `.mpd` 交给 ExoPlayer 直接播放（插件自带 media3-dash 模块），下载则明确拒绝并说明原因；
+> 播放失败不再甩 `PlatformException(... Source error, null, null)`，改为「视频源打不开（可能需要登录 /
+> 防盗链、地址已过期，或格式不受支持）」等 10 类人话提示；控制条四个胶囊统一 50×44dp、
+> 数字等宽，倍速文案整数也写 `1.0x`。完整清单见 `docs/unsniffable-and-fixes.md`。
+
+> v0.4.2 下载可控性：下载前可按清晰度选择码率（记住上次选择，站点换列表时按分辨率回落），
+> 解析 `#EXT-X-MEDIA` 的音轨 / 字幕组，音轨被拆成独立流的档位会被标注并跳过，
+> 不再静默产出没有声音的文件；下载与播放代理携带 WebView 的登录态 Cookie（仅内存、不落盘、不进日志），
+> 需要登录才能取分片的老大难问题得以解决；支持 `#EXT-X-BYTERANGE` 字节区间分片与
+> `#EXT-X-DISCONTINUITY` 断点识别，同文件多区间正确拼接、断点处如实提示。
+> 转 MP4 的时间轴重建：MediaMuxer 写不了 ctts，带 B 帧的流若把回退的 PTS 压平，
+> 近一半的帧显示时长为 0、其余帧间隔翻倍，播放就是卡顿；改为按解码顺序重建等间隔网格后
+> 帧间隔均匀，缺段造成的 PTS 大跳会保留为缺口，避免音画错位。
+>
+> 点击捕获（同一版本）：针对「点开封面才加载」的浮层播放器，捕获阶段旁路记录点击并开 8 秒
+> 归因窗口，窗口内的取流、新插入的播放器、`play()` 调用都算到这次点击上；播放器容器按
+> 固定定位 / 覆盖面积 / 遮罩 / 弹窗类名打分，达到 50 分才标「浮层播放」，内联播放器停在 45 不会误标。
+> 同一页面多个视频各归各的点击，被动嗅探先建好的项原地补标记，不新增重复项；
+> 拿不到地址时按 performance 差异 → 同源 iframe 直读 → 跨域 iframe 给地址 → MSE 回扫逐级降级。
+>
+> 广告与广告跳转的通用适配：按「广告域名（高置信）/ 独占广告路径段（中置信）」两档判定，
+> 点击后 6 秒内跳到高置信广告页自动回退一次，中置信只提示；广告媒体不自动接管、不弹浮标，
+> 嗅探列表默认折叠并沉底，展开后仍可播可下。播放器补齐运行期错误提示与重试按钮。
+>
+> 播放器触控：所有可点控件热区 ≥44dp（原先 compact 密度只有 28~34dp），控制条改为单行 `Row`
+> + 弹性胶囊，不再与按钮抢手势，打开后 350ms 内屏蔽误触；播放期间接管 `window.open` / `alert` / `confirm` /
+> `prompt`，关闭播放器立即还原，避免系统弹窗压在播放器上「点按钮却点到弹窗」。
+>
+> 网页把播放器盖住时：整屏 `fixed/absolute` + `z-index≥20` + 覆盖 ≥45% 视口 + 背景近乎透明 +
+> 内部没有 `video/iframe/canvas` 的层判为广告遮挡层，点击时只关它的 `pointer-events` 并掐掉当次点击，
+> 再点一次就能落到真正的播放器上；点后 1.5 秒内的 `window.open` 一并拒绝。
+> 判定规则与「嗅探不到 / 播不了」的分类见 `docs/unsniffable-and-fixes.md`。
+>
 > v0.4.1 发布后体验补齐：换上自绘应用图标（含 Android 12+ 自适应图标与深色启动图）；
 > 播放器相关文案与内部标识统一为 Nerelict，收藏 / 续播记忆 / 缓存目录 / 通知渠道都带一次性迁移，
 > 不丢历史数据；播放缓存新增占用统计、64~1024MB 上限档位与手动清理；
@@ -115,6 +167,11 @@
 | 功能 | 入口 | 默认 | 关闭后行为 |
 |---|---|---|---|
 | 自动接管网页视频 | 设置 → 自动接管网页视频 | 开 | 视频继续在网页内播放，仅保留原有嗅探 |
+| 点击捕获浮层视频 | 设置 → 点击捕获浮层视频 | 开 | 只嗅探页面加载时就发出的请求，「点开才加载」的播放器抓不到 |
+| 广告页自动回退 | 自动（点击后 6 秒内跳到已知广告域名） | 开 | 只提示「已跳过疑似广告」，不自动返回 |
+| 疑似广告折叠 | 嗅探面板 → 疑似广告 N | 折叠 | 广告与正片混在一起排列 |
+| 播放时拦截网页弹窗 | 设置 → 播放时拦截网页弹窗 | 开 | 播放中可能被网页 alert / 新窗口压住播放器 |
+| 广告遮挡层清理 | 自动（点到透明整屏层时）/ 菜单 → 清理页面遮挡层 | 开 | 网页把广告层做成不透明整屏遮罩时不动它 |
 | 浅色主题 | 设置 → 浅色主题 | 关（原深色） | 恢复原有深色主题 |
 | 下载完成后自动转 MP4 | 设置 → 下载完成后自动转 MP4 | 开 | 保留 TS，可在「下载」页的 MP4 转换入口手动转换 |
 | 谷歌快捷入口 | 首页「快速访问」 | — | 与原有 3 个入口并存 |
@@ -181,6 +238,15 @@ dart run tool/verify_download.dart
 拿两个公开测试流跑完整链路：主播放列表选码率、分片并发下载、AES-128 解密、合并，
 并校验输出头部的 TS 同步字节（0x47）。
 
+不依赖公网的行为测试（本地起 HTTP 服务，跑真实下载链路）：
+
+```bash
+dart run tool/verify_v042.dart   # 选流 / Cookie 鉴权 / 字节区间 / 断点
+dart run tool/verify_mp4_timeline.dart  # 转封装时间轴算法（B 帧网格重建）
+dart run tool/verify_p1.dart     # 临时目录清理与直链背压
+dart run tool/verify_p0.dart     # 重定向、直播标记、续传、If-Range
+```
+
 装机后另可用 `dart run tool/smoke_device.dart` 跑真机冒烟：冷启动、底部三页切换、
 截图留证与崩溃日志检查。需要 adb 与一台已安装本应用的设备；`adb` 不在 PATH 时用
 `--adb <可执行文件>` 指定，`--shots` 改截图目录，`--expect` 指定期望的 versionName。
@@ -198,7 +264,12 @@ lib/
     sniffer_js.dart           注入 WebView 的 m3u8 嗅探脚本（自动 + 手动重扫）
     player_probe_js.dart      注入 WebView 的「可播放视频」探测 + 暂停网页视频
     video_float_js.dart       网页 <video> 长按浮标（独立 FloatChannel，不干扰嗅探）
-    resource_aggregator.dart  分片去重 / 变体聚合
+    click_sniff_js.dart       点击捕获脚本：点击归因 + 浮层评分 + 降级上报
+    click_sniff.dart          点击捕获消息解析（脏消息丢弃、阈值常量）
+    ad_filter.dart            广告域名 / 广告路径段判定（高 / 中置信，保守匹配）
+    playback_guard_js.dart    播放期接管网页 window.open / alert 等出口，关闭即还原
+    playback_error.dart       把 PlatformException 翻译成「403 / DRM / 编码不支持」等人话
+    resource_aggregator.dart  分片去重 / 变体聚合（支持点击归因原地补标记）
     media_source.dart         [播放器] URL 归一化、Referer/UA、类型与 DRM 探测
     player_core.dart          [播放器] 抽象内核 + video_player/ExoPlayer 适配层
     player_platform.dart      [播放器] 原生媒体能力 MethodChannel 封装
@@ -254,6 +325,30 @@ UI 只依赖 `PlayerCore` 接口，将来替换成自研 Texture / PlatformView 
 
 命中后通过 `JavaScriptChannel('SniffChannel')` 回传，Dart 层去重后弹底部横幅。
 
+`click_sniff_js.dart` 是第三条通道 `ClickChannel`，专治「视频要等用户点一下才存在」：
+
+- 在捕获阶段旁路记录点击（`pointerdown` / `click`，全程 `passive`，不阻断页面交互），
+  开一个 8 秒归因窗口；
+- 窗口内的 `fetch` / `XHR` / 新增 `performance` 条目 / 新插入的 `<video>` / `play()` 调用
+  都算到这次点击头上，连同点击目标描述一起上报；
+- 给播放器容器打「浮层」分（`fixed`/`absolute` + 高 z-index + 覆盖面积 + 遮罩 + 弹窗类名 +
+  点击后新插入），达到 50 分才标记「浮层播放」，普通内联播放器停在 30~45 不会误标；
+- 拿到 m3u8 / 分片时并入同一份资源列表（被动嗅探先建好的项会原地补标记，不新增重复项）；
+- 拿不到地址时按级降级：`performance` 差异 → 同源 iframe 直读 → 跨域 iframe 只给地址
+  → MSE 提示并自动回扫 → 手动嗅探。判定规则与降级路径见 `docs/click-sniffing.md`。
+
+广告与广告跳转的通用处理（不认站点，规则见 `docs/ad-playback-adaptation.md`）：
+
+- 地址命中已知广告网络（`doubleclick.net`、`exoclick.com` 等）为**高置信**，
+  命中 `/ads/`、`/preroll/`、`vast` 这类独占路径段为**中置信**，其余一律不判；
+  路径按段比对，`download`、`shadow`、`adapter` 不会被误伤；
+- 点击后 6 秒内跳到**高置信**广告页会在 500ms 后自动 `goBack`，
+  中置信只提示不劫持；同一次跳转只回退一次，避免来回弹；
+- 广告媒体不参与自动接管、不弹浮层浮标，避免刚点完视频就被广告顶掉画面；
+- 嗅探列表默认折叠疑似广告（面板里有「疑似广告 N」可展开），
+  展示顺序统一为「真实条目在前、广告沉底」；
+- 播放器补上运行期错误提示（403 / 分片断开 / 解码失败不再是黑屏）与一键重试。
+
 `player_probe_js.dart` 是独立的第二条通道 `PlayerChannel`：
 m3u8 命中 fetch/XHR/performance/video/页面地址任一即可；mp4 等直链只认 `<video>/<source>`
 和页面地址，避免广告视频误触发。两个脚本各自包一层 fetch/XHR/media src，
@@ -261,7 +356,15 @@ m3u8 命中 fetch/XHR/performance/video/页面地址任一即可；mp4 等直链
 
 ### 下载怎么做的
 
-- 主播放列表按 `BANDWIDTH` 排序取最高码率，码率标签显示在任务卡片上；
+- 主播放列表先解析出全部码率档位：下载前可选定一档（记住上次选择；站点换列表时
+  按分辨率回落，对不上才回落到最高档），任务卡片显示实际选中的档位；
+- `#EXT-X-MEDIA` 的音轨 / 字幕组会被解析。音轨被拆成独立流的档位在选流面板里标注为
+  不可选；若默认档位正好是这种，会自动退到第一个内置音轨的档位并在任务上写明原因，
+  不再静默产出一个没有声音的文件；
+- 出站请求带 `Referer`、`User-Agent` 与该站点在 WebView 里的 `Cookie`（登录态），
+  Cookie 只在内存里按 host 缓存 90 秒，不落盘、不进日志；
+- 支持 `#EXT-X-BYTERANGE`：同一文件的多个字节区间用 `Range` 分别请求，长度不符直接报错；
+  `#EXT-X-DISCONTINUITY` 会被计数并在任务卡片与完成提示里说明时间轴有跳变；
 - 分片并发 4 路；`AES-128` 用 `pointycastle` CBC + PKCS7 解密，未显式给 `IV` 时按分片序号推 16 字节大端 IV；
 - 每个请求 45 秒整体超时（dio 的 `receiveTimeout` 只管两次数据之间，慢速滴流会一直挂着），超时后 `CancelToken` 取消并重试 3 次；
 - 分片先落临时目录，全部完成后按顺序流式合并，避免内存峰值；
@@ -276,6 +379,9 @@ m3u8 命中 fetch/XHR/performance/video/页面地址任一即可；mp4 等直链
   原 `.ts` 文件仍然可用。fMP4 分片本身输出就是 `.mp4`，不显示转换按钮。
 - Service Worker、WebSocket 推流或 blob 地址的站点可能嗅探不到。
 - 直播流（无 `#EXT-X-ENDLIST`）只下载当前列表里的分片。
+- 音轨独立成流（`#EXT-X-MEDIA` 的 AUDIO 组带 `URI`）时无法与画面合并，只能改选内置音轨的档位；
+  所有档位都音轨分离的视频当前无法下载。
+- 字幕只做识别与展示，不随视频下载；`#EXT-X-DISCONTINUITY` 只做计数提示，不重写时间戳。
 - release 包由本机 keystore 签名，未上传应用商店。
 - 播放器：DRM（Widevine / ChinaDRM / SAMPLE-AES）、MSE/EME、`blob:` 地址、短时效签名 URL 不承诺支持；
   AV1、杜比视界、AC3/E-AC3 等编解码能力随设备而异；DASH 由系统解码器决定，未做专门适配。

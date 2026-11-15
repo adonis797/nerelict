@@ -171,8 +171,22 @@ void main() {
   check(converter.contains('adtsFrames'), '解析 ADTS 帧边界');
   check(converter.contains('headerLen'), '按保护位决定 7/9 字节头');
   check(converter.contains('isSupportedAudio'), '音频编码选择独立判断');
-  check(converter.contains('framePts += frameDurUs'), '逐帧累加音频时间戳');
+  check(converter.contains('framePts += audioFrameDurUs'), '逐帧累加音频时间戳');
   check(converter.contains('hasAudio') == false, '音轨信息由 MainActivity 输出');
+
+  stdout.writeln('=== 6b. MP4 时间轴（带 B 帧不再被压平） ===');
+  check(converter.contains('analyzeTrack'), '转换前试读样本判断时间戳特征');
+  check(converter.contains('reordered'), '识别解码顺序里的 PTS 回退（B 帧）');
+  check(converter.contains('Mode.GRID'), '带 B 帧的视频按解码序号重建等间隔网格');
+  check(!converter.contains('PASSTHROUGH'),
+      '不再直通原始 PTS（MediaMuxer 实测会把回退压平）');
+  check(converter.contains('class TrackClock'), '每条轨道独立的时间轴钟');
+  check(converter.contains('count * frameDurUs'), '兜底时按解码序号乘帧间隔重建网格');
+  check(converter.contains('deltas[deltas.size / 2]'), '帧间隔取排序后间隔的中位数');
+  check(converter.contains('probeTimeline'), '产物抽查时间轴单调性与帧间隔');
+  check(converter.contains('gap += jump - frameDurUs'), '缺段缺口计入网格，避免音画错位');
+  check(converter.contains('droppedVideo > writtenVideo / 10'),
+      '直通失败（丢帧过多）时自动改走网格');
 
   stdout.writeln('=== 7. 安装入口归位（仅自我更新） ===');
   final settingsTab = read('lib/ui/settings_tab.dart');
@@ -194,14 +208,14 @@ void main() {
 
   stdout.writeln('=== 9. 版本号与二级设置 ===');
   final pubspec = read('pubspec.yaml');
-  check(pubspec.contains('version: 0.4.1+21'), 'pubspec 基础版本为 0.4.1 / code 21');
+  check(pubspec.contains('version: 0.4.4+24'), 'pubspec 基础版本为 0.4.4 / code 24');
   final gradle = read('android/app/build.gradle.kts');
   check(gradle.contains('versionName = flutter.versionName'),
       '展示版本统一取 pubspec 三段版本');
   check(!gradle.contains('versionName = "0.3.9.0"'), '不再覆盖第四段展示版本');
   final settingsFile = read('lib/ui/settings_tab.dart');
-  check(settingsFile.contains("appVersion = '0.4.1'"), '设置页版本为 0.4.1');
-  check(read('README.md').contains('v0.4.1'), 'README 版本号已同步');
+  check(settingsFile.contains("appVersion = '0.4.4'"), '设置页版本为 0.4.4');
+  check(read('README.md').contains('v0.4.4'), 'README 版本号已同步');
   check(settingsFile.contains('_CategoryTile'), '设置改为分类入口');
   check(settingsFile.contains('_SettingsPage'), '存在二级设置页');
   check(settingsFile.contains("'常规'") && settingsFile.contains("'播放'"),
@@ -381,7 +395,7 @@ void main() {
   check(downloaderDart.contains('SHA256Digest()'), '分片身份使用稳定摘要');
   check(downloaderDart.contains('_writeAtomic(part, data)'),
       '分片原子落盘');
-  check(downloaderDart.contains("'If-Range': validator"),
+  check(downloaderDart.contains("directHeaders['If-Range'] = validator"),
       '直链续传校验源文件版本');
   check(downloaderDart.contains('task.isLive = media.isLive'),
       '直播流标记到任务');
@@ -465,7 +479,7 @@ void main() {
 
   stdout.writeln('=== 23. 发版护栏、品牌命名与 0.4.1 资源 ===');
   // 已正式发布的最高 versionCode；每次 Release 后上调，防止忘记 +1 或复用旧码
-  const int publishedVersionCode = 20;
+  const int publishedVersionCode = 21;
   final pubspecText = read('pubspec.yaml');
   final settingsText = read('lib/ui/settings_tab.dart');
   final gradleText = read('android/app/build.gradle.kts');
@@ -476,7 +490,7 @@ void main() {
       .firstMatch(pubspecText);
   final semver = versionLine?.group(1) ?? '';
   final currentCode = int.tryParse(versionLine?.group(2) ?? '') ?? 0;
-  check(semver == '0.4.1', '当前展示版本为 0.4.1');
+  check(semver == '0.4.4', '当前展示版本为 0.4.4');
   check(currentCode > publishedVersionCode,
       'versionCode $currentCode 严格大于已发布最高值 $publishedVersionCode');
   check(settingsText.contains("appVersion = '$semver'"),
@@ -570,6 +584,254 @@ void main() {
   check(settingsText.contains('_PlaybackCacheTile'), '设置页展示缓存占用与清理');
   check(projectFile('tool/smoke_device.dart').existsSync(),
       '提供可独立运行的真机冒烟脚本');
+
+  stdout.writeln('=== 24. 0.4.2 选流、Cookie 鉴权与分片时序 ===');
+  final parserText = read('lib/services/hls_parser.dart');
+  check(parserText.contains('#EXT-X-MEDIA:'), '解析 #EXT-X-MEDIA 音轨 / 字幕组');
+  check(parserText.contains('#EXT-X-BYTERANGE:'), '解析 #EXT-X-BYTERANGE 字节区间');
+  check(parserText.contains("line == '#EXT-X-DISCONTINUITY'"),
+      'DISCONTINUITY 精确匹配，不误算 DISCONTINUITY-SEQUENCE');
+  check(parserText.contains('class HlsMasterPlaylist'),
+      '主播放列表给出「码率 + 音轨 + 字幕」的完整结果');
+  check(parserText.contains('separateAudioFor'), '能识别音轨被拆成独立流的档位');
+  check(parserText.contains('discontinuities'), '断点数进入播放列表结果');
+
+  final downloaderText = read('lib/services/hls_downloader.dart');
+  check(downloaderText.contains('var chosen = master.pick(task.variantKey)'),
+      '下载按用户选择的档位执行，不再硬取最高码率');
+  check(downloaderText.contains('task.variantNote = note'),
+      '档位被自动调整时留下可见说明');
+  check(downloaderText.contains('range: seg.hasRange'),
+      '字节区间分片按 Range 请求');
+  check(downloaderText.contains('字节区间不符'),
+      '服务端忽略 Range 时报错，而不是把全量写进分片');
+  check(downloaderText.contains('task.discontinuities = media.discontinuities'),
+      '断点数记录到任务上');
+  check(downloaderText.contains('resolveCookie'), '下载器支持注入 Cookie 解析');
+  check(downloaderText.contains("headers['Cookie']"), '出站请求注入 Cookie 头');
+
+  final cookieStoreText = read('lib/services/cookie_store.dart');
+  check(cookieStoreText.contains("MethodChannel('com.nerelict/cookie')"),
+      'Cookie 走独立平台通道');
+  check(cookieStoreText.contains('Duration(seconds: 90)'),
+      'Cookie 缓存有短有效期，跟得上签名刷新');
+  check(!cookieStoreText.contains('logD') &&
+          !cookieStoreText.contains('print('),
+      'Cookie 不写入日志');
+
+  final activityText = read(
+      'android/app/src/main/kotlin/com/nerelict/nerelict/MainActivity.kt');
+  check(activityText.contains('COOKIE_CHANNEL') &&
+          activityText.contains('CookieManager.getInstance()'),
+      '原生侧从 WebView 的 CookieManager 读取登录态');
+
+  final taskModelText = read('lib/models/download_task.dart');
+  check(taskModelText.contains("'variantKey': variantKey") &&
+          taskModelText.contains("'variantNote': variantNote") &&
+          taskModelText.contains("'discontinuities': discontinuities"),
+      '选流结果与断点信息随任务持久化');
+  // 0.4.4 起任务模型会持久化 Authorization / X-*；Cookie 仍由 CookieStore
+  // 按站点实时取，磁盘上不留副本，这里断言的是「没有 Cookie 字段」而不是
+  // 「源码里不能出现 cookie 这个词」（注释里需要解释为什么排除它）。
+  check(!taskModelText.contains("'Cookie'") &&
+          !taskModelText.contains("'cookie'"),
+      'Cookie 不作为字段写入任务模型（不落盘）');
+
+  check(projectFile('lib/ui/variant_picker.dart').existsSync(),
+      '提供下载前选流面板');
+  check(read('lib/ui/variant_picker.dart').contains('音轨独立'),
+      '选流面板把音轨独立的档位标注为不可选');
+  check(projectFile('tool/verify_v042.dart').existsSync(),
+      '提供 0.4.2 行为测试');
+
+  stdout.writeln('=== 25. 点击捕获（浮层播放）===');
+  final clickJsText = read('lib/services/click_sniff_js.dart');
+  final clickModelText = read('lib/models/sniffed_media.dart');
+  final aggregatorText = read('lib/services/resource_aggregator.dart');
+  final browserText = read('lib/ui/browser_tab.dart');
+  check(clickJsText.contains("addEventListener('pointerdown'") &&
+          clickJsText.contains('capture: true, passive: true'),
+      '点击在捕获阶段被动记录，不干扰页面交互');
+  // 唯一的阻断点：刚识别出广告遮挡层的那一次点击，必须掐掉，
+  // 否则它仍会触发广告层自己的跳转（click 目标在 pointerdown 时已锁定）。
+  check(clickJsText.split('preventDefault(').length - 1 == 1 &&
+          clickJsText.contains('blockClickUntil'),
+      '只拦「刚清掉遮挡层」的那一次点击，其余点击不阻断');
+  check(clickJsText.contains('MutationObserver') &&
+          clickJsText.contains('ATTR_MS = 8000'),
+      '点击后新插入的播放器在 8 秒归因窗口内被抓到');
+  check(clickJsText.contains('OVERLAY_MIN = 50') &&
+          clickModelText.contains('kOverlayThreshold = 50'),
+      '浮层阈值在脚本与模型两侧一致');
+  check(clickModelText.contains('class ClickAttribution') &&
+          clickModelText.contains('bool get overlayPlay'),
+      '资源项带上点击归因与浮层判定');
+  check(aggregatorText.contains('ClickAttribution? attribution') &&
+          aggregatorText.contains('noteAttribution'),
+      '聚合层支持把点击归因并到已有资源项');
+  check(browserText.contains("'ClickChannel'") &&
+          browserText.contains('kClickSniffJs'),
+      '点击捕获通道与脚本已接入浏览器页');
+  check(browserText.contains('浮层捕获') && browserText.contains('点击捕获说明'),
+      '资源面板可按浮层筛选，菜单里有说明入口');
+  check(read('lib/state/settings_state.dart')
+          .contains("_kClickCapture = 'click_capture'"),
+      '点击捕获开关可持久化');
+  check(projectFile('tool/verify_click_sniff.dart').existsSync(),
+      '提供点击捕获行为测试');
+
+  stdout.writeln('=== 26. 广告识别、跳转兜底与播放器健壮性 ===');
+  final adFilterText = read('lib/services/ad_filter.dart');
+  check(adFilterText.contains("'doubleclick.net'") &&
+          adFilterText.contains('highConfidence'),
+      '已知广告网络给出高置信判定');
+  check(adFilterText.contains("'preroll'") && adFilterText.contains('_adSegments'),
+      '广告路径按整段匹配，而不是子串');
+  check(!adFilterText.contains('contains(segment)'),
+      '没有退化成子串包含判断（会误伤 download / shadow）');
+
+  final aggregatorAd = read('lib/services/resource_aggregator.dart');
+  check(aggregatorAd.contains('AdFilter.inspect(url)') &&
+          aggregatorAd.contains('markSuspectAd'),
+      '聚合时给广告项打标记');
+  check(aggregatorAd.contains('orderForDisplay'), '提供真实项在前、广告沉底的展示排序');
+  check(read('lib/state/app_state.dart').contains('orderForDisplay('),
+      '嗅探列表使用统一排序');
+
+  check(browserText.contains('AdFilter.inspect(url)') &&
+          browserText.contains('已跳过疑似广告'),
+      '自动接管跳过广告媒体并提示一次');
+  check(browserText.contains('_handleAdNavigation') &&
+          browserText.contains('goBack()'),
+      '点击后跳到高置信广告页会自动回退');
+  check(browserText.contains('_autoSkippedAd'),
+      '同一次广告跳转只回退一次，避免死循环');
+  check(browserText.contains("'疑似广告'") &&
+          browserText.contains('_showAds'),
+      '面板提供疑似广告筛选，默认折叠');
+  check(browserText.contains('isHighConfidenceAd'),
+      '只有高置信广告页才自动回退');
+
+  final playerText = read('lib/ui/player_page.dart');
+  check(playerText.contains('播放中断') && playerText.contains('core.error'),
+      '运行期播放错误可见，不再是黑屏');
+  check(playerText.contains('Future<void> _retry()') &&
+          playerText.contains("'重试'"),
+      '播放错误提供重试入口');
+  check(playerText.contains('_tick?.cancel()'),
+      '重试前收掉旧定时器，避免重复计费');
+  check(projectFile('tool/verify_ad_filter.dart').existsSync(),
+      '提供广告识别行为测试');
+  check(projectFile('docs/ad-playback-adaptation.md').existsSync(),
+      '提供广告适配的判断规则与边界说明');
+
+  stdout.writeln('=== 27. 播放器触控与播放期弹窗守卫 ===');
+  final playerTouchText = read('lib/ui/player_page.dart');
+  check(playerTouchText.contains('const double kPlayerMinTap = 44'),
+      '播放器控件热区下限 44dp');
+  check(!playerTouchText.contains('visualDensity: VisualDensity.compact'),
+      '不再使用 compact 密度（旧热区仅 28~34dp）');
+  check(!playerTouchText.contains('scrollDirection: Axis.horizontal'),
+      '控制条不再用横向滚动容器抢手势');
+  check(playerTouchText.contains('bool get _inputShielded'),
+      '播放器打开后 350ms 内屏蔽手势');
+
+  final guardText = read('lib/services/playback_guard_js.dart');
+  for (final fn in <String>['open', 'alert', 'confirm', 'prompt']) {
+    check(guardText.contains('w.$fn = function'), '播放期接管 window.$fn');
+    check(guardText.contains('w.$fn = o.$fn'), '关闭播放器还原 window.$fn');
+  }
+  check(browserText.contains('_syncPopupGuard') &&
+          browserText.contains('kPlaybackGuardRestoreJs'),
+      '播放结束立即还原网页弹窗出口');
+  check(read('lib/state/settings_state.dart')
+          .contains("'player_block_page_popups'"),
+      '弹窗拦截有独立开关');
+  check(projectFile('tool/verify_player_touch.dart').existsSync(),
+      '提供播放器触控行为测试');
+
+  stdout.writeln('=== 28. 遮挡层防护、错误文案与胶囊尺寸 ===');
+  check(clickJsText.contains('looksLikeAdLayer') &&
+          clickJsText.contains("alphaOf(st.backgroundColor) > 0.35"),
+      '遮挡层判定保守：不透明遮罩不处理');
+  check(clickJsText.contains("setProperty('pointer-events', 'none', 'important')"),
+      '只关指针事件，不删节点');
+  check(clickJsText.contains("Date.now() - shell.tapAt < 1500"),
+      '点击后 1.5 秒内拒绝 window.open');
+  check(clickJsText.contains('window.__ssClearLayers'),
+      '提供手动清理遮挡层入口');
+  check(read('lib/services/click_sniff.dart').contains('shield'),
+      'shield 事件可解析');
+  check(browserText.contains('清理页面遮挡层') &&
+          browserText.contains('_clearAdLayers'),
+      '菜单里能手动清理遮挡层');
+  check(read('lib/services/playback_error.dart').contains('视频源打不开'),
+      '原始播放错误翻译成人话');
+  check(playerTouchText.contains('const double kChipWidth = 50') &&
+          playerTouchText.contains('FontFeature.tabularFigures()'),
+      '倍速等四个胶囊等宽、数字不跳动');
+  check(projectFile('tool/verify_ad_shield.dart').existsSync(),
+      '提供遮挡层 / 错误文案 / 胶囊尺寸测试');
+
+  stdout.writeln('=== 29. 多段 init / 分片组播放 / 响应体抓地址 / DASH 边界 ===');
+  final dl29 = read('lib/services/hls_downloader.dart');
+  check(dl29.contains('final initPaths = <String, String>{}'),
+      '按分片切换 init，支持多段 #EXT-X-MAP');
+  check(dl29.contains('if (key.isNotEmpty && key != writtenInit)'),
+      '合并时 init 变化就重写');
+  check(dl29.contains('暂不支持下载 DASH'), '.mpd 下载被明确拒绝');
+  final sp29 = read('lib/services/streaming_proxy.dart');
+  check(sp29.contains('playbackUrlForSegments') &&
+          sp29.contains("route.startsWith('/local')"),
+      '分片组可合成播放列表边下边播');
+  final sn29 = read('lib/services/sniffer_js.dart');
+  check(sn29.contains('scanBody') && sn29.contains('res.clone()'),
+      '从响应体里抓媒体地址（POST/JSON 站点）');
+  check(projectFile('tool/verify_v043.dart').existsSync(),
+      '提供 0.4.3 行为测试');
+  check(projectFile('docs/unsniffable-and-fixes.md').existsSync(),
+      '提供无法嗅探场景与适配方案文档');
+
+  stdout.writeln('=== 30. 0.4.4 请求头透传 ===');
+  final hp30 = read('lib/services/header_policy.dart');
+  check(hp30.contains('class HeaderPolicy'), '存在请求头策略模块');
+  check(hp30.contains('authorization|x-') && hp30.contains('cookie|set-cookie|host'),
+      '放行鉴权头、排除链路自管头');
+  check(hp30.contains('kMaxValueLength') && hp30.contains(r"contains('\n')"),
+      '超长与换行头值被拒绝（防头注入）');
+  check(hp30.contains('tokenFor'), '代理令牌由地址派生');
+  final sp30 = read('lib/services/streaming_proxy.dart');
+  check(sp30.contains('_registerHeaders') && sp30.contains('_headersByToken'),
+      '代理用内存表登记鉴权头，URL 不带头值');
+  check(sp30.contains(r"'&h=$h'"), '代理地址只携带令牌');
+  check(sp30.contains('Headers: headerToken') ||
+          sp30.contains('h: headerToken'),
+      '分片沿用同一令牌');
+  final sn30 = read('lib/services/sniffer_js.dart');
+  check(sn30.contains('setRequestHeader') &&
+          sn30.contains('XMLHttpRequest.prototype.send'),
+      '嗅探脚本采集 XHR 请求头');
+  check(sn30.contains('headersToList(init && init.headers'),
+      'fetch 读取 init.headers');
+  check(sn30.contains('seenHdr'), 'perf 先发现、网络后命中时可补报头');
+  final dt30 = read('lib/models/download_task.dart');
+  check(dt30.contains('requestHeaders') && dt30.contains("'headers'"),
+      '下载任务可持久化鉴权头并随磁盘恢复');
+  final pr30 = read('lib/models/player_request.dart');
+  check(pr30.contains('Map<String, String> headers'),
+      '播放请求携带鉴权头');
+  check(projectFile('tool/verify_v044.dart').existsSync(),
+      '提供 0.4.4 行为测试');
+
+  stdout.writeln('=== 31. 嗅探提示不刷屏 ===');
+  final browser31 = read('lib/ui/browser_tab.dart');
+  check(!browser31.contains('播放器在跨域页面内'),
+      '跨域播放器不再每点一次就弹提示');
+  check(browser31.contains('case ClickEventType.iframe:') &&
+          browser31.contains('widget.state.clickHints'),
+      '跨域播放器仍记进候选，⚡ 面板仍可打开');
+  check(browser31.contains('_mseNotified'), 'MSE 回扫提示每页只弹一次');
+  check(browser31.contains('_shieldNotified'), '遮挡层提示仍然每页只弹一次');
 
   stdout.writeln();
   if (failures.isEmpty) {

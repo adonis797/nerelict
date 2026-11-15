@@ -9,15 +9,22 @@ import 'package:video_player/video_player.dart';
 
 import '../models/player_request.dart';
 import '../services/favorites.dart';
+import '../services/hls_downloader.dart' show isDirectMediaUrl;
 import '../services/hls_parser.dart' show HlsVariant;
 import '../services/media_source.dart';
 import '../services/playback_memory.dart';
+import '../services/app_log.dart';
+import '../services/playback_error.dart';
 import '../services/player_core.dart';
 import '../services/player_platform.dart';
 import '../services/streaming_proxy.dart';
 import '../state/app_state.dart';
 import '../state/settings_state.dart';
 import 'app_theme.dart';
+
+/// 播放器所有可点控件的热区下限（dp）。Material 建议 48、iOS 44，这里取 44。
+const double kPlayerMinTap = 44;
+
 
 enum _MoreAction {
   pip,
@@ -94,6 +101,12 @@ class _PlayerPanelState extends State<PlayerPanel> {
   Widget? _inlinePanel;
 
   PlayerMode _lastMode = PlayerMode.panel;
+
+  /// 播放器出现的时刻：350ms 内的点击不算用户操作。
+  /// 网页上「封面/浮层」被点开的同一串触摸事件，可能会落到刚弹出的播放器上，
+  /// 结果是刚打开就被自己的手指点成暂停（或把控制条点没）。
+  final DateTime _openedAt = DateTime.now();
+
   DateTime _lastSave = DateTime.fromMillisecondsSinceEpoch(0);
   bool _completedSaved = false;
   bool _disposed = false;
@@ -107,6 +120,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
       title: widget.request.title,
       referer: widget.request.referer,
       local: widget.request.local,
+      headers: widget.request.headers,
     );
     _speed = _settings.playerSpeed;
     _init();
@@ -125,6 +139,11 @@ class _PlayerPanelState extends State<PlayerPanel> {
   }
 
   Future<void> _init() async {
+    _tick?.cancel();
+    _tick = null;
+    _error = null;
+    // 上一次会话的代理错误不能带到这次，否则会误导排查
+    StreamingProxy.instance.lastUpstreamError = null;
     if (!_source.supported) {
       _fail(_source.unsupportedReason!);
       return;
@@ -148,8 +167,12 @@ class _PlayerPanelState extends State<PlayerPanel> {
       }
 
       String? playbackUrl;
+      // 分片组合成的播放列表本身就是本机代理地址，再包一层只是白跑一遍，
+      // 还会把已经带好的 Referer 二次编码。
+      final alreadyLocal = _source.url.startsWith('http://127.0.0.1:');
       if (_settings.playerStreamingCache &&
           !_source.local &&
+          !alreadyLocal &&
           _source.kind == MediaKind.hls) {
         try {
           playbackUrl = await StreamingProxy.instance.playbackUrl(_source);
@@ -229,15 +252,49 @@ class _PlayerPanelState extends State<PlayerPanel> {
     });
   }
 
+  /// 重建播放内核再试一次：换掉可能已失效的握手 / 连接，保留进度与轨道选择。
+  Future<void> _retry() async {
+    final old = _core;
+    _core = null;
+    _error = null;
+    try {
+      old?.values.removeListener(_onValue);
+      await old?.dispose();
+    } catch (_) {}
+    if (!mounted || _disposed) return;
+    setState(() {});
+    await _init();
+  }
+
+  /// 统一收口失败原因：原始错误先记日志，再翻译成人话给用户看。
+  ///
+  /// `PlatformException(VideoError, ... Source error, null, null)` 这种字符串
+  /// 直接甩到界面上，用户既看不懂也不知道下一步做什么。
   void _fail(String message) {
     if (!mounted) return;
+    logD('Player', 'fail: $message');
+    var friendly = playbackErrorSummary(message);
+    // 播放内核只会甩一句 Source error，真正的原因在代理那一层：
+    // 可能是 m3u8 被 403、分片防盗链、或站点回了 HTML 防盗页。
+    final upstream =
+        _usingProxy ? StreamingProxy.instance.lastUpstreamError : null;
+    if (upstream != null && upstream.isNotEmpty) {
+      friendly = '$friendly · 代理回源 $upstream';
+    }
     setState(() => _error =
-        message.length > 160 ? '${message.substring(0, 160)}…' : message);
+        friendly.length > 220 ? '${friendly.substring(0, 220)}…' : friendly);
   }
 
   void _onValue() {
     final core = _core;
     if (core == null || _disposed) return;
+    // 初始化之后的错误（403、分片断开、解码失败）过去没有任何提示，
+    // 用户只看到一块黑；这里如实显示并给出重试入口。
+    final runtimeError = core.error;
+    if (runtimeError != null && _error == null) {
+      _fail('播放中断：$runtimeError');
+      return;
+    }
     final v = core.values.value;
     if (v.duration > Duration.zero &&
         v.position >= v.duration - const Duration(milliseconds: 300) &&
@@ -331,7 +388,12 @@ class _PlayerPanelState extends State<PlayerPanel> {
     });
   }
 
+  /// 触摸屏蔽窗口内不响应播放器手势（打开播放器的那一下还没结束）
+  bool get _inputShielded =>
+      DateTime.now().difference(_openedAt) < const Duration(milliseconds: 350);
+
   void _toggleControls() {
+    if (_inputShielded) return;
     if (_controlsVisible) {
       setState(() => _controlsVisible = false);
       _hideTimer?.cancel();
@@ -415,16 +477,84 @@ class _PlayerPanelState extends State<PlayerPanel> {
 
   // ---- 播放动作 ----
 
-  void _download() {
+  Future<void> _download() async {
     final state = context.read<AppState>();
+    final p = paletteOf(context);
     final title = _displayTitle;
-    state.startDownload(
-      url: widget.request.url,
-      title: title,
-      referer: _source.referer,
+    final url = widget.request.url;
+    final referer = _source.referer;
+    final headers = widget.request.headers;
+
+    void enqueue({String? key, String? label}) {
+      state.startDownload(
+        url: url,
+        title: title,
+        referer: referer,
+        variantKey: key,
+        variantLabel: label,
+        headers: headers,
+      );
+      // 不切页、不关闭播放器：只在底部给一个约 0.5 秒的悬停提示
+      state.showHint(label == null ? '已加入下载队列' : '已加入下载队列 · $label');
+    }
+
+    // 直链没有码率可选，直接入队
+    final uri = Uri.tryParse(url);
+    if (uri != null && isDirectMediaUrl(uri)) {
+      enqueue();
+      return;
+    }
+
+    // 播放器是置顶浮层，这里用内嵌面板而不是 modal，否则会被浮层盖住
+    _toast('正在读取清晰度…');
+    final master = await state.probeDownloadOptions(
+      url,
+      referer: referer,
+      headers: headers,
     );
-    // 不切页、不关闭播放器：只在底部给一个约 0.5 秒的悬停提示
-    state.showHint('已加入下载队列');
+    if (!mounted) return;
+    if (master == null || master.variants.length < 2) {
+      enqueue();
+      return;
+    }
+
+    _openMenu('选择清晰度', <Widget>[
+      for (var i = 0; i < master.variants.length; i++)
+        Builder(builder: (ctx) {
+          final v = master.variants[i];
+          final blocked = master.separateAudioFor(v).isNotEmpty;
+          final subs = master.subtitlesFor(v);
+          final notes = <String>[
+            v.bandwidthLabel,
+            if (blocked) '音轨独立，暂无法合并',
+            if (subs.isNotEmpty) '字幕 ${subs.length} 条',
+          ];
+          return ListTile(
+            dense: true,
+            enabled: !blocked,
+            title: Text(
+              v.resolution ?? v.bandwidthLabel,
+              style: TextStyle(
+                fontSize: 13,
+                color: blocked ? p.textDisabled : p.text,
+              ),
+            ),
+            subtitle: Text(
+              notes.join(' · '),
+              style: TextStyle(
+                fontSize: 11,
+                color: blocked ? p.textDisabled : p.textSub,
+              ),
+            ),
+            onTap: blocked
+                ? null
+                : () {
+                    _closeInline();
+                    enqueue(key: v.key, label: v.label);
+                  },
+          );
+        }),
+    ]);
   }
 
   Future<void> _setSpeed(double value) async {
@@ -515,6 +645,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
           url: variant.uri.toString(),
           title: widget.request.title,
           referer: widget.request.referer,
+          headers: widget.request.headers,
         );
     _toast('已切换到所选码率');
   }
@@ -694,6 +825,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
           addedAt: DateTime.now().millisecondsSinceEpoch,
           local: _source.local,
           referer: _source.referer,
+          headers: _source.customHeaders,
         ));
         _favorite = await _favorites.contains(_source.url);
         if (mounted) setState(() {});
@@ -784,6 +916,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
                       title: item.title,
                       referer: item.referer,
                       local: item.local,
+                      headers: item.headers,
                     );
               },
             ),
@@ -862,6 +995,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
   /// 双击分区：左 1/3 快退、右 1/3 快进、中间暂停/播放。
   /// 比原来「整块双击=暂停」更符合视频应用习惯，也避免想快进时误暂停。
   void _handleDoubleTap(double width) {
+    if (_inputShielded) return;
     final pos = _doubleTapPosition;
     if (pos == null || width <= 0) {
       _togglePlay();
@@ -1246,34 +1380,35 @@ class _PlayerPanelState extends State<PlayerPanel> {
               ),
             ),
             if (!_source.local)
-              IconButton(
-                visualDensity: VisualDensity.compact,
+              _barIcon(
+                Icons.download_for_offline_outlined,
+                _download,
                 tooltip: '下载当前视频',
-                icon: const Icon(Icons.download_for_offline_outlined,
-                    size: 20, color: kAccent),
-                onPressed: _download,
+                iconSize: 20,
+                color: kAccent,
               ),
             // 小窗：与下方控制条的全屏按钮分工，不再重复放大入口
-            IconButton(
-              visualDensity: VisualDensity.compact,
+            _barIcon(
+              Icons.picture_in_picture_alt_outlined,
+              () => context.read<AppState>().setPlayerMode(PlayerMode.mini),
               tooltip: '迷你小窗',
-              icon: Icon(Icons.picture_in_picture_alt_outlined,
-                  size: 19, color: p.textSub),
-              onPressed: () =>
-                  context.read<AppState>().setPlayerMode(PlayerMode.mini),
+              iconSize: 19,
+              color: p.textSub,
             ),
             // 唯一的三点菜单：所有播放增强集中在这里，右上角收纳
-            IconButton(
-              visualDensity: VisualDensity.compact,
+            _barIcon(
+              Icons.more_vert,
+              _showMoreMenu,
               tooltip: '更多播放功能',
-              icon: Icon(Icons.more_vert, size: 19, color: p.textSub),
-              onPressed: _showMoreMenu,
+              iconSize: 19,
+              color: p.textSub,
             ),
-            IconButton(
-              visualDensity: VisualDensity.compact,
-              icon: Icon(Icons.close, size: 19, color: p.textSub),
+            _barIcon(
+              Icons.close,
+              widget.onClose,
               tooltip: '关闭 Nerelict',
-              onPressed: widget.onClose,
+              iconSize: 19,
+              color: p.textSub,
             ),
           ],
         ),
@@ -1375,63 +1510,69 @@ class _PlayerPanelState extends State<PlayerPanel> {
               // 进度条铺满浮层宽度，与画面宽高比无关
               core.progressWidget(),
               const SizedBox(height: 2),
-              SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    IconButton(
-                      visualDensity: VisualDensity.compact,
-                      icon: const Icon(Icons.replay_10,
-                          color: Colors.white, size: 20),
-                      onPressed: () => core
-                          .seekTo(value.position - const Duration(seconds: 10)),
+              // 单行布局：播放三键定宽，右侧胶囊用 Flexible + FittedBox 弹性缩放。
+              // 不用横向滚动列表——滚动容器会和按钮抢手势，稍微带一点位移的点击
+              // 就变成「滚动」，按钮彻底收不到 tap，这是「按不准」的主要来源；
+              // 也不用 Wrap——真实浮层里它的可用宽度会被上层约束压窄，
+              // 结果胶囊竖着排成一列盖在画面上（实测踩到）。
+              Row(
+                children: <Widget>[
+                  _barIcon(
+                    Icons.replay_10,
+                    () => core
+                        .seekTo(value.position - const Duration(seconds: 10)),
+                    tooltip: '后退 10 秒',
+                  ),
+                  _barIcon(
+                    value.isPlaying ? Icons.pause_circle : Icons.play_circle,
+                    _togglePlay,
+                    tooltip: value.isPlaying ? '暂停' : '播放',
+                    iconSize: full ? 32 : 28,
+                    width: kMinTap + 6,
+                  ),
+                  _barIcon(
+                    Icons.forward_10,
+                    () => core
+                        .seekTo(value.position + const Duration(seconds: 10)),
+                    tooltip: '前进 10 秒',
+                  ),
+                  const SizedBox(width: 2),
+                  Expanded(
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.end,
+                      children: <Widget>[
+                        for (final c in <Widget>[
+                          _textChip(_speedChipLabel, _showSpeedSheet),
+                          _textChip('画质', _showQualitySheet),
+                          _textChip('音轨', _showAudioSheet),
+                          _textChip('字幕', _showSubtitleDialog),
+                        ])
+                          Flexible(
+                            child: FittedBox(
+                              fit: BoxFit.scaleDown,
+                              child: c,
+                            ),
+                          ),
+                      ],
                     ),
-                    IconButton(
-                      visualDensity: VisualDensity.compact,
-                      iconSize: full ? 34 : 28,
-                      icon: Icon(
-                        value.isPlaying
-                            ? Icons.pause_circle
-                            : Icons.play_circle,
-                        color: Colors.white,
-                      ),
-                      onPressed: _togglePlay,
+                  ),
+                  if (full)
+                    _barIcon(
+                      Icons.fullscreen_exit,
+                      () => context
+                          .read<AppState>()
+                          .setPlayerMode(PlayerMode.panel),
+                      tooltip: '退出全屏',
+                    )
+                  else
+                    _barIcon(
+                      Icons.fullscreen,
+                      () => context
+                          .read<AppState>()
+                          .setPlayerMode(PlayerMode.fullscreen),
+                      tooltip: '全屏',
                     ),
-                    IconButton(
-                      visualDensity: VisualDensity.compact,
-                      icon: const Icon(Icons.forward_10,
-                          color: Colors.white, size: 20),
-                      onPressed: () => core
-                          .seekTo(value.position + const Duration(seconds: 10)),
-                    ),
-                    const SizedBox(width: 6),
-                    _textChip(formatSpeed(_speed), _showSpeedSheet),
-                    _textChip('画质', _showQualitySheet),
-                    _textChip('音轨', _showAudioSheet),
-                    _textChip('字幕', _showSubtitleDialog),
-                    if (full)
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        tooltip: '退出全屏',
-                        icon: const Icon(Icons.fullscreen_exit,
-                            color: Colors.white, size: 20),
-                        onPressed: () => context
-                            .read<AppState>()
-                            .setPlayerMode(PlayerMode.panel),
-                      )
-                    else
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        tooltip: '全屏',
-                        icon: const Icon(Icons.fullscreen,
-                            color: Colors.white, size: 20),
-                        onPressed: () => context
-                            .read<AppState>()
-                            .setPlayerMode(PlayerMode.fullscreen),
-                      ),
-                  ],
-                ),
+                ],
               ),
             ],
           ),
@@ -1484,29 +1625,86 @@ class _PlayerPanelState extends State<PlayerPanel> {
 
   Widget _status() {
     if (_error != null) {
-      return _PlayerError(message: _error!);
+      return _PlayerError(message: _error!, onRetry: _retry);
     }
     return const Center(child: CircularProgressIndicator(color: kAccent));
   }
 
+  /// 触控目标下限（dp）。Material 建议 48、iOS 44，这里取下限 44。
+  ///
+  /// 播放器过去用 `VisualDensity.compact`，实际命中区只有 28~34dp，
+  /// 手指稍偏就点空——在「页面广告盖过来、只能凭手感找按钮」的场景里，
+  /// 点空一次就可能点到网页上的广告并跳走。
+  static const double kMinTap = kPlayerMinTap;
+
+  /// 固定尺寸的图标按钮：命中区就是视觉外框，不再依赖 IconButton 的默认内边距。
+  Widget _barIcon(
+    IconData icon,
+    VoidCallback onTap, {
+    String? tooltip,
+    double iconSize = 20,
+    double width = kMinTap,
+    Color color = Colors.white,
+  }) {
+    return SizedBox(
+      width: width,
+      height: kMinTap,
+      child: IconButton(
+        padding: EdgeInsets.zero,
+        tooltip: tooltip,
+        iconSize: iconSize,
+        constraints: const BoxConstraints(
+          minWidth: kMinTap,
+          minHeight: kMinTap,
+        ),
+        onPressed: onTap,
+        icon: Icon(icon, color: color, size: iconSize),
+      ),
+    );
+  }
+
+  /// 统一的胶囊尺寸：宽 50dp、高 44dp。
+  ///
+  /// 倍速胶囊过去按文字宽度自适应（1x 只有两个字、1.25x 是五个字符），
+  /// 和旁边「画质 / 音轨 / 字幕」并排时高矮宽窄都不一致，看着像没对齐。
+  /// 现在四个胶囊同宽、文字等宽数字居中，切换倍速时也不会让整行抖动。
+  static const double kChipWidth = 50;
+
   Widget _textChip(String label, VoidCallback onTap) => Padding(
         padding: const EdgeInsets.symmetric(horizontal: 2),
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(6),
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
-            decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.14),
-              borderRadius: BorderRadius.circular(6),
-            ),
-            child: Text(
-              label,
-              style: const TextStyle(fontSize: 10.5, color: Colors.white),
+        child: SizedBox(
+          width: kChipWidth,
+          child: InkWell(
+            onTap: onTap,
+            borderRadius: BorderRadius.circular(8),
+            child: Container(
+              height: kMinTap,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.14),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                label,
+                maxLines: 1,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 11.5,
+                  color: Colors.white,
+                  // 等宽数字：1.0x / 1.25x 切换时胶囊内文字不会左右跳
+                  fontFeatures: <FontFeature>[FontFeature.tabularFigures()],
+                ),
+              ),
             ),
           ),
         ),
       );
+
+  /// 倍速胶囊文案：整数也补一位小数（1.0x），保证四个胶囊长度观感一致
+  String get _speedChipLabel {
+    final rounded = _speed == _speed.roundToDouble();
+    return '${_speed.toStringAsFixed(rounded ? 1 : 2)}x';
+  }
 
   Widget _hintChip(String text) => Container(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
@@ -1524,9 +1722,10 @@ class _PlayerPanelState extends State<PlayerPanel> {
         child: InkWell(
           customBorder: const CircleBorder(),
           onTap: onTap,
-          child: Padding(
-            padding: const EdgeInsets.all(7),
-            child: Icon(icon, size: 17, color: Colors.white),
+          child: SizedBox(
+            width: kMinTap,
+            height: kMinTap,
+            child: Icon(icon, size: 20, color: Colors.white),
           ),
         ),
       );
@@ -1573,8 +1772,10 @@ class _InlineCard extends StatelessWidget {
                     ),
                   ),
                   IconButton(
-                    visualDensity: VisualDensity.compact,
-                    icon: Icon(Icons.close, size: 17, color: p.textFaint),
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(
+                        minWidth: kPlayerMinTap, minHeight: kPlayerMinTap),
+                    icon: Icon(Icons.close, size: 18, color: p.textFaint),
                     onPressed: onClose,
                   ),
                 ],
@@ -1620,9 +1821,10 @@ class _SheetTitle extends StatelessWidget {
 }
 
 class _PlayerError extends StatelessWidget {
-  const _PlayerError({required this.message});
+  const _PlayerError({required this.message, this.onRetry});
 
   final String message;
+  final Future<void> Function()? onRetry;
 
   @override
   Widget build(BuildContext context) {
@@ -1644,6 +1846,20 @@ class _PlayerError extends StatelessWidget {
             maxLines: 2,
             style: const TextStyle(color: Colors.white54, fontSize: 10),
           ),
+          if (onRetry != null) ...[
+            const SizedBox(height: 8),
+            OutlinedButton(
+              onPressed: () => onRetry!(),
+              style: OutlinedButton.styleFrom(
+                // 出错时最想点的就是这个按钮，别让它只有二十来像素高
+                minimumSize: const Size(96, kPlayerMinTap),
+                side: const BorderSide(color: Colors.white24),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
+              ),
+              child: const Text('重试', style: TextStyle(fontSize: 11.5)),
+            ),
+          ],
         ],
       ),
     );

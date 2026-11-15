@@ -8,8 +8,15 @@ import 'package:webview_flutter_android/webview_flutter_android.dart';
 
 import '../models/player_request.dart' show PlayerMode;
 import '../models/sniffed_media.dart';
+import '../services/ad_filter.dart';
+import '../services/app_log.dart';
+import '../services/click_sniff.dart';
+import '../services/click_sniff_js.dart';
+import '../services/user_agent.dart' show UserAgent;
+import '../services/playback_guard_js.dart';
 import '../services/player_probe_js.dart';
 import '../services/sniffer_js.dart';
+import '../services/streaming_proxy.dart';
 import '../services/video_float_js.dart';
 import '../state/app_state.dart';
 import '../state/history_state.dart';
@@ -19,11 +26,19 @@ import '../ui/app_theme.dart';
 import '../ui/history_page.dart';
 import '../ui/neon_progress_bar.dart';
 import '../ui/site_icon.dart';
+import '../ui/variant_picker.dart';
 import '../ui/web_favorites_page.dart';
 import '../ui/widgets/app_menu.dart';
 
 /// 地址栏右上角三点菜单的动作
-enum _UrlMenuAction { favorite, sniff, favorites }
+enum _UrlMenuAction {
+  favorite,
+  sniff,
+  clearLayers,
+  clickHelp,
+  resetClick,
+  favorites,
+}
 
 class BrowserTab extends StatefulWidget {
   const BrowserTab({super.key});
@@ -53,6 +68,34 @@ class _BrowserTabState extends State<BrowserTab> {
   String _floatPage = '';
   String _floatTitle = '';
 
+  /// 浮标是否来自「点击后浮层播放」的捕获（文案会不同）
+  bool _floatOverlay = false;
+
+  /// 最近一次点击的时间：用于判断「点击后立刻跳到广告页」这类跳转
+  DateTime? _lastClickAt;
+
+  /// 本页是否已经因为广告命中提示过，避免反复弹
+  bool _adSkipNotified = false;
+
+  /// 本页是否已经自动回退过一次广告页（防止来回弹）
+  bool _autoSkippedAd = false;
+
+  /// 是否正处于「点了视频却被带到广告页」的途中
+  bool _adDetour = false;
+
+  /// 播放期间的网页弹窗守卫是否已挂上（避免每次 AppState 通知都重复执行脚本）
+  bool _popupGuardOn = false;
+
+  /// 遮挡层 / 点击弹窗的提示每页只弹一次，避免连续点击刷屏
+  bool _shieldNotified = false;
+
+  /// MSE 回扫的提示每页只弹一次：页面用 blob: 播放时，每点一次播放都会触发
+  /// 回扫，逐次弹提示会把人烦死，而这个信息说一次就够了。
+  bool _mseNotified = false;
+
+  /// 本页已清掉的广告遮挡层数量（面板里显示）
+  int _shieldedLayers = 0;
+
   Color? _appliedWebBg;
 
   @override
@@ -60,6 +103,8 @@ class _BrowserTabState extends State<BrowserTab> {
     super.initState();
     _state = context.read<AppState>();
     _state.addBackInterceptor(_handleSystemBack);
+    // 播放器开着的时候把网页的弹窗出口接管掉，关掉立刻还原
+    _state.addListener(_syncPopupGuard);
 
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
@@ -75,6 +120,10 @@ class _BrowserTabState extends State<BrowserTab> {
       ..addJavaScriptChannel(
         'FloatChannel',
         onMessageReceived: (msg) => _onFloatMessage(msg.message),
+      )
+      ..addJavaScriptChannel(
+        'ClickChannel',
+        onMessageReceived: (msg) => _onClickMessage(msg.message),
       )
       ..setNavigationDelegate(
         NavigationDelegate(
@@ -95,7 +144,11 @@ class _BrowserTabState extends State<BrowserTab> {
           },
           onPageStarted: (url) {
             if (!mounted) return;
+            _handleAdNavigation(url);
             _handled.clear(); // 新页面重新开始自动接管
+            _shieldNotified = false;
+            _mseNotified = false;
+            _shieldedLayers = 0;
             // 离开上一页：清空该页的嗅探资源、选中项、播放浮层与临时数据
             _state.resetPageResources();
             _floatUrl = null;
@@ -141,6 +194,9 @@ class _BrowserTabState extends State<BrowserTab> {
       platform.setMediaPlaybackRequiresUserGesture(false);
       platform.setAllowFileAccess(false); // 只加载 http/https，关掉文件访问更稳妥
     }
+
+    // 出站请求用 WebView 的真实 UA，避免「同一个地址、另一个客户端」被 403
+    unawaited(_adoptWebViewUserAgent());
   }
 
   @override
@@ -155,6 +211,7 @@ class _BrowserTabState extends State<BrowserTab> {
 
   @override
   void dispose() {
+    _state.removeListener(_syncPopupGuard);
     _state.removeBackInterceptor(_handleSystemBack);
     // 页面卸载：同样清空本页资源与播放状态（销毁阶段不再通知监听者）
     _state.resetPageResources(notify: false);
@@ -200,20 +257,61 @@ class _BrowserTabState extends State<BrowserTab> {
         );
   }
 
-  /// 三支注入脚本合并成一次通道调用：相比串行三次往返，
-  /// 页面首帧前的空窗更短；任一支脚本异常也不会影响其他两支。
-  String get _injectedScript => <String>[
+  /// 多支注入脚本合并成一次通道调用：相比串行多次往返，
+  /// 页面首帧前的空窗更短；任一支脚本异常也不会影响其他几支。
+  ///
+  /// 点击捕获脚本只在开关打开时注入：关掉后页面里连监听都不挂，
+  /// 而不是挂着监听再把消息丢掉。
+  String _buildInjectedScript({required bool clickCapture}) => <String>[
         kSniffJs,
         kPlayerProbeJs,
-        kVideoFloatJs
+        kVideoFloatJs,
+        if (clickCapture) kClickSniffJs,
       ].map((s) => 'try{\n$s\n}catch(e){}\n').join();
 
-  Future<void> _inject() async {
+  /// 让下载器与播放代理沿用 WebView 的真实 UA。
+  ///
+  /// 源站是按这个 UA 发的地址。换成下载器自带的 UA 去取，等于「同一个地址、
+  /// 另一个客户端」，很多 CDN 会按 UA 与会话不一致直接 403。采纳一次即可，
+  /// 之后所有出站请求都读 [UserAgent.current]。
+  Future<void> _adoptWebViewUserAgent() async {
     try {
-      await _controller.runJavaScript(_injectedScript);
+      final ua = await _controller.getUserAgent();
+      UserAgent.adopt(ua);
+      logD('Browser', 'ua adopted=${ua != null && ua.length > 20}');
+    } catch (_) {
+      // 拿不到就继续用兜底 UA，不影响浏览
+    }
+  }
+
+  Future<void> _inject() async {
+    final capture = context.read<SettingsState>().clickCapture;
+    try {
+      await _controller.runJavaScript(_buildInjectedScript(clickCapture: capture));
     } catch (_) {
       // 页面可能禁止执行脚本，忽略
     }
+    // 换页会丢掉上一页的守卫：播放器还开着就补挂一次
+    if (_popupGuardOn) {
+      try {
+        await _controller.runJavaScript(kPlaybackGuardJs);
+      } catch (_) {}
+    }
+  }
+
+  /// 播放中接管网页的弹窗出口（`window.open` / `alert` / `confirm` / `prompt`）。
+  ///
+  /// 原生 JS 对话框是系统窗口，会压在 Flutter 浮层之上：用户想点播放键，
+  /// 实际点到的是弹窗，还会被拖走。播放器一关就把出口原样还原，
+  /// 不影响站点后续用 `window.open` 打开登录页这类正常功能。
+  void _syncPopupGuard() {
+    if (!mounted) return;
+    final settings = context.read<SettingsState>();
+    final want = _state.player != null && settings.playerBlockPagePopups;
+    if (want == _popupGuardOn) return;
+    _popupGuardOn = want;
+    final js = want ? kPlaybackGuardJs : kPlaybackGuardRestoreJs;
+    unawaited(_controller.runJavaScript(js).catchError((Object _) {}));
   }
 
   /// 网页里检测到可播放视频 -> 在当前页面上打开 Nerelict 浮层。
@@ -232,6 +330,13 @@ class _BrowserTabState extends State<BrowserTab> {
       final data = jsonDecode(raw) as Map<String, dynamic>;
       final url = (data['url'] as String?)?.trim() ?? '';
       if (url.isEmpty || !url.startsWith('http')) return;
+      // 广告媒体的自动接管会让用户刚点完就被广告抢走画面，直接不接
+      final verdict = AdFilter.inspect(url);
+      if (verdict.isAd) {
+        _handled.add(url);
+        _notifyAdSkipped(verdict.reason);
+        return;
+      }
       if (_handled.contains(url)) return;
       _handled.add(url);
 
@@ -254,8 +359,16 @@ class _BrowserTabState extends State<BrowserTab> {
 
   /// 横幅 / 列表里的「播放」：同样只打开浮层，不跳转页面
   Future<void> _openPlayer(SniffedMedia media) async {
-    // 只有 M3U8 播放列表能直接播放；分片组作为整体下载
-    if (!media.isPlayable) return;
+    // 分片组：把已收到的 TS 分片合成播放列表，交给本地代理边下边播。
+    // fMP4 分片缺 init，合出来放不了，只能提示下载——不静默失败。
+    if (!media.isPlayable) {
+      if (!media.needsSegmentDownload) return;
+      final ok = await _playSegmentGroup(media);
+      if (!ok && mounted) {
+        _toast('这组分片没法直接播放（片数太少，或是缺少初始化段的 fMP4），建议下载');
+      }
+      return;
+    }
     _state.selectResource(media.id);
     try {
       await _controller.runJavaScript(kPauseWebVideosJs);
@@ -265,7 +378,31 @@ class _BrowserTabState extends State<BrowserTab> {
       url: media.url,
       title: media.pageTitle,
       referer: media.pageUrl.startsWith('http') ? media.pageUrl : null,
+      headers: media.requestHeaders,
     );
+  }
+
+  /// 分片组直接播放：合成播放列表走代理，鉴权与在线播放一致
+  Future<bool> _playSegmentGroup(SniffedMedia media) async {
+    String? url;
+    try {
+      url = await StreamingProxy.instance.playbackUrlForSegments(
+        media.segmentUrls,
+        referer: media.pageUrl.startsWith('http') ? media.pageUrl : null,
+        headers: media.requestHeaders,
+      );
+    } catch (_) {
+      url = null;
+    }
+    if (url == null || !mounted) return false;
+    try {
+      await _controller.runJavaScript(kPauseWebVideosJs);
+    } catch (_) {}
+    if (!mounted) return false;
+    _state.selectResource(media.id);
+    _state.openPlayer(url: url, title: media.pageTitle);
+    logD('Sniff', 'segment-group play ${media.segmentCount} segs -> $url');
+    return true;
   }
 
   /// 长按网页视频：只显示浮标，不自动打断当前浏览
@@ -278,8 +415,140 @@ class _BrowserTabState extends State<BrowserTab> {
         _floatUrl = url;
         _floatPage = (data['page'] as String?) ?? '';
         _floatTitle = (data['title'] as String?) ?? '';
+        _floatOverlay = false;
       });
     } catch (_) {}
+  }
+
+  /// 点击捕获回调：把「点开才加载」的播放器接进现有链路。
+  ///
+  /// 分工：
+  /// - m3u8 / 分片交给 AppState 并入资源列表（被动嗅探已建好的项会被原地补标记）；
+  /// - mp4 直链只用于浮标提示，不进列表，避免和 HLS 的下载链路混淆；
+  /// - MSE / 跨域 iframe 属于「拿不到地址」的情况，走兜底提示。
+  Future<void> _onClickMessage(String raw) async {
+    if (!mounted) return;
+    final settings = context.read<SettingsState>();
+    if (!settings.clickCapture) return;
+
+    final event = _state.onClickSniffMessage(raw);
+    if (event == null || !mounted) return;
+    if (event.type == ClickEventType.hit ||
+        event.type == ClickEventType.overlay ||
+        event.type == ClickEventType.iframe ||
+        event.type == ClickEventType.mse) {
+      logD('Click', '${event.type.name} #${event.sessionId} '
+          'score=${event.overlayScore} ${event.kind} ${event.url}');
+    }
+
+    switch (event.type) {
+      case ClickEventType.hit:
+        if (AdFilter.isAdUrl(event.url)) break;
+        // 自动接管关闭时不打断浏览，但浮层播放这类明确命中仍给一个入口
+        if (event.isOverlay && !settings.autoTakeover) {
+          _showOverlayFloat(event);
+        }
+        break;
+      case ClickEventType.mse:
+        // blob 地址拿不到真实 URL：退回被动嗅探，把请求记录再扫一遍
+        try {
+          await _controller.runJavaScript(kManualSniffJs);
+          await _controller.runJavaScript(kClickSniffScanJs);
+        } catch (_) {}
+        if (mounted && !_mseNotified) {
+          _mseNotified = true;
+          _toast('页面用 MSE 播放，直链不可见，已回扫请求记录');
+        }
+        break;
+      case ClickEventType.iframe:
+        // 跨域播放器只记进候选列表（⚡ 面板里有「打开继续嗅探」的入口），
+        // 不再每次点击都弹提示：同一页面反复点播放会连续刷屏，反而挡视线。
+        break;
+      case ClickEventType.click:
+        // 记下点击时刻：随后若跳到广告页，用这个时间判断是不是「点出来的」
+        _lastClickAt = DateTime.now();
+        break;
+      case ClickEventType.overlay:
+        break;
+      case ClickEventType.shield:
+        // 遮挡层：第一次命中就说清楚为什么用户「点播放没反应」
+        if (event.kind == 'layer' || event.kind == 'manual') {
+          _shieldedLayers = event.kind == 'manual' ? event.sessionId : _shieldedLayers + 1;
+          logD('Ad', 'shield ${event.kind} total=$_shieldedLayers');
+          if (!_shieldNotified) {
+            _shieldNotified = true;
+            _toast('已移除播放器上的广告遮挡层，再点一次即可播放');
+          }
+        } else if (event.kind == 'blocked') {
+          // 同一次点击的第二条消息：层已经计过数，不再累加也不再提示
+          logD('Ad', 'shield blocked-tap');
+        } else if (event.kind == 'popup') {
+          logD('Ad', 'shield popup #${event.sessionId}');
+          if (!_shieldNotified) {
+            _shieldNotified = true;
+            _toast('已拦截点击广告弹窗；如未起播请再点一次');
+          }
+        }
+        break;
+    }
+  }
+
+  /// 广告页命中提示：同一页只提示一次，避免每次重定向都弹
+  void _notifyAdSkipped(String reason) {
+    if (_adSkipNotified || !mounted) return;
+    _adSkipNotified = true;
+    logD('Ad', 'skip $reason');
+    _toast('已跳过疑似广告（$reason）');
+  }
+
+  /// 处理「点了视频却被带到广告页」：识别、必要时代退回并提示。
+  ///
+  /// 只有高置信度（已知广告网络域名）才自动回退；靠路径关键词判定的
+  /// 只提示不劫持，避免误判把用户从正常页面弹回去。
+  void _handleAdNavigation(String url) {
+    final verdict = AdFilter.inspectPage(url);
+    if (!verdict.isAd) {
+      if (_adDetour) {
+        _adDetour = false;
+        _adSkipNotified = false;
+        if (mounted) _toast('已从广告页返回，再点一次视频即可播放');
+      }
+      _autoSkippedAd = false;
+      return;
+    }
+
+    final clickedAt = _lastClickAt;
+    final fromClick = clickedAt != null &&
+        DateTime.now().difference(clickedAt) < const Duration(seconds: 6);
+    if (!fromClick) return;
+
+    logD('Ad', 'detour ${verdict.reason} $url');
+    _adDetour = true;
+    if (!verdict.isHighConfidenceAd) {
+      _notifyAdSkipped(verdict.reason);
+      return;
+    }
+    if (_autoSkippedAd) return;
+    _autoSkippedAd = true;
+    // 高置信广告页：给它半秒开始渲染就退回，用户不必手动按返回
+    Timer(const Duration(milliseconds: 500), () async {
+      if (!mounted) return;
+      try {
+        if (!await _controller.canGoBack()) return;
+        await _controller.goBack();
+        if (mounted) _toast('已自动跳过广告页，再点一次视频即可播放');
+      } catch (_) {}
+    });
+  }
+
+  void _showOverlayFloat(ClickSniffEvent event) {
+    if (_floatUrl == event.url || _state.player != null) return;
+    setState(() {
+      _floatUrl = event.url;
+      _floatPage = event.page;
+      _floatTitle = event.title;
+      _floatOverlay = true;
+    });
   }
 
   Future<void> _openFloatPlayer() async {
@@ -287,7 +556,10 @@ class _BrowserTabState extends State<BrowserTab> {
     if (url == null) return;
     final page = _floatPage;
     final title = _floatTitle;
-    setState(() => _floatUrl = null);
+    setState(() {
+      _floatUrl = null;
+      _floatOverlay = false;
+    });
     _state.selectResource(url);
     try {
       await _controller.runJavaScript(kPauseWebVideosJs);
@@ -331,15 +603,105 @@ class _BrowserTabState extends State<BrowserTab> {
     });
   }
 
+  /// 手动清理「盖在播放器上的透明广告层」。
+  ///
+  /// 有些站点把广告层做成整屏透明 div，用户点播放其实点在广告上；
+  /// 自动拦截依赖「刚好点在那层上」，这里再给一个不依赖点击的入口。
+  Future<void> _clearAdLayers() async {
+    if (!context.read<SettingsState>().clickCapture) {
+      _toast('该功能随「点击捕获」一起关闭了，先在设置里打开');
+      return;
+    }
+    var count = 0;
+    try {
+      await _controller.runJavaScript(kClickSniffJs);
+      await _controller.runJavaScript('try{window.__ssClearLayers&&window.__ssClearLayers()}catch(e){}');
+      final raw = await _controller
+          .runJavaScriptReturningResult('(window.__ssShell||{}).layers||0');
+      count = int.tryParse(raw.toString().replaceAll('"', '')) ?? 0;
+    } catch (_) {}
+    if (!mounted) return;
+    _toast(count > 0
+        ? '已移除 $count 个遮挡层，现在可以直接点播放'
+        : '这一页没找到透明遮挡层');
+  }
+
   /// 右上角手动嗅探：对当前页面主动重新扫描一次。
   /// 复用同一套上报/聚合逻辑，已有资源不会重复出现。
   Future<void> _manualSniff() async {
     try {
       await _controller.runJavaScript(kSniffJs);
       await _controller.runJavaScript(kManualSniffJs);
+      // 有活跃点击会话时顺带补扫一次窗口内的播放器
+      await _controller.runJavaScript(kClickSniffScanJs);
     } catch (_) {}
     if (!mounted) return;
     _toast('已重新嗅探当前页，点 ⚡ 查看资源');
+  }
+
+  /// 点击捕获说明：写清适用场景、判定规则与兜底方式
+  Future<void> _showClickCaptureHelp() async {
+    final p = paletteOf(context);
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: p.surface,
+        title: Text('点击捕获怎么工作', style: TextStyle(fontSize: 15, color: p.text)),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              _helpBlock(p, '适用场景', '视频要点一下封面 / 剧集才加载，点开后以浮层弹窗'
+                  '（lightbox、模态播放器、iframe 播放器）浮起播放窗口。'),
+              _helpBlock(p, '怎么判定', '点击后 8 秒内出现的播放列表请求、新插入的 '
+                  '<video>、play() 调用都算到这次点击；容器是固定定位、铺满屏幕、'
+                  '带遮罩或类名像弹窗时记为「浮层播放」。'),
+              _helpBlock(p, '不会做什么', '不拦截点击、不阻止默认行为、不点广告，'
+                  '只旁路记录地址；每条地址仍按原有规则去重聚合。'),
+              _helpBlock(p, '拿不到地址时', 'MSE（blob:）会回扫请求记录；跨域 iframe '
+                  '只给播放器地址，可在 ⚡ 资源面板里打开它继续嗅探；实在不行用「手动嗅探」。'),
+            ],
+          ),
+        ),
+        actions: <Widget>[
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _helpBlock(AppPalette p, String title, String body) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(
+            title,
+            style: TextStyle(fontSize: 12.5, color: p.accent, fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 2),
+          Text(body, style: TextStyle(fontSize: 12, color: p.textSub, height: 1.5)),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _resetClickCapture() async {
+    if (!context.read<SettingsState>().clickCapture) {
+      _toast('点击捕获已在设置里关闭');
+      return;
+    }
+    try {
+      await _controller.runJavaScript(kClickSniffResetJs);
+      await _controller.runJavaScript(kClickSniffJs);
+    } catch (_) {}
+    _state.clearClickHints();
+    if (mounted) _toast('已重置点击捕获，下一次点击从 #1 重新计数');
   }
 
   void _goHome() {
@@ -387,8 +749,12 @@ class _BrowserTabState extends State<BrowserTab> {
                         right: 14,
                         bottom: 18,
                         child: _VideoFloatEntry(
+                          overlay: _floatOverlay,
                           onOpen: _openFloatPlayer,
-                          onDismiss: () => setState(() => _floatUrl = null),
+                          onDismiss: () => setState(() {
+                            _floatUrl = null;
+                            _floatOverlay = false;
+                          }),
                         ),
                       ),
                   ],
@@ -520,7 +886,12 @@ class _BrowserTabState extends State<BrowserTab> {
             color: sniffCount > 0 ? p.accent : p.textSub,
             tooltip:
                 sniffCount > 0 ? '已嗅探 $sniffCount 个视频资源，点击查看全部' : '已嗅探的源（点击查看）',
-            onPressed: () => showSniffedSheet(context, _state, _openPlayer),
+            onPressed: () => showSniffedSheet(
+              context,
+              _state,
+              _openPlayer,
+              onOpenPage: _open,
+            ),
           ),
           // 收藏与主动嗅探统一收纳进右上角三点菜单，地址栏只留高频入口
           Builder(
@@ -549,6 +920,24 @@ class _BrowserTabState extends State<BrowserTab> {
                       enabled: _hasPage,
                     ),
                     AppMenuItem<_UrlMenuAction>(
+                      value: _UrlMenuAction.clearLayers,
+                      label: '清理页面遮挡层',
+                      icon: Icons.layers_clear_outlined,
+                      enabled: _hasPage,
+                    ),
+                    AppMenuItem<_UrlMenuAction>(
+                      value: _UrlMenuAction.clickHelp,
+                      label: '点击捕获说明',
+                      icon: Icons.ads_click_outlined,
+                      enabled: _hasPage,
+                    ),
+                    AppMenuItem<_UrlMenuAction>(
+                      value: _UrlMenuAction.resetClick,
+                      label: '重置点击捕获',
+                      icon: Icons.restart_alt,
+                      enabled: _hasPage,
+                    ),
+                    AppMenuItem<_UrlMenuAction>(
                       value: _UrlMenuAction.favorites,
                       label: '全部网页收藏',
                       icon: Icons.bookmarks_outlined,
@@ -572,6 +961,15 @@ class _BrowserTabState extends State<BrowserTab> {
         break;
       case _UrlMenuAction.sniff:
         await _manualSniff();
+        break;
+      case _UrlMenuAction.clearLayers:
+        await _clearAdLayers();
+        break;
+      case _UrlMenuAction.clickHelp:
+        await _showClickCaptureHelp();
+        break;
+      case _UrlMenuAction.resetClick:
+        await _resetClickCapture();
         break;
       case _UrlMenuAction.favorites:
         final url = await Navigator.of(context).push<String>(
@@ -1278,9 +1676,17 @@ class _HistorySection extends StatelessWidget {
 }
 
 /// 长按网页视频后出现的浮标：只提供一个明确的手动接管入口。
+///
+/// [overlay] 为 true 时表示这条来自「点击后浮层播放」的捕获，
+/// 文案换成「浮层视频已捕获」，让用户明白这次不是长按触发的。
 class _VideoFloatEntry extends StatelessWidget {
-  const _VideoFloatEntry({required this.onOpen, required this.onDismiss});
+  const _VideoFloatEntry({
+    required this.overlay,
+    required this.onOpen,
+    required this.onDismiss,
+  });
 
+  final bool overlay;
   final VoidCallback onOpen;
   final VoidCallback onDismiss;
 
@@ -1301,13 +1707,17 @@ class _VideoFloatEntry extends StatelessWidget {
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.smart_display_outlined, size: 17, color: p.accent),
+            Icon(
+              overlay ? Icons.picture_in_picture_alt : Icons.smart_display_outlined,
+              size: 17,
+              color: p.accent,
+            ),
             const SizedBox(width: 7),
             GestureDetector(
               onTap: onOpen,
-              child: const Text(
-                '用 Nerelict 打开',
-                style: TextStyle(
+              child: Text(
+                overlay ? '浮层视频已捕获' : '用 Nerelict 打开',
+                style: const TextStyle(
                   fontSize: 12,
                   color: Colors.white,
                   fontWeight: FontWeight.w600,
@@ -1450,27 +1860,32 @@ void downloadFromMedia(
       : media.suggestedName;
 
   state.selectResource(media.id);
-  state.startDownload(
+  // 交给选流流程：多档清晰度会先让用户挑，单档 / 分片组则直接入队
+  unawaited(startDownloadWithChoice(
+    context,
+    state,
     url: media.url,
     title: title,
     referer: media.pageUrl.isEmpty ? null : media.pageUrl,
     segments: media.needsSegmentDownload ? media.segmentUrls : null,
-  );
-  // 同样只给悬停提示：不打断当前网页与播放
-  state.showHint(media.needsSegmentDownload
-      ? '已将 ${media.segmentCount} 个分片加入下载'
-      : '已加入下载队列');
+    headers: media.requestHeaders,
+    doneHint: media.needsSegmentDownload
+        ? '已将 ${media.segmentCount} 个分片加入下载'
+        : '已加入下载队列',
+  ));
 }
 
 /// 右上角「小闪电」：嗅探结果的唯一入口。
 ///
-/// 底部横幅已移除，这里展示全部聚合结果；面板默认占 62% 并可上拖到 95%，
+/// 底部横幅已移除，这里展示全部聚合结果；面板默认占 82% 并上拖到 95%，
 /// 点条目可查看完整地址，播放/下载入口保持原样。
+/// [onOpenPage] 用于打开跨域 iframe 播放器地址，继续在那一页里嗅探。
 void showSniffedSheet(
   BuildContext pageContext,
   AppState state,
-  Future<void> Function(SniffedMedia media) onPlay,
-) {
+  Future<void> Function(SniffedMedia media) onPlay, {
+  required void Function(String url) onOpenPage,
+}) {
   final p = paletteOf(pageContext);
 
   // 播放器浮层始终置顶，会盖住底部弹窗：临时收成迷你小窗，不打断播放。
@@ -1497,6 +1912,7 @@ void showSniffedSheet(
         pageContext: pageContext,
         state: state,
         onPlay: onPlay,
+        onOpenPage: onOpenPage,
         hasPlayer: hasPlayer,
       ),
     ),
@@ -1535,12 +1951,14 @@ class _SniffSheet extends StatefulWidget {
     required this.pageContext,
     required this.state,
     required this.onPlay,
+    required this.onOpenPage,
     required this.hasPlayer,
   });
 
   final BuildContext pageContext;
   final AppState state;
   final Future<void> Function(SniffedMedia media) onPlay;
+  final void Function(String url) onOpenPage;
   final bool hasPlayer;
 
   @override
@@ -1552,6 +1970,12 @@ class _SniffSheetState extends State<_SniffSheet> {
   String _query = '';
   _SniffGroup? _group;
 
+  /// 只看「点击后浮层播放」的捕获结果
+  bool _overlayOnly = false;
+
+  /// 是否展开疑似广告（默认折叠：列表顶部不再被广告占满）
+  bool _showAds = false;
+
   @override
   void dispose() {
     _search.dispose();
@@ -1561,11 +1985,14 @@ class _SniffSheetState extends State<_SniffSheet> {
   List<SniffedMedia> _visible(List<SniffedMedia> all) {
     final q = _query.trim().toLowerCase();
     return all.where((m) {
+      if (m.suspectAd && !_showAds) return false;
+      if (_overlayOnly && !m.overlayPlay) return false;
       if (_group != null && _groupOf(m) != _group) return false;
       if (q.isEmpty) return true;
       return m.label.toLowerCase().contains(q) ||
           m.url.toLowerCase().contains(q) ||
-          m.kindLabel.toLowerCase().contains(q);
+          m.kindLabel.toLowerCase().contains(q) ||
+          m.captureNote.toLowerCase().contains(q);
     }).toList();
   }
 
@@ -1580,6 +2007,7 @@ class _SniffSheetState extends State<_SniffSheet> {
         title: title,
         referer: m.pageUrl.isEmpty ? null : m.pageUrl,
         segments: m.needsSegmentDownload ? m.segmentUrls : null,
+        headers: m.requestHeaders,
       );
     }
     Navigator.of(context).pop();
@@ -1594,6 +2022,9 @@ class _SniffSheetState extends State<_SniffSheet> {
       builder: (context, _) {
         final all = widget.state.sniffed;
         final items = _visible(all);
+        final hints = widget.state.clickHints;
+        final overlayCount = all.where((m) => m.overlayPlay).length;
+        final adCount = all.where((m) => m.suspectAd).length;
         final counts = <_SniffGroup, int>{
           for (final g in _SniffGroup.values)
             g: all.where((m) => _groupOf(m) == g).length,
@@ -1604,51 +2035,63 @@ class _SniffSheetState extends State<_SniffSheet> {
         return Column(
           children: <Widget>[
             _header(p, all, items),
-            _toolbar(p, groups, counts, all.length),
+            _toolbar(p, groups, counts, all.length, overlayCount, adCount),
             Expanded(
-              child: all.isEmpty
-                  ? Center(
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 32),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: <Widget>[
-                            Icon(Icons.radar_outlined,
-                                size: 40, color: p.textDisabled),
-                            const SizedBox(height: 12),
-                            Text(
-                              '还没有嗅探到视频资源',
-                              style:
-                                  TextStyle(fontSize: 13, color: p.textFaint),
+              child: Column(
+                children: <Widget>[
+                  if (hints.isNotEmpty) _hintCard(p, hints),
+                  Expanded(
+                    child: all.isEmpty
+                        ? Center(
+                            child: Padding(
+                              padding:
+                                  const EdgeInsets.symmetric(horizontal: 32),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: <Widget>[
+                                  Icon(Icons.radar_outlined,
+                                      size: 40, color: p.textDisabled),
+                                  const SizedBox(height: 12),
+                                  Text(
+                                    '还没有嗅探到视频资源',
+                                    style: TextStyle(
+                                        fontSize: 13, color: p.textFaint),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    '先点一下页面里的视频封面，或点地址栏右侧的雷达图标手动嗅探',
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                        fontSize: 11.5, color: p.textDisabled),
+                                  ),
+                                ],
+                              ),
                             ),
-                            const SizedBox(height: 4),
-                            Text(
-                              '播放网页里的视频，或点地址栏右侧的雷达图标手动嗅探',
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                  fontSize: 11.5, color: p.textDisabled),
-                            ),
-                          ],
-                        ),
-                      ),
-                    )
-                  : items.isEmpty
-                      ? Center(
-                          child: Text(
-                            '当前筛选下没有资源',
-                            style:
-                                TextStyle(fontSize: 12.5, color: p.textFaint),
-                          ),
-                        )
-                      : ListView.separated(
-                          padding: EdgeInsets.only(
-                              bottom: widget.hasPlayer ? 140 : 20),
-                          itemCount: items.length,
-                          separatorBuilder: (_, __) =>
-                              Divider(height: 1, color: p.border),
-                          itemBuilder: (context, i) =>
-                              _tile(context, p, items[i]),
-                        ),
+                          )
+                        : items.isEmpty
+                            ? Center(
+                                child: Text(
+                                  _overlayOnly
+                                      ? '还没有捕获到浮层播放的视频'
+                                      : (adCount > 0 && !_showAds
+                                          ? '只嗅探到 $adCount 个疑似广告，点「疑似广告」可查看'
+                                          : '当前筛选下没有资源'),
+                                  style: TextStyle(
+                                      fontSize: 12.5, color: p.textFaint),
+                                ),
+                              )
+                            : ListView.separated(
+                                padding: EdgeInsets.only(
+                                    bottom: widget.hasPlayer ? 140 : 20),
+                                itemCount: items.length,
+                                separatorBuilder: (_, __) =>
+                                    Divider(height: 1, color: p.border),
+                                itemBuilder: (context, i) =>
+                                    _tile(context, p, items[i]),
+                              ),
+                  ),
+                ],
+              ),
             ),
           ],
         );
@@ -1710,6 +2153,8 @@ class _SniffSheetState extends State<_SniffSheet> {
     List<_SniffGroup> groups,
     Map<_SniffGroup, int> counts,
     int total,
+    int overlayCount,
+    int adCount,
   ) {
     return Column(
       children: <Widget>[
@@ -1763,6 +2208,24 @@ class _SniffSheetState extends State<_SniffSheet> {
               for (final g in groups)
                 _chip(p, g.label, counts[g] ?? 0, _group == g,
                     () => setState(() => _group = g)),
+              if (overlayCount > 0)
+                _chip(
+                  p,
+                  '浮层捕获',
+                  overlayCount,
+                  _overlayOnly,
+                  () => setState(() => _overlayOnly = !_overlayOnly),
+                  icon: Icons.picture_in_picture_alt,
+                ),
+              if (adCount > 0)
+                _chip(
+                  p,
+                  '疑似广告',
+                  adCount,
+                  _showAds,
+                  () => setState(() => _showAds = !_showAds),
+                  icon: Icons.report_gmailerrorred,
+                ),
             ],
           ),
         ),
@@ -1776,8 +2239,9 @@ class _SniffSheetState extends State<_SniffSheet> {
     String label,
     int count,
     bool active,
-    VoidCallback onTap,
-  ) {
+    VoidCallback onTap, {
+    IconData? icon,
+  }) {
     return Padding(
       padding: const EdgeInsets.only(right: 8),
       child: InkWell(
@@ -1796,6 +2260,10 @@ class _SniffSheetState extends State<_SniffSheet> {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: <Widget>[
+              if (icon != null) ...[
+                Icon(icon, size: 12, color: active ? p.accent : p.textFaint),
+                const SizedBox(width: 4),
+              ],
               Text(
                 label,
                 style: TextStyle(
@@ -1819,18 +2287,77 @@ class _SniffSheetState extends State<_SniffSheet> {
     );
   }
 
+  /// 跨域 iframe 播放器：拿不到里面的视频地址，只能提供「打开它继续嗅探」。
+  Widget _hintCard(AppPalette p, List<ClickSniffEvent> hints) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      padding: const EdgeInsets.fromLTRB(12, 9, 12, 8),
+      decoration: BoxDecoration(
+        color: p.surfaceAlt,
+        borderRadius: BorderRadius.circular(p.isCyber ? 3 : 10),
+        border: Border.all(color: p.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Icon(Icons.open_in_new, size: 14, color: p.accent),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  '跨域播放器 ${hints.length} 个 · 打开后可在那一页继续嗅探',
+                  style: TextStyle(fontSize: 11.5, color: p.textSub),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 2),
+          for (final h in hints.take(3))
+            InkWell(
+              onTap: () {
+                Navigator.of(context).pop();
+                widget.onOpenPage(h.url);
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 5),
+                child: Text(
+                  h.url,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 10.5, color: p.textFaint),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   Widget _tile(BuildContext context, AppPalette p, SniffedMedia m) {
     final agg = <String>[
       if (m.variantCount > 0) '${m.variantCount + 1} 个地址',
       if (m.segmentCount > 0) '${m.segmentCount} 个分片',
     ].join(' · ');
+    final note = <String>[
+      if (m.suspectAd) '疑似广告 · ${m.adReason}',
+      // 鉴权头只在内存里、不落盘，这里只提示「带了头」，不暴露名字之外的内容
+      if (m.requestHeaders.isNotEmpty) '已带鉴权头',
+      m.captureNote,
+    ].where((e) => e.isNotEmpty).join(' · ');
     return ListTile(
       dense: true,
       onTap: () => showFullMediaUrl(context, p, m),
       leading: Icon(
-        m.isPlayable ? Icons.playlist_play : Icons.view_list_outlined,
+        m.suspectAd
+            ? Icons.report_gmailerrorred
+            : (m.overlayPlay
+                ? Icons.picture_in_picture_alt
+                : (m.isPlayable
+                    ? Icons.playlist_play
+                    : Icons.view_list_outlined)),
         size: 20,
-        color: p.accent,
+        color: m.suspectAd ? p.textFaint : p.accent,
       ),
       title: Text(
         m.label,
@@ -1843,10 +2370,16 @@ class _SniffSheetState extends State<_SniffSheet> {
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
           Text(
+            // 判定说明放最前：窄屏下副标题会被省略号截断，
+            // 「疑似广告 · 路径段 /ads」必须第一眼就能看到
+            '${note.isEmpty ? '' : '$note · '}'
             '${m.kindLabel} · ${m.source}${agg.isEmpty ? '' : ' · $agg'}',
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-            style: TextStyle(fontSize: 11, color: p.textFaint),
+            style: TextStyle(
+              fontSize: 11,
+              color: m.overlayPlay ? p.accent : p.textFaint,
+            ),
           ),
           const SizedBox(height: 2),
           Text(
@@ -1860,9 +2393,9 @@ class _SniffSheetState extends State<_SniffSheet> {
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
-          if (m.isPlayable)
+          if (m.isPlayable || m.needsSegmentDownload)
             IconButton(
-              tooltip: '用 Nerelict 打开',
+              tooltip: m.isPlayable ? '用 Nerelict 打开' : '用已嗅探的分片边下边播',
               icon: Icon(Icons.play_circle_outline, color: p.accent),
               onPressed: () {
                 Navigator.of(context).pop();

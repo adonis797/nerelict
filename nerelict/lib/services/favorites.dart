@@ -2,6 +2,8 @@ import 'dart:convert';
 
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'header_policy.dart';
+
 /// 播放器内「收藏」的一条记录。
 class FavoriteItem {
   const FavoriteItem({
@@ -10,6 +12,7 @@ class FavoriteItem {
     required this.addedAt,
     required this.local,
     this.referer,
+    this.headers = const <String, String>{},
   });
 
   final String url;
@@ -18,23 +21,38 @@ class FavoriteItem {
   final bool local;
   final String? referer;
 
+  /// 收藏时该地址带的鉴权头。token 通常几小时就过期，过期后重播仍会失败，
+  /// 但没过期时能省掉一次「重新嗅探」，所以跟着收藏一起存。
+  final Map<String, String> headers;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
         'url': url,
         'title': title,
         'addedAt': addedAt,
         'local': local,
         if (referer != null) 'referer': referer,
+        if (headers.isNotEmpty) 'headers': headers,
       };
 
   static FavoriteItem? fromJson(dynamic raw) {
     try {
       final m = Map<String, dynamic>.from(raw as Map);
+      final rawHeaders = m['headers'];
+      final headers = <String, String>{};
+      if (rawHeaders is Map) {
+        for (final e in rawHeaders.entries) {
+          final k = e.key;
+          final v = e.value;
+          if (k is String && v is String) headers[k] = v;
+        }
+      }
       return FavoriteItem(
         url: m['url'] as String? ?? '',
         title: m['title'] as String? ?? '',
         addedAt: (m['addedAt'] as num?)?.toInt() ?? 0,
         local: m['local'] as bool? ?? false,
         referer: m['referer'] as String?,
+        headers: HeaderPolicy.sanitize(headers),
       );
     } catch (_) {
       return null;
@@ -111,6 +129,7 @@ class FavoritesStore {
           addedAt: items[i].addedAt,
           local: items[i].local,
           referer: items[i].referer,
+          headers: items[i].headers,
         );
         changed = true;
       }

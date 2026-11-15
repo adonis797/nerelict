@@ -39,6 +39,7 @@ class SettingsState extends ChangeNotifier {
   static const _kLightTheme = 'light_theme'; // 旧版本布尔开关，仅用于迁移
   static const _kThemeMode = 'theme_mode';
   static const _kAutoTakeover = 'auto_takeover';
+  static const _kClickCapture = 'click_capture';
   static const _kMp4Conversion = 'mp4_conversion';
   static const _kSearchEngine = 'search_engine';
 
@@ -46,6 +47,7 @@ class SettingsState extends ChangeNotifier {
   static const _kPlayerMediaControls = 'player_media_controls';
   static const _kPlayerAutoResume = 'player_auto_resume';
   static const _kPlayerGestures = 'player_gestures';
+  static const _kPlayerBlockPagePopups = 'player_block_page_popups';
   static const _kPlayerStreamingCache = 'player_streaming_cache';
   static const _kPlayerCacheLimitMb = 'player_cache_limit_mb';
   static const _kPlayerSpeed = 'player_speed';
@@ -61,6 +63,9 @@ class SettingsState extends ChangeNotifier {
 
   AppThemeMode _themeMode = AppThemeMode.dark;
   bool _autoTakeover = true;
+
+  /// 点击捕获：识别「点开才加载」的浮层播放器（默认开启）
+  bool _clickCapture = true;
   bool _mp4Conversion = true;
   SearchEngine _searchEngine = SearchEngine.google;
   String? _downloadDirUri;
@@ -69,6 +74,10 @@ class SettingsState extends ChangeNotifier {
   bool _playerMediaControls = false;
   bool _playerAutoResume = true;
   bool _playerGestures = true;
+
+  /// 播放期间拦截网页弹窗（window.open / alert / confirm / prompt）。
+  /// 原生对话框会压在播放器之上，用户点按钮时点到的是弹窗而不是播放器。
+  bool _playerBlockPagePopups = true;
   bool _playerStreamingCache = false;
   int _playerCacheLimitMb = kDefaultCacheLimitMb;
   double _playerSpeed = 1.0;
@@ -95,6 +104,7 @@ class SettingsState extends ChangeNotifier {
   /// 兼容旧调用：只有浅色主题才算「浅色」
   bool get lightTheme => _themeMode == AppThemeMode.light;
   bool get autoTakeover => _autoTakeover;
+  bool get clickCapture => _clickCapture;
   bool get mp4Conversion => _mp4Conversion;
   SearchEngine get searchEngine => _searchEngine;
   bool get ready => _ready;
@@ -109,6 +119,9 @@ class SettingsState extends ChangeNotifier {
 
   /// 画面手势（亮度 / 音量 / 进度 / 长按倍速）
   bool get playerGestures => _playerGestures;
+
+  /// 播放期间拦截网页弹窗与对话框
+  bool get playerBlockPagePopups => _playerBlockPagePopups;
 
   /// 边下边播：本地代理缓存 HLS 分片（默认关闭）
   bool get playerStreamingCache => _playerStreamingCache;
@@ -141,6 +154,7 @@ class SettingsState extends ChangeNotifier {
         legacyLight: prefs.getBool(_kLightTheme) ?? false,
       );
       _autoTakeover = prefs.getBool(_kAutoTakeover) ?? true;
+      _clickCapture = prefs.getBool(_kClickCapture) ?? true;
       _mp4Conversion = prefs.getBool(_kMp4Conversion) ?? true;
       _searchEngine =
           SearchEngineX.fromStorage(prefs.getString(_kSearchEngine));
@@ -149,6 +163,8 @@ class SettingsState extends ChangeNotifier {
       _playerMediaControls = prefs.getBool(_kPlayerMediaControls) ?? false;
       _playerAutoResume = prefs.getBool(_kPlayerAutoResume) ?? true;
       _playerGestures = prefs.getBool(_kPlayerGestures) ?? true;
+      _playerBlockPagePopups =
+          prefs.getBool(_kPlayerBlockPagePopups) ?? true;
       _playerStreamingCache = prefs.getBool(_kPlayerStreamingCache) ?? false;
       final savedLimitMb = prefs.getInt(_kPlayerCacheLimitMb) ?? kDefaultCacheLimitMb;
       _playerCacheLimitMb = kCacheLimitOptionsMb.contains(savedLimitMb)
@@ -207,6 +223,14 @@ class SettingsState extends ChangeNotifier {
     await _save(_kAutoTakeover, value);
   }
 
+  /// 点击捕获：只记录点击后的取流行为，不拦截、不改写页面交互
+  Future<void> setClickCapture(bool value) async {
+    if (_clickCapture == value) return;
+    _clickCapture = value;
+    notifyListeners();
+    await _save(_kClickCapture, value);
+  }
+
   /// 关闭时不显示转换按钮，也不执行任何转换
   Future<void> setMp4Conversion(bool value) async {
     if (_mp4Conversion == value) return;
@@ -262,6 +286,13 @@ class SettingsState extends ChangeNotifier {
     _playerGestures = value;
     notifyListeners();
     await _save(_kPlayerGestures, value);
+  }
+
+  Future<void> setPlayerBlockPagePopups(bool value) async {
+    if (_playerBlockPagePopups == value) return;
+    _playerBlockPagePopups = value;
+    notifyListeners();
+    await _save(_kPlayerBlockPagePopups, value);
   }
 
   Future<void> setPlayerStreamingCache(bool value) async {

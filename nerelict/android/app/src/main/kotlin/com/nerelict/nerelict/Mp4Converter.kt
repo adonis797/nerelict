@@ -13,13 +13,18 @@ import java.nio.ByteBuffer
  * TS -> MP4 无重编码转封装（MediaExtractor + MediaMuxer）。
  *
  * 只搬运已编码的 H.264 / HEVC + AAC 样本，不重新编码，速度快、不损失画质。
- * 针对 HLS（m3u8 分片合并出来的 TS）常见的「转出来打不开」做了四件事：
- *  1. 时间戳重建：分片拼接后 PTS 可能回退到 0，B 帧也会让 PTS 倒退，
- *     统一做「小回退压平、大回退整体平移」，保证单调递增；
+ * 针对 HLS（m3u8 分片合并出来的 TS）常见的「转出来打不开 / 播放卡顿」做了五件事：
+ *  1. 时间轴重建：先试读一段样本判断该轨是否带 B 帧。带 B 帧时解码顺序的 PTS 会周期性回退，
+ *     MediaMuxer 实测并不能保住这种回退（它会把时间戳顶成「上一帧 + 最小间隔」，
+ *     产物里 46% 的相邻帧显示时长为 0，剩下的帧间隔翻倍，播放就是掉帧、卡顿）。
+ *     所以这里按解码顺序重建等间隔网格：帧间隔取源的中位帧间隔，
+ *     帧序仍是正确的解码顺序，时间轴均匀，播放才平滑。
  *  2. AAC 的 csd-0 若是 ADTS 头，转换为 AudioSpecificConfig 再交给 MP4 封装，
  *     否则写出的 esds 非法，播放器无法创建音频解码器；
  *  3. 视频从第一个关键帧开始写，避免开头缺参考帧导致黑屏 / 花屏；
- *  4. 产物用系统解码器校验（时长 + 首帧），不合格就换一种时间线策略重来。
+ *  4. 产物用系统解码器校验（时长 + 首帧），再抽查时间轴是否塌陷，
+ *     不合格直接判失败并删掉产物，不留下「能打开但卡」的坏文件；
+ *  5. 分片缺段 / 广告插播造成的 PTS 大跳会被计入网格缺口，避免整段被压缩后音画错位。
  */
 object Mp4Converter {
 
@@ -29,8 +34,13 @@ object Mp4Converter {
     private const val VIDEO_HEVC = MediaFormat.MIMETYPE_VIDEO_HEVC
     private const val VIDEO_MPEG4 = MediaFormat.MIMETYPE_VIDEO_MPEG4
 
-    private const val VIDEO_STEP_US = 33_000L
-    private const val AUDIO_STEP_US = 21_000L
+    /** 拿不到帧率且探测失败时的兜底（约 30fps），正常路径不会用到 */
+    private const val FALLBACK_VIDEO_STEP_US = 33_000L
+    private const val FALLBACK_AUDIO_STEP_US = 21_000L
+
+    /** 帧间隔的合理范围：0.5fps ~ 125fps */
+    private const val MIN_FRAME_DUR_US = 8_000L
+    private const val MAX_FRAME_DUR_US = 1_000_000L
 
     fun convert(inputPath: String): String {
         val input = File(inputPath)
@@ -45,19 +55,11 @@ object Mp4Converter {
         val target = uniqueTarget(input)
         var success = false
         try {
-            // 第一遍：保留原始时间线（只做必要修正），画质与音画同步最好
-            runCatching { remux(input, target, syntheticTimeline = false) }
-            if (probe(target)) {
-                success = true
-            } else {
-                target.delete()
-                // 第二遍：完全按解码顺序重建时间线，保证一定能播
-                remux(input, target, syntheticTimeline = true)
-                success = probe(target)
+            val expectedMs = remux(input, target)
+            if (!probe(target, expectedMs)) {
+                throw IllegalArgumentException("转换产物未通过校验（时长或时间轴异常），可能不是标准 TS 流")
             }
-            if (!success) {
-                throw IllegalArgumentException("转换产物无法解码，可能不是标准 TS 流")
-            }
+            success = true
             return target.absolutePath
         } finally {
             if (!success) target.delete()
@@ -76,7 +78,88 @@ object Mp4Converter {
         return target
     }
 
-    private fun remux(input: File, target: File, syntheticTimeline: Boolean) {
+    /** 一条轨道的探测结果 */
+    private data class TrackTiming(
+        /** 该轨第一个样本的原始 PTS（µs），用于保留音轨与视频之间的起始偏移 */
+        val firstPtsUs: Long,
+        /** 相邻帧的典型间隔（µs），取排序后 PTS 正间隔的中位数 */
+        val frameDurUs: Long,
+        /** 解码顺序里 PTS 是否周期性回退（带 B 帧） */
+        val reordered: Boolean,
+    )
+
+    /**
+     * 把一条轨道的原始 PTS 转成可写入 MP4 的时间轴。
+     *
+     * MediaMuxer 收到回退的 PTS 并不会写 ctts 表达显示顺序，而是把时间戳顶成
+     * 「上一帧 + 最小间隔」——实测产物里 46% 的相邻帧显示时长为 0，其余帧间隔翻倍，
+     * 播放表现就是卡顿。所以带 B 帧的视频必须自己重建时间轴：
+     * [Mode.GRID] 按解码序号 × 帧间隔铺成等间隔网格，帧序仍是正确解码顺序，
+     * 时间轴均匀；[Mode.STRICT] 用于音频与本身就单调的轨道，只做必要的防回退。
+     */
+    private class TrackClock(
+        private val mode: Mode,
+        val frameDurUs: Long,
+        private val basePtsUs: Long,
+        private val startUs: Long,
+    ) {
+        enum class Mode { STRICT, GRID }
+
+        private var count = 0L
+        private var shift = 0L
+        private var gap = 0L
+        private var firstRaw = Long.MIN_VALUE
+        private var lastRaw = Long.MIN_VALUE
+        private var lastOut = -1L
+        private var maxOut = 0L
+
+        fun next(rawPts: Long, stepUs: Long): Long {
+            if (mode == Mode.GRID) {
+                if (lastRaw != Long.MIN_VALUE) {
+                    val jump = rawPts - lastRaw
+                    // 分片缺段 / 广告插播：把缺口补回网格，否则整段被压缩、与音频错位
+                    if (jump > frameDurUs * 8) gap += jump - frameDurUs
+                }
+                lastRaw = rawPts
+                val out = startUs + gap + count * frameDurUs
+                count++
+                lastOut = out
+                if (out > maxOut) maxOut = out
+                return out
+            }
+
+            val base = if (basePtsUs >= 0) {
+                basePtsUs
+            } else {
+                if (firstRaw == Long.MIN_VALUE) firstRaw = rawPts
+                firstRaw
+            }
+            var value = rawPts - base + startUs + shift
+            if (lastOut >= 0 && value <= lastOut) {
+                val back = lastOut - value
+                value = if (back > 1_000_000L) {
+                    // 时间轴被重置（分段拼接 / 广告插播）：整体平移，保持连续
+                    shift += back + stepUs
+                    lastOut + stepUs
+                } else {
+                    // 时间戳相同或轻微回退：只压 1µs，保证严格递增
+                    lastOut + 1
+                }
+            }
+            if (value < 0) value = 0
+            lastOut = value
+            if (value > maxOut) maxOut = value
+            return value
+        }
+
+        /** ADTS 拆帧后由调用方告知实际写到的最后一个时间戳 */
+        fun markWritten(ptsUs: Long) {
+            if (ptsUs > lastOut) lastOut = ptsUs
+            if (ptsUs > maxOut) maxOut = ptsUs
+        }
+    }
+
+    private fun remux(input: File, target: File): Long {
         val extractor = MediaExtractor()
         var muxer: MediaMuxer? = null
         try {
@@ -112,13 +195,78 @@ object Mp4Converter {
                 44100
             }
             // AAC-LC 每帧 1024 个采样点
-            val frameDurUs = if (audioSampleRate > 0) {
+            val audioFrameDurUs = if (audioSampleRate > 0) {
                 (1024L * 1_000_000L) / audioSampleRate
             } else {
-                AUDIO_STEP_US
+                FALLBACK_AUDIO_STEP_US
             }
 
             val selected = listOf(videoTrack, audioTrack).filter { it >= 0 }
+            val timings = HashMap<Int, TrackTiming>()
+            val declaredFps = if (videoTrack >= 0) {
+                readFrameRate(extractor.getTrackFormat(videoTrack))
+            } else {
+                0.0
+            }
+            for (i in selected) {
+                val limit = if (i == videoTrack) 180 else 90
+                analyzeTrack(input, i, limit)?.let { timings[i] = it }
+            }
+
+            // 起始偏移：统一按最早那条轨道归一，保留音轨与视频的相对起点，
+            // 避免各自从 0 开始造成几十毫秒的音画错位。
+            val allKnown = selected.all { timings[it] != null }
+            val globalMin = if (allKnown) {
+                selected.mapNotNull { timings[it]?.firstPtsUs }.minOrNull() ?: 0L
+            } else {
+                0L
+            }
+
+            val clocks = HashMap<Int, TrackClock>()
+            for (i in selected) {
+                val t = timings[i]
+                val start = if (allKnown && t != null) {
+                    (t.firstPtsUs - globalMin).coerceAtLeast(0L)
+                } else {
+                    0L
+                }
+                val isVideo = i == videoTrack
+                // 帧间隔优先用实测中位数：TS 的 PTS 是 90kHz 整数刻度，
+                // 29.97fps 实测是 33.366ms；若改用 KEY_FRAME_RATE（常写成整数 30），
+                // 长时间视频会以每秒 0.1% 的速度漂移，一小时后音画差出 1~2 秒。
+                // 音频不用实测值：音频样本是 PES，一个样本可能含多帧，
+                // 实测间隔会是几百毫秒，真正的步长是 1024 个采样点。
+                var dur = when {
+                    !isVideo -> audioFrameDurUs
+                    t != null && t.frameDurUs > 0 -> t.frameDurUs
+                    isVideo && declaredFps > 0 -> (1_000_000.0 / declaredFps).toLong()
+                    else -> FALLBACK_VIDEO_STEP_US
+                }
+                dur = dur.coerceIn(MIN_FRAME_DUR_US, MAX_FRAME_DUR_US)
+                // 视频带 B 帧时优先保留原始 PTS，让 MediaMuxer 用 ctts 记录显示顺序；
+                // 只有兜底那一遍才重建网格。音频 PTS 单调，永远走强制单调。
+                // 带 B 帧的视频必须重建网格（MediaMuxer 保不住回退）；
+                // 音频和本就单调的轨道走强制单调，保留原始时间轴。
+                val mode = if (isVideo && t != null && t.reordered) {
+                    TrackClock.Mode.GRID
+                } else {
+                    TrackClock.Mode.STRICT
+                }
+                clocks[i] = TrackClock(
+                    mode = mode,
+                    frameDurUs = dur,
+                    basePtsUs = t?.firstPtsUs ?: -1L,
+                    startUs = start,
+                )
+                if (mode != TrackClock.Mode.STRICT) {
+                    Log.i(
+                        TAG,
+                        "timeline: track=$i mode=$mode frameDurUs=$dur " +
+                            "reordered=${t?.reordered == true} startUs=$start"
+                    )
+                }
+            }
+
             val muxIndex = HashMap<Int, Int>()
             var rotation = 0
 
@@ -147,14 +295,11 @@ object Mp4Converter {
             val scratch = ByteBuffer.allocateDirect(256 * 1024)
             val info = MediaCodec.BufferInfo()
 
-            // 每条轨道各自的时间线状态
-            val basePts = HashMap<Int, Long>()
-            val shift = HashMap<Int, Long>()
-            val lastPts = HashMap<Int, Long>()
             val written = HashMap<Int, Int>()
             val dropped = HashMap<Int, Int>()
             var videoSynced = videoTrack < 0
             var adtsFramesTotal = 0
+            var maxOutPts = 0L
 
             while (true) {
                 buffer.clear()
@@ -172,8 +317,9 @@ object Mp4Converter {
                 val flags = extractor.sampleFlags
                 val rawPts = extractor.sampleTime
                 val outTrack = muxIndex[srcTrack]
+                val clock = clocks[srcTrack]
 
-                if (outTrack == null || size <= 0 || rawPts < 0) {
+                if (outTrack == null || clock == null || size <= 0 || rawPts < 0) {
                     if (!extractor.advance()) break
                     continue
                 }
@@ -187,29 +333,12 @@ object Mp4Converter {
                     videoSynced = true
                 }
 
-                val step = if (srcTrack == videoTrack) VIDEO_STEP_US else frameDurUs
-                val pts: Long
-                if (syntheticTimeline) {
-                    val prev = lastPts[srcTrack]
-                    pts = if (prev == null) 0L else prev + step
+                val step = if (srcTrack == videoTrack) {
+                    clock.frameDurUs
                 } else {
-                    val base = basePts.getOrPut(srcTrack) { rawPts }
-                    var value = rawPts - base + (shift[srcTrack] ?: 0L)
-                    val prev = lastPts[srcTrack]
-                    if (prev != null && value <= prev) {
-                        val back = prev - value
-                        value = if (back > 1_000_000L) {
-                            // 时间轴被重置（分段拼接 / 广告插播）：整体平移，保持连续
-                            shift[srcTrack] = (shift[srcTrack] ?: 0L) + back + step
-                            prev + step
-                        } else {
-                            // 同轨样本时间戳相同或轻微倒退：压平到 +1us
-                            prev + 1
-                        }
-                    }
-                    if (value < 0) value = 0
-                    pts = value
+                    audioFrameDurUs
                 }
+                val pts = clock.next(rawPts, step)
 
                 // AAC(ADTS)：把样本拆成单个 ADTS 帧，去头后逐帧写入。
                 // 拆帧后每帧一个样本，时间戳按帧长累加，音画同步也更准。
@@ -228,8 +357,9 @@ object Mp4Converter {
                             } else {
                                 dropped[srcTrack] = (dropped[srcTrack] ?: 0) + 1
                             }
-                            lastPts[srcTrack] = framePts
-                            framePts += frameDurUs
+                            clock.markWritten(framePts)
+                            if (framePts > maxOutPts) maxOutPts = framePts
+                            framePts += audioFrameDurUs
                             p += 2
                         }
                         if (!extractor.advance()) break
@@ -237,9 +367,9 @@ object Mp4Converter {
                     }
                 }
 
-                lastPts[srcTrack] = pts
                 if (writeSlice(muxer, outTrack, buffer, 0, size, pts, flags, scratch, info)) {
                     written[srcTrack] = (written[srcTrack] ?: 0) + 1
+                    if (pts > maxOutPts) maxOutPts = pts
                 } else {
                     dropped[srcTrack] = (dropped[srcTrack] ?: 0) + 1
                 }
@@ -250,10 +380,28 @@ object Mp4Converter {
             Log.i(
                 TAG,
                 "remux done: video=${written[videoTrack] ?: 0} audio=${written[audioTrack] ?: 0} " +
-                    "audioFrames=$adtsFramesTotal dropped=$dropped synthetic=$syntheticTimeline"
+                    "audioFrames=$adtsFramesTotal dropped=$dropped " +
+                    "lastPtsUs=$maxOutPts"
             )
             val total = written.values.sum()
             if (total <= 0) throw IllegalArgumentException("没有可写入的音视频样本")
+
+            // 保留原始 PTS 时若系统对回退时间戳不买账，会被判为写失败而丢帧；
+            // 丢得太多说明这条路走不通，抛出去让上层改用网格时间线重来。
+            val droppedVideo = dropped[videoTrack] ?: 0
+            val writtenVideo = written[videoTrack] ?: 0
+            if (writtenVideo > 0 && droppedVideo > writtenVideo / 10) {
+                throw IllegalArgumentException(
+                    "丢弃样本过多（$droppedVideo/$writtenVideo），改用重建时间线"
+                )
+            }
+
+            val tail = if (videoTrack >= 0) {
+                clocks[videoTrack]?.frameDurUs ?: FALLBACK_VIDEO_STEP_US
+            } else {
+                audioFrameDurUs
+            }
+            return (maxOutPts + tail) / 1000
         } finally {
             try {
                 muxer?.stop()
@@ -265,6 +413,79 @@ object Mp4Converter {
             }
             extractor.release()
         }
+    }
+
+    /**
+     * 用一个独立的 extractor 试读前 [limit] 个样本，判断该轨时间戳特征。
+     * 独立实例是为了不打乱主流程的读取位置（部分 extractor 的 seekTo 不可靠）。
+     */
+    private fun analyzeTrack(input: File, track: Int, limit: Int): TrackTiming? {
+        val reader = MediaExtractor()
+        val pts = ArrayList<Long>(limit)
+        try {
+            reader.setDataSource(input.absolutePath)
+            reader.selectTrack(track)
+            val buf = ByteBuffer.allocateDirect(2 * 1024 * 1024)
+            while (pts.size < limit) {
+                buf.clear()
+                val size = try {
+                    reader.readSampleData(buf, 0)
+                } catch (_: Exception) {
+                    -1
+                }
+                if (size < 0) {
+                    if (!reader.advance()) break
+                    continue
+                }
+                val t = reader.sampleTime
+                if (t >= 0) pts.add(t)
+                if (!reader.advance()) break
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "analyzeTrack failed: track=$track ${e.message}")
+        } finally {
+            try {
+                reader.release()
+            } catch (_: Exception) {
+            }
+        }
+        if (pts.isEmpty()) return null
+
+        // 帧间隔：排序后再取正间隔中位数。解码顺序的间隔会被 B 帧打乱，
+        // 排序后的间隔才是真实帧间隔。
+        val sorted = pts.sorted()
+        val deltas = ArrayList<Long>(sorted.size)
+        for (i in 1 until sorted.size) {
+            val d = sorted[i] - sorted[i - 1]
+            if (d in 500L..2_000_000L) deltas.add(d)
+        }
+        deltas.sort()
+        val frameDur = if (deltas.isEmpty()) 0L else deltas[deltas.size / 2]
+
+        // 解码顺序里 PTS 往回走、且回退幅度不到 4 帧，就是 B 帧重排；
+        // 幅度超过 4 帧的回退属于时间轴重置，交给平移逻辑处理。
+        var lags = 0
+        val window = (frameDur.takeIf { it > 0 } ?: FALLBACK_VIDEO_STEP_US) * 4
+        for (i in 1 until pts.size) {
+            val d = pts[i] - pts[i - 1]
+            if (d < 0 && -d <= window) lags++
+        }
+        return TrackTiming(pts[0], frameDur, lags >= 2)
+    }
+
+    private fun readFrameRate(format: MediaFormat): Double {
+        if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+            val fps = runCatching {
+                format.getInteger(MediaFormat.KEY_FRAME_RATE).toDouble()
+            }.getOrDefault(0.0)
+            if (fps > 0) return fps
+        }
+        if (format.containsKey("frame-rate")) {
+            val fps = runCatching { format.getFloat("frame-rate").toDouble() }
+                .getOrDefault(0.0)
+            if (fps > 0) return fps
+        }
+        return 0.0
     }
 
     /** 把 [src] 的一段写入封装器（先拷进直接缓冲，避免 position/limit 影响调用方）。
@@ -376,30 +597,113 @@ object Mp4Converter {
         format.setByteBuffer("csd-0", ByteBuffer.wrap(asc))
     }
 
-    /** 用系统解码器确认产物真的能播：有时长，且视频能取出首帧。 */
-    private fun probe(file: File): Boolean {
+    /** 用系统解码器确认产物真的能播：时长对得上、视频能取出首帧、时间轴没有塌陷。 */
+    private fun probe(file: File, expectedMs: Long): Boolean {
         if (!file.exists() || file.length() < 1024) return false
         val retriever = MediaMetadataRetriever()
-        return try {
+        var duration = 0L
+        var hasVideo = false
+        var frameOk = true
+        try {
             retriever.setDataSource(file.absolutePath)
-            val duration = retriever
+            duration = retriever
                 .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 ?.toLongOrNull() ?: 0L
-            val hasVideo = retriever
+            hasVideo = retriever
                 .extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO) == "yes"
-            val frame = if (hasVideo) {
-                retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-            } else {
-                null
+            if (hasVideo) {
+                val frame = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                frameOk = frame != null
+                frame?.recycle()
             }
-            val ok = duration > 0 && (!hasVideo || frame != null)
-            frame?.recycle()
-            ok
+        } catch (_: Exception) {
+            return false
+        } finally {
+            try {
+                retriever.release()
+            } catch (_: Exception) {
+            }
+        }
+        if (duration <= 0 || !frameOk) return false
+        if (expectedMs > 1500) {
+            val diff = kotlin.math.abs(duration - expectedMs)
+            if (diff > maxOf(1500L, expectedMs / 10)) return false
+        }
+        return if (hasVideo) probeTimeline(file) else true
+    }
+
+    /**
+     * 抽查前 120 个视频样本的时间轴是否「塌陷」。
+     *
+     * 注意不能要求 PTS 严格递增：合规的带 B 帧 MP4 里，解码顺序的 PTS 本来就会
+     * 回退（显示顺序由 ctts 表达）。旧实现把回退压平后，会出现大量**相同**的
+     * 时间戳（每两帧挤在同一毫秒），那才是掉帧卡顿的形态。所以这里检查
+     * 排序后相邻值是否有过多重复、帧间隔中位数是否被压到 0。
+     */
+    private fun probeTimeline(file: File): Boolean {
+        val reader = MediaExtractor()
+        return try {
+            reader.setDataSource(file.absolutePath)
+            var track = -1
+            for (i in 0 until reader.trackCount) {
+                val mime = reader.getTrackFormat(i)
+                    .getString(MediaFormat.KEY_MIME) ?: continue
+                if (isSupportedVideo(mime)) {
+                    track = i
+                    break
+                }
+            }
+            if (track < 0) {
+                true
+            } else {
+                reader.selectTrack(track)
+                val buf = ByteBuffer.allocateDirect(256 * 1024)
+                val pts = ArrayList<Long>(120)
+                while (pts.size < 120) {
+                    buf.clear()
+                    val size = try {
+                        reader.readSampleData(buf, 0)
+                    } catch (_: Exception) {
+                        -1
+                    }
+                    if (size < 0) {
+                        if (!reader.advance()) break
+                        continue
+                    }
+                    val t = reader.sampleTime
+                    if (t >= 0) pts.add(t)
+                    if (!reader.advance()) break
+                }
+                if (pts.size < 8) {
+                    true
+                } else {
+                    val sorted = pts.sorted()
+                    var duplicates = 0
+                    val deltas = ArrayList<Long>(sorted.size)
+                    for (i in 1 until sorted.size) {
+                        val d = sorted[i] - sorted[i - 1]
+                        if (d == 0L) duplicates++ else deltas.add(d)
+                    }
+                    if (duplicates > sorted.size / 20) {
+                        Log.w(TAG, "probeTimeline: ${duplicates}/${sorted.size} 个重复时间戳")
+                        false
+                    } else if (deltas.isEmpty()) {
+                        false
+                    } else {
+                        deltas.sort()
+                        val median = deltas[deltas.size / 2]
+                        if (median < 1_000L) {
+                            Log.w(TAG, "probeTimeline: 帧间隔中位数仅 ${median}µs")
+                        }
+                        median >= 1_000L
+                    }
+                }
+            }
         } catch (_: Exception) {
             false
         } finally {
             try {
-                retriever.release()
+                reader.release()
             } catch (_: Exception) {
             }
         }
