@@ -7,6 +7,7 @@ import 'package:path_provider/path_provider.dart';
 import 'media_source.dart';
 import 'app_log.dart';
 import 'app_paths.dart';
+import 'browser_headers.dart';
 import 'cookie_store.dart';
 import 'header_policy.dart';
 import 'playlist_rewriter.dart';
@@ -462,6 +463,10 @@ class StreamingProxy {
     if (referer != null && referer.startsWith('http')) {
       req.headers.set('Referer', referer);
     }
+    // 浏览器等效头：与下载器共用同一份映射，保证「边下边播」和「下载」
+    // 在站点眼里是同一个客户端；否则会出现「能播不能下」之外的新裂缝
+    browserMediaHeaders(url, referer: referer)
+        .forEach((name, value) => req.headers.set(name, value));
     // 页面侧带来的鉴权头。UA / Referer / Cookie 已由本方法统一处理，
     // HeaderPolicy 把这三类排除在白名单外，这里不会互相覆盖。
     final extra = headerToken.isEmpty ? null : _headersByToken[headerToken];

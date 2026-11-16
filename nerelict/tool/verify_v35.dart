@@ -883,6 +883,38 @@ void main() {
   check(projectFile('tool/click_js_test.js').existsSync(),
       '提供点击脚本的 Node 行为验证');
 
+  // 下载被 Cloudflare 挡下的两层原因：Cookie 读不到（可能 HttpOnly）与请求特征不像浏览器。
+  // 方案见 docs/download-auth-and-challenge.md，这里锁住「实现别走偏」：
+  // 头只补浏览器必带的项、诊断三种情况不混、ExoPlayer 直连不被动过。
+  stdout.writeln('=== 34. 回源请求的浏览器一致性与 403 诊断 ===');
+  final bh34 = read('lib/services/browser_headers.dart');
+  check(bh34.contains("'Sec-Fetch-Site'") && bh34.contains("'Sec-Fetch-Dest'"),
+      '补齐 Sec-Fetch-* 三项');
+  check(bh34.contains("'Accept': '*/*'"), '补 Accept');
+  check(!bh34.contains("'User-Agent'") && !bh34.contains("'Cookie'"),
+      '不产出 UA / Cookie（会覆盖真实会话）');
+  // 注释里会提到 Range / sec-ch-ua 以解释「为什么不加」，所以只匹配作为键出现的形态
+  check(!bh34.contains("'Range'") && !bh34.contains("'sec-ch-ua"),
+      '不产出 Range，也不猜 sec-ch-ua（值必须与 UA 版本对应）');
+  final hd34 = read('lib/services/hls_downloader.dart');
+  check(hd34.contains('browserMediaHeaders(url'), '下载回源用到这份头');
+  check(hd34.contains('describeAuthFailure('), '403 文案走统一诊断');
+  check(hd34.contains('PageCookieProbe.lengthFor('), '诊断里带上页面可见 Cookie 读数');
+  check(read('lib/services/streaming_proxy.dart')
+          .contains('browserMediaHeaders(url'),
+      '播放代理与下载器共用同一份头');
+  check(!read('lib/services/media_source.dart').contains('Sec-Fetch'),
+      'ExoPlayer 直连不被动过（当前播放是通的）');
+  check(read('lib/services/page_cookie_probe.dart').contains('lastHost'),
+      '页面 Cookie 读数按 host 存，换站不串');
+  check(read('lib/ui/browser_tab.dart').contains('PageCookieProbe.attach(') &&
+          read('lib/ui/browser_tab.dart').contains('_readDocumentCookieLength'),
+      'WebView 侧注入读数探针');
+  check(projectFile('tool/verify_browser_headers.dart').existsSync(),
+      '提供头映射与诊断的纯 Dart 断言');
+  check(projectFile('docs/download-auth-and-challenge.md').existsSync(),
+      '方案文档落在 docs 下');
+
   stdout.writeln();
   if (failures.isEmpty) {
     stdout.writeln('全部通过：$passed 项断言');

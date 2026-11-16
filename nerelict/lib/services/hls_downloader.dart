@@ -7,7 +7,10 @@ import 'package:dio/dio.dart';
 import 'package:pointycastle/export.dart';
 
 import '../models/download_task.dart';
+import 'browser_headers.dart';
+import 'download_diagnosis.dart';
 import 'hls_parser.dart';
+import 'page_cookie_probe.dart';
 import 'user_agent.dart';
 import 'app_paths.dart';
 
@@ -50,6 +53,16 @@ class HlsDownloader {
   /// 403 时这一个 bit 就能把范围砍一半：带上 Cookie 还被拒，多半是 UA /
   /// Referer / 签名或站点侧风控；没带上，就是登录态根本没读到。
   bool _lastCookiePresent = false;
+
+  /// 最近一次读到（并带上）的 Cookie 条数。只用于诊断展示，不含名字与值。
+  int _lastCookieCount = 0;
+
+  /// 最近一次响应的 `server` 与 `cf-mitigated`。
+  ///
+  /// 单看 403 分不出「来源页校验」和「人机验证」，这两个响应头是最直接的线索：
+  /// Cloudflare 挑战会带 `cf-mitigated: challenge`，普通防盗链不会。
+  String _lastServer = '';
+  bool _lastCfMitigated = false;
 
   /// 最近一次出站请求的地址。
   ///
@@ -719,21 +732,40 @@ class HlsDownloader {
     // WebView 建好后会换成真实 UA，下载器必须跟着变
     headers['User-Agent'] = UserAgent.current;
     if (referer != null && referer.isNotEmpty) headers['Referer'] = referer;
+    // 浏览器等效头（Accept / Accept-Language / Sec-Fetch-*）。
+    // 少了这几项，挂在 Cloudflare 后面的站点很容易把请求判成自动化；
+    // 页面带来的白名单头在下面合并，仍然优先。
+    headers.addAll(browserMediaHeaders(url, referer: referer));
     if (extra != null && extra.isNotEmpty) {
       // 已过白名单，这里直接展开；若与上面的 Referer 同名，白名单已排除该情况
       headers.addAll(extra);
     }
     _lastCookiePresent = false;
+    _lastCookieCount = 0;
     try {
       final cookie = await resolveCookie?.call(url);
       if (cookie != null && cookie.trim().isNotEmpty) {
         headers['Cookie'] = cookie.trim();
         _lastCookiePresent = true;
+        _lastCookieCount = _countCookies(cookie);
       }
     } catch (_) {
       // 平台通道不可用（如主机验证脚本未注入）时按匿名请求处理
     }
     return headers;
+  }
+
+  /// 数 Cookie 条数。
+  ///
+  /// 只统计，不记录名字与值：这个模块必须保持纯 Dart（`app_log` 依赖 Flutter，
+  /// 引进来会让 `verify_download` / `verify_v042` 编译不过）。条数已经够诊断——
+  /// 真正要区分的是「有没有带上」，名字留给需要深挖时由调用方自己看。
+  int _countCookies(String raw) {
+    return raw
+        .split(';')
+        .map((e) => e.trim())
+        .where((e) => e.contains('='))
+        .length;
   }
 
   /// 返回正文与**重定向后的最终 URI**，供相对分片解析使用。
@@ -896,6 +928,10 @@ class HlsDownloader {
   /// 不失效的话，三次重试实际都在用同一份旧凭证，全部失败。
   void _onRequestRejected(Object error, String url) {
     if (error is! DioException) return;
+    // 先把能说明「为什么被拒」的响应特征留下来，错误文案要用
+    final headers = error.response?.headers;
+    _lastServer = headers?.value('server') ?? '';
+    _lastCfMitigated = headers?.value('cf-mitigated') != null;
     if (error.response?.statusCode != 403) return;
     invalidateCookie?.call(url);
   }
@@ -963,6 +999,10 @@ class HlsDownloader {
   /// 这类 403 与「没登录」「防盗链」不是一回事：页面是挑战页，重试和改 Cookie
   /// 都未必有用，提示必须说清楚，否则用户会一直在网页里反复播放。
   bool _isBotChallenge(DioException e) {
+    // 先用 _onRequestRejected 留下的响应特征：正文可能被截断或换成二进制，
+    // 头里的 `cf-mitigated` 是更早、更可靠的证据
+    if (_lastCfMitigated) return true;
+    if (_lastServer.toLowerCase().contains('cloudflare')) return true;
     final response = e.response;
     final headers = response?.headers;
     if (headers != null) {
@@ -982,7 +1022,8 @@ class HlsDownloader {
     return raw.contains('__cf_chl') || raw.contains('cf-chl-');
   }
 
-  String _friendlyError(Object e) {    if (e is DioException) {
+  String _friendlyError(Object e) {
+    if (e is DioException) {
       switch (e.type) {
         case DioExceptionType.connectionTimeout:
         case DioExceptionType.receiveTimeout:
@@ -997,20 +1038,26 @@ class HlsDownloader {
           final detail = _responseSnippet(e.response?.data);
           final tail = detail == null ? '' : ' · 服务端原文：$detail';
           if (code == 401 || code == 403) {
-            final cookie = _lastCookiePresent ? 'Cookie 已带' : 'Cookie 未取到';
-            if (_isBotChallenge(e)) {
+            final challenged = _isBotChallenge(e);
+            final diag = describeAuthFailure(
+              cookieSent: _lastCookiePresent,
+              cookieCount: _lastCookieCount,
+              pageCookieLength:
+                  PageCookieProbe.lengthFor(Uri.tryParse(_lastRequestUrl)?.host ?? ''),
+              challenged: challenged,
+            );
+            // 诊断只增不改：文案仍以用户能照做的事开头，细节放后半段
+            if (challenged) {
               // master 播放列表常是站点的入口页，被挑战的概率比实际 media
               // 播放列表高；面板里往往同时有 video.m3u8 这类地址，换一条更省事
               final isMaster = _lastRequestUrl.toLowerCase().contains('playlist');
               final alt = isMaster
                   ? '若面板里还有 video.m3u8 之类的地址，换那条下载通常能过；'
                   : '';
-              return '被站点的 Cloudflare 人机验证拦下$at（$cookie）。'
-                  '这类验证由服务端判定，下载请求比浏览更容易被打成自动化访问。'
-                  '$alt可先在网页里把该视频播放十几秒再试，或直接在浏览器里保存';
+              return '被站点的 Cloudflare 人机验证拦下$at（${diag.cookieLabel}）。'
+                  '$alt${diag.hint}';
             }
-            return '服务器返回 $code$at（$cookie）：需要登录态或来源页校验失败。'
-                '可先在浏览器里打开该页面并播放一次，再回来重试$tail';
+            return '服务器返回 $code$at（${diag.cookieLabel}）：${diag.hint}$tail';
           }
           return '服务器返回 $code$at，可能需要 Referer 或链接已失效$tail';
         default:

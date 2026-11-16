@@ -13,6 +13,7 @@ import '../services/app_log.dart';
 import '../services/click_sniff.dart';
 import '../services/click_sniff_js.dart';
 import '../services/open_external.dart';
+import '../services/page_cookie_probe.dart';
 import '../services/user_agent.dart' show UserAgent;
 import '../services/playback_guard_js.dart';
 import '../services/player_probe_js.dart';
@@ -106,6 +107,9 @@ class _BrowserTabState extends State<BrowserTab> {
     _state.addBackInterceptor(_handleSystemBack);
     // 播放器开着的时候把网页的弹窗出口接管掉，关掉立刻还原
     _state.addListener(_syncPopupGuard);
+    // 下载器 403 时要把「该域没有 Cookie」和「只有 HttpOnly」分开，
+    // 后者只能由页面自己回答，所以这里给它挂一个读数探针
+    PageCookieProbe.attach(_readDocumentCookieLength);
 
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
@@ -154,6 +158,8 @@ class _BrowserTabState extends State<BrowserTab> {
             _shieldNotified = false;
             _mseNotified = false;
             _shieldedLayers = 0;
+            // 换页了：上一个站点的 Cookie 读数不再适用
+            PageCookieProbe.clear();
             // 离开上一页：清空该页的嗅探资源、选中项、播放浮层与临时数据
             _state.resetPageResources();
             _floatUrl = null;
@@ -172,6 +178,9 @@ class _BrowserTabState extends State<BrowserTab> {
             });
             _inject();
             _refreshNavState();
+            // 页面加载完再读一次「页面可见 Cookie」：
+            // 挑战与登录态都是在这一步之后才落到 Cookie 上的
+            unawaited(PageCookieProbe.refresh(Uri.tryParse(url)?.host ?? ''));
             // 记录浏览历史（非 http/https 地址由 HistoryState 自行过滤）
             try {
               final title = await _controller.getTitle();
@@ -221,6 +230,7 @@ class _BrowserTabState extends State<BrowserTab> {
     // 页面卸载：同样清空本页资源与播放状态（销毁阶段不再通知监听者）
     _state.resetPageResources(notify: false);
     _handled.clear();
+    PageCookieProbe.attach(null);
     _urlCtrl.dispose();
     super.dispose();
   }
@@ -611,6 +621,20 @@ class _BrowserTabState extends State<BrowserTab> {
     final ok = await OpenExternal.open(url);
     if (!mounted) return;
     _toast(ok ? '已交给外部应用，授权完成后返回' : '没有找到能打开该登录方式的应用');
+  }
+
+  /// 读本页 `document.cookie` 的字符数。
+  ///
+  /// 只用来区分两种 403：该域压根没有 Cookie，还是 Cookie 存在但都是 HttpOnly
+  /// （`CookieManager.getCookie` 看不到）。返回 null 表示读不到，绝不返回 0 冒充。
+  Future<int?> _readDocumentCookieLength() async {
+    try {
+      final raw = await _controller
+          .runJavaScriptReturningResult('document.cookie.length');
+      return int.tryParse(raw.toString().trim());
+    } catch (_) {
+      return null;
+    }
   }
 
   void _open(String input) {
