@@ -208,13 +208,13 @@ void main() {
 
   stdout.writeln('=== 9. 版本号与二级设置 ===');
   final pubspec = read('pubspec.yaml');
-  check(pubspec.contains('version: 0.4.4+24'), 'pubspec 基础版本为 0.4.4 / code 24');
+  check(pubspec.contains('version: 0.4.5+25'), 'pubspec 基础版本为 0.4.5 / code 25');
   final gradle = read('android/app/build.gradle.kts');
   check(gradle.contains('versionName = flutter.versionName'),
       '展示版本统一取 pubspec 三段版本');
   check(!gradle.contains('versionName = "0.3.9.0"'), '不再覆盖第四段展示版本');
   final settingsFile = read('lib/ui/settings_tab.dart');
-  check(settingsFile.contains("appVersion = '0.4.4'"), '设置页版本为 0.4.4');
+  check(settingsFile.contains("appVersion = '0.4.5'"), '设置页版本为 0.4.5');
   check(read('README.md').contains('v0.4.4'), 'README 版本号已同步');
   check(settingsFile.contains('_CategoryTile'), '设置改为分类入口');
   check(settingsFile.contains('_SettingsPage'), '存在二级设置页');
@@ -479,7 +479,7 @@ void main() {
 
   stdout.writeln('=== 23. 发版护栏、品牌命名与 0.4.1 资源 ===');
   // 已正式发布的最高 versionCode；每次 Release 后上调，防止忘记 +1 或复用旧码
-  const int publishedVersionCode = 21;
+  const int publishedVersionCode = 24;
   final pubspecText = read('pubspec.yaml');
   final settingsText = read('lib/ui/settings_tab.dart');
   final gradleText = read('android/app/build.gradle.kts');
@@ -490,7 +490,7 @@ void main() {
       .firstMatch(pubspecText);
   final semver = versionLine?.group(1) ?? '';
   final currentCode = int.tryParse(versionLine?.group(2) ?? '') ?? 0;
-  check(semver == '0.4.4', '当前展示版本为 0.4.4');
+  check(semver == '0.4.5', '当前展示版本为 0.4.5');
   check(currentCode > publishedVersionCode,
       'versionCode $currentCode 严格大于已发布最高值 $publishedVersionCode');
   check(settingsText.contains("appVersion = '$semver'"),
@@ -652,11 +652,16 @@ void main() {
   check(clickJsText.contains("addEventListener('pointerdown'") &&
           clickJsText.contains('capture: true, passive: true'),
       '点击在捕获阶段被动记录，不干扰页面交互');
-  // 唯一的阻断点：刚识别出广告遮挡层的那一次点击，必须掐掉，
-  // 否则它仍会触发广告层自己的跳转（click 目标在 pointerdown 时已锁定）。
-  check(clickJsText.split('preventDefault(').length - 1 == 1 &&
-          clickJsText.contains('blockClickUntil'),
-      '只拦「刚清掉遮挡层」的那一次点击，其余点击不阻断');
+  // 全脚本只允许两处阻止默认行为，且都属于「必须由我们接管」的场景：
+  // 1. 刚识别出广告遮挡层的那一次点击（否则仍会触发广告层自己的跳转，
+  //    click 目标在 pointerdown 时已锁定）；
+  // 2. `target="_blank"` 的链接：WebView 侧没有 onCreateWindow，新窗口开不出来，
+  //    只能改成同页跳转，否则点了完全没反应（登录入口最常见的形态）。
+  // 除这两处之外，任何新增的 preventDefault 都视为回归。
+  check(clickJsText.split('preventDefault(').length - 1 == 2 &&
+          clickJsText.contains('blockClickUntil') &&
+          clickJsText.contains("closest('a[target]')"),
+      '只有遮挡层当次点击与 target=_blank 接管会阻止默认行为');
   check(clickJsText.contains('MutationObserver') &&
           clickJsText.contains('ATTR_MS = 8000'),
       '点击后新插入的播放器在 8 秒归因窗口内被抓到');
@@ -832,6 +837,51 @@ void main() {
       '跨域播放器仍记进候选，⚡ 面板仍可打开');
   check(browser31.contains('_mseNotified'), 'MSE 回扫提示每页只弹一次');
   check(browser31.contains('_shieldNotified'), '遮挡层提示仍然每页只弹一次');
+
+  // 真机验证必须装正式签名包：一旦又回到「临时移走 key.properties 回退 debug 签名」，
+  // 装机的包和对外发布的包就不是同一份产物，还会因为签名冲突被逼着卸载清数据。
+  stdout.writeln('=== 32. 真机验证只装正式签名包 ===');
+  final agents32 = read('../AGENTS.md');
+  check(readmeText.contains('adb install -r') &&
+          readmeText.contains('不要') &&
+          readmeText.contains('debug 签名'),
+      'README 说明真机装正式签名包、不再回退 debug 签名');
+  check(agents32.contains('真机验证一律安装正式签名包'),
+      'AGENTS.md 固化「真机验证装正式签名包」');
+  check(agents32.contains('INSTALL_FAILED_UPDATE_INCOMPATIBLE') ||
+          agents32.contains('不能互相覆盖'),
+      'AGENTS.md 记录两套签名不能互相覆盖');
+
+  // 登录入口的四个出口：遮挡层误判、window.open、target=_blank、自定义深链。
+  // 这四条任何一条回退，都会表现成「点了登录没反应」，所以逐条锁住。
+  stdout.writeln('=== 33. 登录按钮不被自己的防护弄死 ===');
+  final click33 = read('lib/services/click_sniff_js.dart');
+  check(click33.contains("querySelector('form,input,select,textarea,dialog,'"),
+      '含表单控件的层不判广告遮挡层');
+  check(click33.contains('[aria-modal="true"]'),
+      '对话框语义（aria-modal）同样豁免');
+  check(click33.contains('wasKilled') && click33.contains('killedLayers'),
+      '命中的层记入列表，不再向父层扩散');
+  check(click33.contains('anyPlaying') && click33.contains('tapInPlayer'),
+      'window.open 只在播放中或点在视频容器时拦');
+  check(!click33.contains('if (Date.now() - shell.tapAt < 1500) {\n          shell.popups++;'),
+      '不再「点击后 1.5 秒内一律拒绝 window.open」');
+  check(click33.contains('location.href = target'),
+      'window.open 降级成同页跳转（WebView 开不出新窗口）');
+  check(click33.contains("closest('a[target]')"),
+      'target=_blank 的链接改成同页跳转');
+  final browser33 = read('lib/ui/browser_tab.dart');
+  check(browser33.contains('_openDeepLink') && browser33.contains('_loginSchemes'),
+      '自定义 scheme 深链交给系统处理');
+  check(browser33.contains('unawaited(_openDeepLink'), '导航拦截里异步转交深链');
+  check(read('lib/services/open_external.dart').contains('com.nerelict/external'),
+      '深链通道名与原生一致');
+  final activity33 = read('android/app/src/main/kotlin/com/nerelict/nerelict/MainActivity.kt');
+  check(activity33.contains('EXTERNAL_CHANNEL = "com.nerelict/external"') &&
+          activity33.contains('Intent.ACTION_VIEW'),
+      '原生侧用 ACTION_VIEW 打开深链');
+  check(projectFile('tool/click_js_test.js').existsSync(),
+      '提供点击脚本的 Node 行为验证');
 
   stdout.writeln();
   if (failures.isEmpty) {

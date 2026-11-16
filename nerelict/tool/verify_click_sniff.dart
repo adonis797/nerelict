@@ -232,12 +232,18 @@ void main() {
   check(kClickSniffJs.contains("addEventListener('click'"), 'click 兜底');
   check(kClickSniffJs.contains('capture: true, passive: true'),
       '监听为捕获阶段且 passive');
-  // 唯一的例外：刚识别出广告遮挡层的那一次点击，在 document 捕获阶段掐掉，
-  // 否则它仍会触发广告层自己的跳转。普通点击全程 passive。
+  // 只允许两处阻止默认行为，两处都必须是「我们得接管」的场景：
+  // 1. 刚识别出广告遮挡层的那一次点击在 document 捕获阶段掐掉，
+  //    否则它仍会触发广告层自己的跳转；普通点击全程 passive。
+  // 2. `target="_blank"` 的链接：WebView 没有 onCreateWindow，开不出新窗口，
+  //    只能改成同页跳转，否则点了完全没反应（登录入口最常见的形态）。
   final gu = kClickSniffJs.indexOf('if (!shell.blockClickUntil');
   final pd = kClickSniffJs.indexOf('preventDefault(');
   check(pd > 0 && gu > 0 && pd > gu && pd - gu < 700,
-      '仅遮挡层拦截这一处阻止默认行为');
+      '遮挡层当次点击的拦截就在判断之后');
+  check(kClickSniffJs.split('preventDefault(').length - 1 == 2 &&
+          kClickSniffJs.contains("closest('a[target]')"),
+      '全脚本只有遮挡层拦截与 target=_blank 接管两处阻止默认行为');
   check(kClickSniffJs.contains('blockClickUntil = 0;'),
       '一次性：拦完立刻复位，不影响后续点击');
   check(kClickSniffJs.contains('{ capture: true }'),

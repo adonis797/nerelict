@@ -430,8 +430,18 @@ const String kClickSniffJs = r'''
   //    ——下一次点击就能落到播放器上，页面看起来没有任何变化；
   //  - 点击后 1.5 秒内拒绝 window.open。正常人点链接开新窗口不会只隔一瞬，
   //    而广告弹窗几乎都发生在点击的同一帧。
-  var shell = { tapAt: 0, popups: 0, layers: 0, blockClickUntil: 0 };
+  var shell = { tapAt: 0, popups: 0, layers: 0, blockClickUntil: 0, tapEl: null };
   window.__ssShell = shell;
+
+  // 已经关过指针事件的层。命中过的层不再参与判定，也不允许「继续往上找」——
+  // 否则连点几次会一层层把外壳、乃至整页容器都掐掉，弹窗就彻底点不动了。
+  var killedLayers = [];
+  function wasKilled(el) {
+    for (var i = 0; i < killedLayers.length; i++) {
+      if (killedLayers[i] === el) return true;
+    }
+    return false;
+  }
 
   function alphaOf(c) {
     if (!c) return 1;
@@ -468,6 +478,15 @@ const String kClickSniffJs = r'''
       if (!bigEnough(el)) return false;
       // 真正的播放器 / 弹窗容器不能动
       if (el.querySelector && el.querySelector('video,iframe,canvas')) return false;
+      // 登录 / 搜索 / 支付这类「有真实表单控件」的层不是广告遮罩：
+      // 广告层最多有个「关闭」「领取」按钮，不会有 input / textarea / 对话框语义。
+      // 少这一条的话，透明外壳 + 大字少的登录弹窗会被整层掐掉指针事件，
+      // 表现就是「弹窗还在、点登录完全没反应」。
+      if (el.querySelector &&
+          el.querySelector('form,input,select,textarea,dialog,' +
+                           '[role="dialog"],[role="alertdialog"],[aria-modal="true"]')) {
+        return false;
+      }
       // 不透明的大色块通常是正常遮罩或背景，不碰
       if (alphaOf(st.backgroundColor) > 0.35) return false;
       // 有大量文字的层多半是真正的说明/弹窗，避免误伤
@@ -480,6 +499,8 @@ const String kClickSniffJs = r'''
   function killLayer(el) {
     try {
       el.style.setProperty('pointer-events', 'none', 'important');
+      // 记下来：同一支链再次点击时不再向上找，避免逐层升级
+      if (!wasKilled(el) && killedLayers.length < 24) killedLayers.push(el);
       // 光关指针事件还不够：本次触摸的 click 目标在 pointerdown 时就锁定了，
       // 不拦一下的话「点广告层」这一下仍会触发它自己的跳转。
       shell.blockClickUntil = Date.now() + 800;
@@ -493,12 +514,17 @@ const String kClickSniffJs = r'''
   function shieldAt(target) {
     var el = target, guard = 0;
     while (el && el !== document.body && guard++ < 6) {
+      // 这一支已经处理过：就此停手，不再向父层扩散
+      if (wasKilled(el)) return false;
       if (looksLikeAdLayer(el)) { killLayer(el); return true; }
       el = el.parentElement;
     }
     try {
       var kids = document.body.children;
       for (var i = 0; i < kids.length; i++) {
+        // 已经处理过的层跳过：否则每次点击都会把它当成新的遮挡层再关一次，
+        // 顺手把 blockClickUntil 续上，整页点击都会被吞掉。
+        if (wasKilled(kids[i])) continue;
         if (looksLikeAdLayer(kids[i])) { killLayer(kids[i]); return true; }
       }
     } catch (e) {}
@@ -518,16 +544,56 @@ const String kClickSniffJs = r'''
     return n;
   };
 
-  // 点击后 1.5 秒内的 window.open 一律拒绝（广告弹窗几乎都发生在这一瞬）
+  // 页面里是否有媒体正在播放：只有这种时候的 window.open 才更像广告弹窗
+  function anyPlaying() {
+    try {
+      var ms = document.querySelectorAll('video,audio');
+      for (var i = 0; i < ms.length; i++) {
+        var m = ms[i];
+        if (m && !m.paused && !m.ended && m.currentTime > 0) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  // 点击目标是否落在视频容器里（含播放器控件：播放键点了才会弹广告）
+  function tapInPlayer() {
+    var el = shell.tapEl, guard = 0;
+    while (el && el !== document.body && guard++ < 5) {
+      try {
+        if (String(el.tagName || '').toUpperCase() === 'VIDEO') return true;
+        if (el.querySelector && el.querySelector('video')) return true;
+      } catch (e) {}
+      el = el.parentElement;
+    }
+    return false;
+  }
+
+  // window.open 的两件事，必须分开：
+  //
+  // 1. 拦「点播放弹出广告窗」——只在正在播放、或点击落在视频容器里时才拦。
+  //    以前是「点击后 1.5 秒内一律拒绝」，而登录 / OAuth 弹窗正好都在这个窗口里，
+  //    结果就是「点登录没反应」。
+  // 2. 放行之后也不能真的开新窗口：WebView 侧没有 onCreateWindow，新窗口开不出来，
+  //    同样表现为点了没反应。这里降级成同页跳转，登录流程才走得下去。
   try {
     if (!window.__ssOpenWrapped) {
       window.__ssOpenWrapped = 1;
       var ssOpen = window.open;
-      window.open = function () {
-        if (Date.now() - shell.tapAt < 1500) {
+      window.open = function (url) {
+        var target = url ? abs(String(url)) : '';
+        var isHttp = /^https?:/i.test(target);
+        var nearTap = Date.now() - shell.tapAt < 1500;
+        if (nearTap && (anyPlaying() || tapInPlayer())) {
           shell.popups++;
           post({ t: 'shield', kind: 'popup', id: shell.popups });
           return null;
+        }
+        if (isHttp) {
+          try { location.href = target; } catch (e) {}
+          // 返回 window 而不是 null：站点常接着调 w.focus()，
+          // 返回 null 会走到它自己的「弹窗被拦截」分支，反而多一条提示。
+          return window;
         }
         return ssOpen.apply(window, arguments);
       };
@@ -550,14 +616,36 @@ const String kClickSniffJs = r'''
     }, { capture: true });
   } catch (e) {}
 
+  // <a target="_blank"> 同样开不出新窗口，改成同页跳转。
+  // 只处理 http(s)，深链留给 Dart 侧交给系统应用。
+  //
+  // 注册顺序有意排在「刚清掉遮挡层就掐掉点击」那条之后：广告层的当次点击会被
+  // stopImmediatePropagation 拦下，不能再顺手把页面跳走。
+  try {
+    document.addEventListener('click', function (e) {
+      var a = null;
+      try { a = e.target && e.target.closest ? e.target.closest('a[target]') : null; } catch (err) {}
+      if (!a) return;
+      var t = String(a.getAttribute('target') || '').toLowerCase();
+      if (t !== '_blank' && t !== '_new') return;
+      var href = a.getAttribute('href') || '';
+      if (!href || href.charAt(0) === '#' || /^javascript:/i.test(href)) return;
+      var target = abs(href);
+      if (!/^https?:/i.test(target)) return;
+      try { e.preventDefault(); } catch (err) {}
+      try { location.href = target; } catch (err) {}
+    }, { capture: true });
+  } catch (e) {}
+
   // 捕获阶段记录点击：pointerdown 比 click 早，能覆盖 mousedown 就换源的站点；
-  // 其余监听全 passive，只有上面那条「刚清掉遮挡层」的一次性拦截会阻止默认行为。
+  // 其余监听全 passive，只有上面两条会阻止默认行为（遮挡层当次点击、target=_blank 接管）。
   var lastDown = 0;
   var downX = 0, downY = 0;
   try {
     document.addEventListener('pointerdown', function (e) {
       lastDown = Date.now();
       shell.tapAt = lastDown;
+      shell.tapEl = e.target;
       downX = e.clientX || 0;
       downY = e.clientY || 0;
       // 点在广告遮挡层上：先把这层的指针事件关掉，用户再点一次就落到播放器

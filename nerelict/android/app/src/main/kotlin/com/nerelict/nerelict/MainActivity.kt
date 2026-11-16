@@ -30,6 +30,7 @@ class MainActivity : FlutterActivity() {
         private const val INSTALL_CHANNEL = "com.nerelict/install"
         private const val NETWORK_CHANNEL = "com.nerelict/network"
         private const val COOKIE_CHANNEL = "com.nerelict/cookie"
+        private const val EXTERNAL_CHANNEL = "com.nerelict/external"
         private const val REQ_PICK_DIR = 1001
         private const val REQ_PICK_APK = 1002
     }
@@ -47,6 +48,7 @@ class MainActivity : FlutterActivity() {
         configureInstallChannel(flutterEngine)
         configureNetworkChannel(flutterEngine)
         configureCookieChannel(flutterEngine)
+        configureExternalChannel(flutterEngine)
     }
 
     /**
@@ -76,6 +78,38 @@ class MainActivity : FlutterActivity() {
                                 // 取不到就按匿名请求继续，不阻断下载
                                 result.success(null)
                             }
+                        }
+                    }
+
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    /**
+     * 自定义 scheme 深链：微信 / QQ / 支付宝 / 运营商一键登录。
+     *
+     * WebView 自己开不了这些地址，拦下来用户就只会看到「点登录没反应」，
+     * 所以交给系统去起对应应用；没有可用应用时返回 false，由 Dart 侧给提示。
+     */
+    private fun configureExternalChannel(flutterEngine: FlutterEngine) {
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, EXTERNAL_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "open" -> {
+                        val url = call.argument<String>("url")
+                        if (url.isNullOrEmpty() || !url.contains("://")) {
+                            result.success(false)
+                            return@setMethodCallHandler
+                        }
+                        try {
+                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            startActivity(intent)
+                            result.success(true)
+                        } catch (_: Exception) {
+                            // 没有能处理该 scheme 的应用（ActivityNotFoundException）
+                            result.success(false)
                         }
                     }
 

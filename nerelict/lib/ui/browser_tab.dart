@@ -12,6 +12,7 @@ import '../services/ad_filter.dart';
 import '../services/app_log.dart';
 import '../services/click_sniff.dart';
 import '../services/click_sniff_js.dart';
+import '../services/open_external.dart';
 import '../services/user_agent.dart' show UserAgent;
 import '../services/playback_guard_js.dart';
 import '../services/player_probe_js.dart';
@@ -127,12 +128,16 @@ class _BrowserTabState extends State<BrowserTab> {
       )
       ..setNavigationDelegate(
         NavigationDelegate(
-          // 只放行 http/https，拦掉 intent://、baiduboxapp:// 这类 App 深链
+          // 只放行 http/https，拦掉 intent://、baiduboxapp:// 这类 App 深链。
+          // 例外：登录用的自定义 scheme（weixin:// 等）WebView 开不了，
+          // 静默拦掉的表现就是「点登录按钮完全没反应」，所以转交系统去处理。
           onNavigationRequest: (request) {
             final url = request.url;
             if (url.startsWith('http://') || url.startsWith('https://')) {
               return NavigationDecision.navigate;
             }
+            final scheme = Uri.tryParse(url)?.scheme.toLowerCase() ?? '';
+            if (scheme.isNotEmpty) unawaited(_openDeepLink(url, scheme));
             return NavigationDecision.prevent;
           },
           onProgress: (p) {
@@ -580,6 +585,32 @@ class _BrowserTabState extends State<BrowserTab> {
 
   void _toast(String msg) {
     context.read<AppState>().showToast(msg);
+  }
+
+  /// 只有登录常用的几个 scheme 才自动交给系统。
+  /// 其余深链（`intent://` 等）保持拦截——广告页常靠它们顺手拉起不相干的 App。
+  static const Set<String> _loginSchemes = <String>{
+    'weixin',
+    'wechat',
+    'mqqapi',
+    'mqqwpa',
+    'mqqticket',
+    'wtlogin',
+    'alipays',
+    'alipay',
+    'openlogin',
+    'sinaweibo',
+    'taobao',
+  };
+
+  /// 把登录深链递交给系统：能起 App 就切过去，起不来给一句人话，
+  /// 不让用户面对一个「点了没反应」的按钮。
+  Future<void> _openDeepLink(String url, String scheme) async {
+    if (!_loginSchemes.contains(scheme)) return;
+    logD('Web', 'deeplink $scheme');
+    final ok = await OpenExternal.open(url);
+    if (!mounted) return;
+    _toast(ok ? '已交给外部应用，授权完成后返回' : '没有找到能打开该登录方式的应用');
   }
 
   void _open(String input) {

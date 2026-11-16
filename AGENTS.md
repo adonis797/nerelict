@@ -60,6 +60,7 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 | `verify_mp4_timeline.dart` | 转封装时间轴算法：B 帧重排识别、等间隔网格重建、缺段缺口（纯算法，不依赖设备） |
 | `verify_download.dart` | 真实公开测试流跑“解析 → 分片 → 解密 → 合并”（依赖公网，可能超时） |
 | `smoke_device.dart` | 真机冒烟：冷启动、三页切换、截图、崩溃日志（需要 adb + 设备，**不进常规回归链**） |
+| `click_js_test.js` | 点击归因脚本的行为验证：登录弹窗不被误判成遮挡层、`window.open` 收窄并降级成同页跳转、`target=_blank` 接管、深链不被劫持（需要 Node，**不进 Dart 回归链**） |
 | `verify_file_manager.dart` / `verify_v2_features.dart` / `verify_v34.dart` / `verify_v334.dart` | 文件管理、直链分流、转换策略、文件类型与主题解析 |
 | `serve_test_hls.dart` | 起本地 HLS 服务，配合 `adb reverse` 做真机端到端 |
 
@@ -79,6 +80,10 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 - 将来需要模拟器时改为 `--target-platform android-arm64,android-x64`，不改源码。
 - release 构建在存在 `android/key.properties` 时用正式 keystore 签名，缺失时自动回退 debug 签名（保证他人 clone 后可直接构建）。
   `key.properties` 与 `.jks` 一律放在仓库外或保持忽略状态，**绝不提交**；签名材料丢失会导致已安装用户无法覆盖升级。
+- **真机验证一律安装正式签名包**：保留 `android/key.properties`，`flutter build apk --release` 之后 `adb install -r`，测的就是要发布的那个包。
+  **不要**为了装机把 `key.properties` 临时移走、让构建回退 debug 签名——两套签名的包不能互相覆盖，来回切换必须卸载，
+  会清空应用数据（播放缓存、收藏、续播、站点登录态），验证结果也不再等于发布包的真实表现。
+  设备上若装过 debug 签名的包，卸载一次之后就一直用正式签名覆盖升级。
 - `packaging { jniLibs { excludes } }` 剔除了 `armeabi-v7a` / `x86_64` 的插件 so，使不支持的设备在安装阶段即报不兼容，而不是装完启动崩溃。要支持模拟器时同步调整这里与 `--target-platform`。
 
 ## 代码约定

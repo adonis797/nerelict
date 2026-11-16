@@ -74,6 +74,18 @@
 > 设置改为二级分类菜单（常规 / 播放 / 下载与存储 / 其他），关于页去掉包名与更新说明，仅保留「安装应用更新」入口；
 > 版本号改为四位迭代号 0.3.5.2（pubspec 仍为 0.3.5+14，Gradle 覆盖 versionName）。
 
+> v0.4.5 登录入口不再被自己的防护弄死：不少站点点「登录」毫无反应，其实是三处出口被我们
+> 自己堵上了——① 登录弹窗的透明外壳同时满足「fixed + 高 z-index + 铺满视口 + 背景透明 +
+> 文字少」，被判成广告遮挡层，整层被加 `pointer-events: none`（该属性会继承，弹窗里所有
+> 控件一起失效），还会把当次点击 `preventDefault` 掉；现在含 `form` / `input` / `select` /
+> `textarea` / `dialog` / `aria-modal` 的层一律不动，已处理过的层也不再向父层扩散。
+> ② `window.open` 以前是「点击后 1.5 秒内一律返回 null」，而登录、OAuth 弹窗正好都在这个
+> 窗口里；现在只在「媒体正在播放」或「点击落在视频容器内」时才算广告弹窗。
+> ③ 放行的 `window.open` 与 `<a target="_blank">` 也开不出新窗口——WebView 侧没有
+> `onCreateWindow` 入口，请求会被静默丢弃；现在统一降级成同页跳转。
+> 另加：`weixin://`、`mqqapi://`、`alipays://`、`openlogin://` 等登录深链不再被静默拦截，
+> 改由系统拉起对应 App，起不来给一句人话提示。
+>
 > v0.4.4 请求头透传：一部分站点不用 Cookie 鉴权，而是靠 `Authorization: Bearer …` 或
 > 自定义 `X-*` 头——页面里能播，Nerelict 只带 UA / Referer / Cookie，于是在播放器里 403。
 > 现在包装 `fetch` 时读 `init.headers` / `Request.headers`，hook `XMLHttpRequest.setRequestHeader`
@@ -221,6 +233,13 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 
 产物：`build/app/outputs/flutter-apk/app-release.apk`（约 20 MB，arm64-v8a 单架构，
 由本机 `android/key.properties` 指定的 keystore 签名，未配置时回退 debug 签名）。
+
+真机验证就装这一个包，和发布出去的是同一份产物：**不要**为了装到手机而临时移走
+`android/key.properties` 去回退 debug 签名——两套签名不能互相覆盖，切换必须卸载，
+会清空播放缓存、收藏、续播与站点登录态，验证结果也就不等于发布包的表现。
+设备上如果装过 debug 签名的包，卸载一次之后一直用正式签名覆盖升级即可。
+怀疑缓存污染时，用 App 内「设置 → 播放缓存 → 清理」而不是卸载重装。
+
 只面向 64 位 ARM 新设备，`armeabi-v7a` 与 `x86_64` 的插件 so 已在打包阶段剔除；如需模拟器支持，
 把参数改为 `--target-platform android-arm64,android-x64` 并调整 `packaging` 排除规则，详见根目录 `README.md`。
 应用名来自 `android/app/src/main/res/values/strings.xml` 的 `app_name`，

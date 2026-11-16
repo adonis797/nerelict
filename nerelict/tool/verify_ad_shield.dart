@@ -59,16 +59,23 @@ void main() {
   stdout.writeln();
   stdout.writeln('=== 3. 点击弹窗拦截 ===');
   check(js.contains('shell.tapAt = lastDown'), '记录最近一次点击时刻');
-  check(js.contains("Date.now() - shell.tapAt < 1500"), '点击后 1.5 秒窗口');
+  check(js.contains('Date.now() - shell.tapAt < 1500'), '点击后 1.5 秒窗口');
   check(js.contains('return null;') && js.contains('shell.popups++'),
       '窗口内 window.open 返回 null 并计数');
+  // 收窄条件：只有「正在播放」或「点在视频容器里」才算广告弹窗，
+  // 否则登录 / OAuth 弹窗也会被一起吞掉。
+  check(js.contains('anyPlaying()') && js.contains('tapInPlayer()'),
+      'window.open 只在播放中或点在视频容器时拦');
+  // WebView 侧没有 onCreateWindow，放行原生 window.open 也开不出窗口，
+  // 所以 http(s) 一律降级成同页跳转，非 http 才交回原生。
+  check(js.contains('location.href = target'), 'http(s) 降级成同页跳转');
   check(js.contains('ssOpen.apply(window, arguments)'),
-      '窗口外照常放行，不影响正常开新窗口');
+      '非 http(s) 仍交回原生 window.open');
   check(js.contains('window.__ssOpenWrapped'), '只包一次，重复注入不会套娃');
   check(js.contains('blockClickUntil'),
       '只拦截「刚清掉遮挡层」的那一次点击');
-  check(js.split('preventDefault(').length - 1 == 1,
-      '全脚本只有一处 preventDefault');
+  check(js.split('preventDefault(').length - 1 == 2,
+      '只有遮挡层当次点击与 target=_blank 接管会 preventDefault');
 
   stdout.writeln();
   stdout.writeln('=== 4. Dart 侧解析 ===');
