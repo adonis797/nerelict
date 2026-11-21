@@ -208,13 +208,13 @@ void main() {
 
   stdout.writeln('=== 9. 版本号与二级设置 ===');
   final pubspec = read('pubspec.yaml');
-  check(pubspec.contains('version: 0.4.5+25'), 'pubspec 基础版本为 0.4.5 / code 25');
+  check(pubspec.contains('version: 0.4.6+26'), 'pubspec 基础版本为 0.4.6 / code 26');
   final gradle = read('android/app/build.gradle.kts');
   check(gradle.contains('versionName = flutter.versionName'),
       '展示版本统一取 pubspec 三段版本');
   check(!gradle.contains('versionName = "0.3.9.0"'), '不再覆盖第四段展示版本');
   final settingsFile = read('lib/ui/settings_tab.dart');
-  check(settingsFile.contains("appVersion = '0.4.5'"), '设置页版本为 0.4.5');
+  check(settingsFile.contains("appVersion = '0.4.6'"), '设置页版本为 0.4.6');
   check(read('README.md').contains('v0.4.4'), 'README 版本号已同步');
   check(settingsFile.contains('_CategoryTile'), '设置改为分类入口');
   check(settingsFile.contains('_SettingsPage'), '存在二级设置页');
@@ -479,7 +479,7 @@ void main() {
 
   stdout.writeln('=== 23. 发版护栏、品牌命名与 0.4.1 资源 ===');
   // 已正式发布的最高 versionCode；每次 Release 后上调，防止忘记 +1 或复用旧码
-  const int publishedVersionCode = 24;
+  const int publishedVersionCode = 25;
   final pubspecText = read('pubspec.yaml');
   final settingsText = read('lib/ui/settings_tab.dart');
   final gradleText = read('android/app/build.gradle.kts');
@@ -490,7 +490,7 @@ void main() {
       .firstMatch(pubspecText);
   final semver = versionLine?.group(1) ?? '';
   final currentCode = int.tryParse(versionLine?.group(2) ?? '') ?? 0;
-  check(semver == '0.4.5', '当前展示版本为 0.4.5');
+  check(semver == '0.4.6', '当前展示版本为 0.4.6');
   check(currentCode > publishedVersionCode,
       'versionCode $currentCode 严格大于已发布最高值 $publishedVersionCode');
   check(settingsText.contains("appVersion = '$semver'"),
@@ -914,6 +914,13 @@ void main() {
       '提供头映射与诊断的纯 Dart 断言');
   check(projectFile('docs/download-auth-and-challenge.md').existsSync(),
       '方案文档落在 docs 下');
+  // 实测：master 与 media 两条 m3u8 都会因 Cookie 缺失被拦，换源绕不过这一层。
+  // 提示不能再声称「换 video.m3u8 通常能过」。
+  check(!hd34.contains('换那条下载通常能过') && hd34.contains('Cookie 这条仍然存在'),
+      '提示不再承诺「换源就能过」（两条都被拦过）');
+  check(hd34.contains('crossHost') &&
+          read('lib/services/download_diagnosis.dart').contains('crossHost'),
+      '跨域与 HttpOnly 分开判（分片的 Cookie 读数不通用）');
 
   stdout.writeln();
   if (failures.isEmpty) {

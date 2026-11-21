@@ -130,6 +130,21 @@ void main() {
   check(unknown.cookieLabel.contains('不可用'),
       '读数拿不到时明说「不可用」，不冒充 0');
 
+  // 分片常挂在独立 CDN 域上：那时「页面可见 Cookie」量的是页面那个域，
+  // 对分片域没有参考价值，必须单独成一种，不能被误判成 HttpOnly。
+  final crossHostReport = describeAuthFailure(
+    cookieSent: false,
+    cookieCount: 0,
+    pageCookieLength: null,
+    challenged: false,
+    crossHost: true,
+  );
+  check(crossHostReport.cookieLabel.contains('不同域'), '跨域单独成一种（不混进「读数不可用」）');
+  check(crossHostReport.cookieLabel != unknown.cookieLabel, '跨域与读数不可用文案不同');
+  check(!crossHostReport.hint.contains('HttpOnly'),
+      '跨域不指向 HttpOnly（页面读数不适用于该域）');
+  check(crossHostReport.hint.contains('单独取凭证'), '跨域给的是「按该域单独取凭证」');
+
   stdout.writeln('=== 4. HttpOnly 判定与探针 ===');
   check(
       looksHttpOnlyOnly(cookieSent: false, pageCookieLength: 10) == true,

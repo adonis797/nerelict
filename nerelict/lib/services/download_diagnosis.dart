@@ -41,12 +41,16 @@ bool looksHttpOnlyOnly({
 /// - [cookieSent]：这次请求有没有带上 Cookie；
 /// - [cookieCount]：带上（或读到）的 Cookie 条数，只用于展示，不含名字与值；
 /// - [pageCookieLength]：`document.cookie.length`，`null` 表示读不到；
-/// - [challenged]：是否命中人机验证特征（`cf-mitigated` / 挑战页正文等）。
+/// - [challenged]：是否命中人机验证特征（`cf-mitigated` / 挑战页正文等）；
+/// - [crossHost]：被拒的地址与当前页面是否不同域。分片常挂在独立 CDN 域名上，
+///   此时「页面可见 Cookie」量的是页面那个域，对分片域没有参考价值，
+///   必须单独成一种情况，否则会把「跨域」误判成「HttpOnly」。
 AuthFailureReport describeAuthFailure({
   required bool cookieSent,
   required int cookieCount,
   required int? pageCookieLength,
   required bool challenged,
+  bool crossHost = false,
 }) {
   if (cookieSent) {
     final label = 'Cookie 已带（$cookieCount 项）';
@@ -55,6 +59,13 @@ AuthFailureReport describeAuthFailure({
       challenged
           ? '已带 Cookie 仍被判为自动化访问：属于请求特征差异（头部与指纹），不是登录态问题'
           : '仍被拒，多半是来源页校验或链接签名已过期',
+    );
+  }
+
+  if (crossHost) {
+    return AuthFailureReport(
+      'Cookie 未取到（该域 0 项，且与当前页面不同域）',
+      '分片在独立域名上，页面的登录态带不过去：这类站点要按该域单独取凭证',
     );
   }
 

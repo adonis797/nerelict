@@ -74,6 +74,15 @@
 > 设置改为二级分类菜单（常规 / 播放 / 下载与存储 / 其他），关于页去掉包名与更新说明，仅保留「安装应用更新」入口；
 > 版本号改为四位迭代号 0.3.5.2（pubspec 仍为 0.3.5+14，Gradle 覆盖 versionName）。
 
+> v0.4.6 把「能播不能下」的鉴权问题拆开来看：一是 `cf_clearance` 这类凭证带 `HttpOnly`，
+> `CookieManager.getCookie()` 读不到；二是回源请求只有 UA / Referer / Cookie，缺
+> `Accept` / `Accept-Language` / `Sec-Fetch-*`，在站点眼里不像浏览器。这一版先做前两层：
+> 403 的提示不再一律「Cookie 未取到」，而是分成「该域确实没有 Cookie」「与当前页面不同域」
+> 「只有 HttpOnly」「带了 Cookie 仍被挑战」四种，每种给一句可执行的建议；
+> 回源请求补上浏览器等效头（下载器与播放代理共用一份，ExoPlayer 直连不动）。
+> 方案与取舍见 `nerelict/docs/download-auth-and-challenge.md`，第三层（用 WebView 上下文代取
+> Cookie）留待诊断结果确认后再做。
+>
 > v0.4.5 登录入口不再被自己的防护弄死：不少站点点「登录」毫无反应，其实是三处出口被我们
 > 自己堵上了——① 登录弹窗的透明外壳同时满足「fixed + 高 z-index + 铺满视口 + 背景透明 +
 > 文字少」，被判成广告遮挡层，整层被加 `pointer-events: none`（该属性会继承，弹窗里所有

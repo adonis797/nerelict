@@ -1039,20 +1039,28 @@ class HlsDownloader {
           final tail = detail == null ? '' : ' · 服务端原文：$detail';
           if (code == 401 || code == 403) {
             final challenged = _isBotChallenge(e);
+            final host = Uri.tryParse(_lastRequestUrl)?.host ?? '';
+            final pageHost = PageCookieProbe.lastHost;
+            final crossHost = pageHost.isNotEmpty &&
+                host.isNotEmpty &&
+                pageHost != host.toLowerCase();
             final diag = describeAuthFailure(
               cookieSent: _lastCookiePresent,
               cookieCount: _lastCookieCount,
-              pageCookieLength:
-                  PageCookieProbe.lengthFor(Uri.tryParse(_lastRequestUrl)?.host ?? ''),
+              // 跨域时 lengthFor 会返回 null（那是页面那个域的读数），
+              // 但文案要靠 crossHost 说清「是跨域」，不能含糊成「读数不可用」
+              pageCookieLength: PageCookieProbe.lengthFor(host),
               challenged: challenged,
+              crossHost: crossHost,
             );
             // 诊断只增不改：文案仍以用户能照做的事开头，细节放后半段
             if (challenged) {
-              // master 播放列表常是站点的入口页，被挑战的概率比实际 media
-              // 播放列表高；面板里往往同时有 video.m3u8 这类地址，换一条更省事
+              // master 播放列表常是站点的入口页，规则比实际 media 播放列表更严。
+              // 但换源只能绕过「入口页更严」这一层，Cookie 缺失这条仍在——
+              // 所以措辞不能写成「换那条就能过」。
               final isMaster = _lastRequestUrl.toLowerCase().contains('playlist');
               final alt = isMaster
-                  ? '若面板里还有 video.m3u8 之类的地址，换那条下载通常能过；'
+                  ? '换 video.m3u8 只能绕过入口页更严的规则，Cookie 这条仍然存在；'
                   : '';
               return '被站点的 Cloudflare 人机验证拦下$at（${diag.cookieLabel}）。'
                   '$alt${diag.hint}';
