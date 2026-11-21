@@ -7,7 +7,6 @@ import 'package:path_provider/path_provider.dart';
 import 'media_source.dart';
 import 'app_log.dart';
 import 'app_paths.dart';
-import 'browser_headers.dart';
 import 'cookie_store.dart';
 import 'header_policy.dart';
 import 'playlist_rewriter.dart';
@@ -463,12 +462,12 @@ class StreamingProxy {
     if (referer != null && referer.startsWith('http')) {
       req.headers.set('Referer', referer);
     }
-    // 浏览器等效头：与下载器共用同一份映射，保证「边下边播」和「下载」
-    // 在站点眼里是同一个客户端；否则会出现「能播不能下」之外的新裂缝
-    browserMediaHeaders(url, referer: referer)
-        .forEach((name, value) => req.headers.set(name, value));
-    // 页面侧带来的鉴权头。UA / Referer / Cookie 已由本方法统一处理，
-    // HeaderPolicy 把这三类排除在白名单外，这里不会互相覆盖。
+    // 这里**刻意不加**浏览器特征头（`Accept` / `Accept-Language` / `Sec-Fetch-*`）。
+    //
+    // 播放是已经跑通的路径：站点接受「UA + Referer + Cookie」这套最小身份。
+    // 0.4.6 为了「让下载看起来像浏览器」曾在这里也加了一份，结果把本来能播的
+    // HLS 站点打回 403——拿可用功能做实验，方向错了。浏览器特征头只留给下载器。
+    // 页面侧带来的鉴权头仍然照转（Authorization / X-* 等白名单项）。
     final extra = headerToken.isEmpty ? null : _headersByToken[headerToken];
     if (extra != null) {
       extra.forEach((name, value) => req.headers.set(name, value));

@@ -208,13 +208,13 @@ void main() {
 
   stdout.writeln('=== 9. 版本号与二级设置 ===');
   final pubspec = read('pubspec.yaml');
-  check(pubspec.contains('version: 0.4.7+27'), 'pubspec 基础版本为 0.4.7 / code 27');
+  check(pubspec.contains('version: 0.4.8+28'), 'pubspec 基础版本为 0.4.8 / code 28');
   final gradle = read('android/app/build.gradle.kts');
   check(gradle.contains('versionName = flutter.versionName'),
       '展示版本统一取 pubspec 三段版本');
   check(!gradle.contains('versionName = "0.3.9.0"'), '不再覆盖第四段展示版本');
   final settingsFile = read('lib/ui/settings_tab.dart');
-  check(settingsFile.contains("appVersion = '0.4.7'"), '设置页版本为 0.4.7');
+  check(settingsFile.contains("appVersion = '0.4.8'"), '设置页版本为 0.4.8');
   check(read('README.md').contains('v0.4.4'), 'README 版本号已同步');
   check(settingsFile.contains('_CategoryTile'), '设置改为分类入口');
   check(settingsFile.contains('_SettingsPage'), '存在二级设置页');
@@ -491,7 +491,7 @@ void main() {
       .firstMatch(pubspecText);
   final semver = versionLine?.group(1) ?? '';
   final currentCode = int.tryParse(versionLine?.group(2) ?? '') ?? 0;
-  check(semver == '0.4.7', '当前展示版本为 0.4.7');
+  check(semver == '0.4.8', '当前展示版本为 0.4.8');
   check(currentCode > publishedVersionCode,
       'versionCode $currentCode 严格大于已发布最高值 $publishedVersionCode');
   check(settingsText.contains("appVersion = '$semver'"),
@@ -1069,9 +1069,16 @@ void main() {
   check(!hd34.contains("server.contains('cloudflare')"),
       '不再把 server: cloudflare 当成被挑战');
   check(hd34.contains("value('cf-mitigated')"), '只认 cf-mitigated 这个明确信号');
-  check(read('lib/services/streaming_proxy.dart')
-          .contains('browserMediaHeaders(url'),
-      '播放代理与下载器共用同一份头');
+  // 播放代理**不能**跟着下载器一起加浏览器特征头：0.4.6 加过一次，
+  // 把本来能播的 HLS 站点打回 403。播放是通的路径，不许拿来做实验。
+  final proxy34 = read('lib/services/streaming_proxy.dart');
+  check(!proxy34.contains('browserMediaHeaders'),
+      '播放代理不加浏览器特征头（只发 UA + Referer + Cookie）');
+  check(proxy34.contains("req.headers.set('User-Agent', MediaSource.userAgent)") &&
+          proxy34.contains("req.headers.set('Referer', referer)"),
+      '播放代理的身份头仍是 UA + Referer 那套最小集合');
+  check(read('lib/services/browser_headers.dart').contains('只给下载器用'),
+      '浏览器头的适用边界写在模块里，避免再被复用');
   check(!read('lib/services/media_source.dart').contains('Sec-Fetch'),
       'ExoPlayer 直连不被动过（当前播放是通的）');
   check(read('lib/services/page_cookie_probe.dart').contains('lastHost'),
