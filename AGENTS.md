@@ -53,6 +53,8 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 |---|---|
 | `verify_v35.dart` | 主回归脚本，安装能力、版本号、文案、常量与第 N 节分块断言 |
 | `verify_paths.dart` | `app_paths.dart` 路径层边界（配置缺失 / 相对 / 绝对 / 穿越 / 回退 / 端口） |
+| `verify_browser_headers.dart` | 回源请求的浏览器等效头（`Sec-Fetch-*` 推导、不覆盖 UA/Cookie/Range）+ 403 诊断三种情况不混 |
+| `verify_media_meta.dart` | 文件页数据层：分类宫格覆盖、`.m3u8` 认作清单、清单解析、时长/分辨率文案、元数据缓存序列化 |
 | `verify_playback.dart` | 播放代理链路：302 回源、最终 URI、m3u8 改写、MIME、缓存键 |
 | `verify_p0.dart` | 重定向 base、直播标记、续传不串片、直链 `If-Range` |
 | `verify_p1.dart` | `ss_*` 残留清理、直链背压写盘、中途暂停状态收敛 |
@@ -93,7 +95,11 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
   `verify_v35.dart` 第 23 节会扫描并阻止回归。
 - **状态管理用 `provider` + `ChangeNotifier`**（`lib/state/` 下 `AppState` / `SettingsState` / `HistoryState` / `WebFavoritesState`），不引入其他状态库。
 - **JS 注入脚本与 Dart 通信走 `JavaScriptChannel`**：`SniffChannel`（嗅探）、`PlayerChannel`（可播放视频探测与接管）、`FloatChannel`（网页 `<video>` 长按浮标）。三个脚本各自包一层 `fetch` / `XHR` / `media src`，链式调用必须互不干扰。
-- **原生能力走 `MethodChannel`，两端名字必须同步改**：`com.nerelict/mp4`、`com.nerelict/storage`、`com.nerelict/player`、`com.nerelict/screen`、`com.nerelict/install`、`com.nerelict/network`。Dart 端在 `lib/services/*.dart`，Kotlin 端在 `MainActivity.kt` 注册。
+- **原生能力走 `MethodChannel`，两端名字必须同步改**：`com.nerelict/mp4`、`com.nerelict/storage`、`com.nerelict/player`、`com.nerelict/screen`、`com.nerelict/install`、`com.nerelict/network`、`com.nerelict/cookie`、`com.nerelict/external`、`com.nerelict/media`。Dart 端在 `lib/services/*.dart`，Kotlin 端在 `MainActivity.kt` 注册。
+- **回源请求的身份要一致**：UA 统一读 `UserAgent.current`（WebView 建好后采纳真实 UA），
+  浏览器等效头统一走 `lib/services/browser_headers.dart`。下载器与播放代理必须用同一份，
+  否则同一个地址在站点眼里是两个客户端——这就是 0.4.4 之前「能播不能下」的根因。
+  方案与取舍见 `nerelict/docs/download-auth-and-challenge.md`。
 - **路径一律走 `lib/services/app_paths.dart`**：`joinPath` 拼接、环境变量键 `NERELICT_DOWNLOAD_DIR` / `NERELICT_INSTALL_SKILL_DIR` / `NERELICT_PROJECT_ROOT` / `NERELICT_HLS_HOST` / `NERELICT_HLS_PORT`。**禁止硬编码盘符、`Directory.current` 或固定项目位置**；下载目录名统一用 `kDownloadDirName`（`Nerelict`）。
 - **MP4 转换只做无重编码转封装**（`MediaExtractor` + `MediaMuxer`，`Mp4Converter.kt`），不引入 FFmpeg；只搬 H.264/HEVC + AAC 样本，其它编码明确报不支持。
 - **播放器分层不要打穿**：`media_source` → `player_core`（抽象接口，UI 只依赖它）→ `player_ui`；`download_cache`（本地代理）与 `media_session`（原生通知/音频焦点）是两条可独立关闭的旁路。
@@ -122,7 +128,9 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 
 ## 已知限制与踩坑记录
 
-- 真机截图是缩放图（1080x2400 设备截图常见为 483x1080），**点击坐标要按比例换算**，否则会点错行。
+- 真机截图在预览里是缩放图（1080x2400 设备截图显示为 483x1080），**不要靠目测换算坐标**：
+  一律先 `adb shell uiautomator dump /sdcard/ui.xml` 拉下来读 `bounds`，再点。
+  目测换算会偏几十到上百像素，轻则点空，重则点到相邻控件——本项目曾因此误删用户的一个成品视频。
 - vivo 百度输入法会把 `adb shell input text` 的 ASCII 当拼音；可临时 `ime disable` / `ime enable` 恢复，用完必须还原。
 - `adb reverse` 不跨命令持久，需与设备操作放在同一条命令里；PC 侧访问 `adb forward` 端口要加 `--noproxy '*'`。
 - Git Bash 会把设备侧 `/sdcard/...` 转成 Windows 路径，涉及设备路径的操作改用 PowerShell。

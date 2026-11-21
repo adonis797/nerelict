@@ -8,6 +8,11 @@
          INSTALL_PACKAGES 是系统级权限，只有系统签名/预装 priv-app 或 root 才能生效，
          普通安装包声明它不会获得授权，仅用于「已预装」场景下启用静默安装。 -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <!-- 文件管理：浏览整个内部存储（Android 11+ 的「所有文件访问权限」，
+         需用户在系统设置里手动开启，见设置页的引导） -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage"/>
     <uses-permission
         android:name="android.permission.INSTALL_PACKAGES"
         tools:ignore="ProtectedPermissions"/>

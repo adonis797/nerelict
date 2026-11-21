@@ -208,13 +208,13 @@ void main() {
 
   stdout.writeln('=== 9. 版本号与二级设置 ===');
   final pubspec = read('pubspec.yaml');
-  check(pubspec.contains('version: 0.4.5+25'), 'pubspec 基础版本为 0.4.5 / code 25');
+  check(pubspec.contains('version: 0.4.7+27'), 'pubspec 基础版本为 0.4.7 / code 27');
   final gradle = read('android/app/build.gradle.kts');
   check(gradle.contains('versionName = flutter.versionName'),
       '展示版本统一取 pubspec 三段版本');
   check(!gradle.contains('versionName = "0.3.9.0"'), '不再覆盖第四段展示版本');
   final settingsFile = read('lib/ui/settings_tab.dart');
-  check(settingsFile.contains("appVersion = '0.4.5'"), '设置页版本为 0.4.5');
+  check(settingsFile.contains("appVersion = '0.4.7'"), '设置页版本为 0.4.7');
   check(read('README.md').contains('v0.4.4'), 'README 版本号已同步');
   check(settingsFile.contains('_CategoryTile'), '设置改为分类入口');
   check(settingsFile.contains('_SettingsPage'), '存在二级设置页');
@@ -345,7 +345,8 @@ void main() {
       projectFile('lib/ui/files_tab.dart').existsSync() &&
           !projectFile('lib/ui/downloads_tab.dart').existsSync(),
       '下载页拆分为文件页 + 下载分支');
-  check(filesTab.contains('final files = state.localFiles'), '文件页直接使用扫描到的文件');
+  check(filesTab.contains('_dir == null ? state.localFiles : _entries'),
+      '文件页按当前目录取数据源（下载目录 / 外部目录）');
   check(!filesTab.contains('knownPaths'), '不再排除已完成任务引用的文件（修复文件不显示）');
   check(filesTab.contains('DownloadTasksPage'), '顶部菜单可进入下载分支');
   check(!filesTab.contains('cleaning_services_outlined'), '文件页顶部不再放清理扫把');
@@ -479,7 +480,7 @@ void main() {
 
   stdout.writeln('=== 23. 发版护栏、品牌命名与 0.4.1 资源 ===');
   // 已正式发布的最高 versionCode；每次 Release 后上调，防止忘记 +1 或复用旧码
-  const int publishedVersionCode = 24;
+  const int publishedVersionCode = 25;
   final pubspecText = read('pubspec.yaml');
   final settingsText = read('lib/ui/settings_tab.dart');
   final gradleText = read('android/app/build.gradle.kts');
@@ -490,7 +491,7 @@ void main() {
       .firstMatch(pubspecText);
   final semver = versionLine?.group(1) ?? '';
   final currentCode = int.tryParse(versionLine?.group(2) ?? '') ?? 0;
-  check(semver == '0.4.5', '当前展示版本为 0.4.5');
+  check(semver == '0.4.7', '当前展示版本为 0.4.7');
   check(currentCode > publishedVersionCode,
       'versionCode $currentCode 严格大于已发布最高值 $publishedVersionCode');
   check(settingsText.contains("appVersion = '$semver'"),
@@ -882,6 +883,192 @@ void main() {
       '原生侧用 ACTION_VIEW 打开深链');
   check(projectFile('tool/click_js_test.js').existsSync(),
       '提供点击脚本的 Node 行为验证');
+
+  // 文件页：分类宫格 + 最近播放 + 单列行，视频不做独立页面。
+  // 数据层的规则单独由 verify_media_meta.dart 跑，这里锁「结构没被改回去」。
+  stdout.writeln('=== 35. 文件页与媒体元数据 ===');
+  final kinds35 = read('lib/services/file_kinds.dart');
+  check(kinds35.contains('ebook') && kinds35.contains('apk'),
+      '类型细分出电子书与安装包');
+  check(kinds35.contains("'.m3u8': LocalFileKind.video"),
+      '.m3u8 归入视频（可播放）');
+  check(kinds35.contains('kPlaylistExts') && kinds35.contains('isPlaylistName'),
+      '清单文件单独识别');
+  final meta35 = read('lib/services/media_meta.dart');
+  check(meta35.contains('parsePlaylistText') && meta35.contains('formatDuration'),
+      '清单解析与时长格式化在纯 Dart 层');
+  check(meta35.contains("startsWith('#EXTM3U')"),
+      '首个非空行必须是 #EXTM3U（防盗链的 HTML 不会被当成清单）');
+  check(meta35.contains('resolutionLabel'), '分辨率档位化');
+  final probe35 = read('lib/services/media_probe.dart');
+  check(probe35.contains("'com.nerelict/media'"), '元数据走独立原生通道');
+  check(probe35.contains('modifiedMs') && probe35.contains('_inflight'),
+      '按 size+mtime 缓存并合并并发探测');
+  check(probe35.contains('_maxSegmentChecks'), '清单分片核对有上限，不阻塞 UI');
+  final activity35 =
+      read('android/app/src/main/kotlin/com/nerelict/nerelict/MainActivity.kt');
+  check(activity35.contains('MEDIA_CHANNEL = "com.nerelict/media"') &&
+          activity35.contains('MediaMetadataRetriever'),
+      '原生用 MediaMetadataRetriever 读时长与分辨率');
+  final files35 = read('lib/ui/files_tab.dart');
+  check(files35.contains('_KindGrid') && files35.contains('kGridKinds'),
+      '分类宫格取代原来的类型 chips');
+  check(!files35.contains('_FilterBar('), '旧的横向筛选条已移除');
+  check(files35.contains('_SearchField') && files35.contains('_showSortSheet'),
+      '搜索与排序入口在页内');
+  check(files35.contains('_enterSelection') && files35.contains('_BatchBar'),
+      '长按进多选、底部批量操作条');
+  check(files35.contains('_showRowMenu') && files35.contains('_FileRow'),
+      '行尾 ⋮ 菜单承载重命名/删除/信息');
+  check(files35.contains('MediaProbe.instance.probe('),
+      '行内元数据懒加载');
+  check(!files35.contains('PlayerPage'), '视频不另开页面，直接走 Nerelict 播放器');
+  check(projectFile('tool/verify_media_meta.dart').existsSync(),
+      '提供文件页数据层的纯 Dart 断言');
+
+  // 删除先落回收站：起因是一次真实的误删，成品视频直接被删掉、无法挽回。
+  stdout.writeln('=== 36. 删除可撤销 ===');
+  final trash36 = read('lib/services/file_trash.dart');
+  check(trash36.contains("dirName = '.trash'"), '回收站目录是 .trash（扫描会跳过）');
+  check(trash36.contains('keepFor') && trash36.contains('days: 7'),
+      '回收站保留 7 天');
+  check(trash36.contains('moveToTrash') && trash36.contains('restore('),
+      '支持移入与还原');
+  check(trash36.contains('_恢复_'), '同名文件还原时不覆盖，改名留痕');
+  final state36 = read('lib/state/app_state.dart');
+  check(state36.contains('FileTrash.moveToTrash('), '删除走回收站');
+  check(state36.contains('return trashed'), '删除返回回收站路径供撤销');
+  check(state36.contains('restoreFromTrash'), '提供撤销还原入口');
+  check(state36.contains('FileManager.delete(path)'),
+      '回收站搬不动时退回硬删，不让「删除」点了没反应');
+  check(state36.contains('purgeExpired'), '过期回收站会被清理');
+  final files36 = read('lib/ui/files_tab.dart');
+  check(files36.contains("label: '撤销'"), '删除后给一次撤销机会');
+  check(files36.contains('restoreFromTrash'), '撤销接到状态层');
+
+  // 浏览整个内部存储：Android 11+ 只能靠「所有文件访问权限」，且必须用户手动开。
+  stdout.writeln('=== 37. 全盘浏览（所有文件访问权限） ===');
+  final manifest37 = read('android/app/src/main/AndroidManifest.xml');
+  check(manifest37.contains('MANAGE_EXTERNAL_STORAGE'),
+      '声明所有文件访问权限');
+  final activity37 =
+      read('android/app/src/main/kotlin/com/nerelict/nerelict/MainActivity.kt');
+  check(activity37.contains('isExternalStorageManager'),
+      '原生按 isExternalStorageManager 判断授权');
+  check(activity37.contains('ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION') &&
+          activity37.contains('ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION'),
+      '跳转到授权页，并对缺失该页的 ROM 兜底');
+  check(activity37.contains('getExternalStorageDirectory'),
+      '能给出内部存储根路径');
+  final access37 = read('lib/services/storage_access.dart');
+  check(access37.contains('hasAllFilesAccess') && access37.contains('openSettings'),
+      'Dart 侧封装检查与跳转');
+  final scanner37 = read('lib/services/local_media_scanner.dart');
+  check(scanner37.contains('scanDirectory(') && scanner37.contains('includeDirs'),
+      '扫描支持任意目录与目录条目');
+  check(scanner37.contains('isDir'), '目录是单独的条目类型');
+  final files37 = read('lib/ui/files_tab.dart');
+  check(files37.contains('_enterDir') && files37.contains('_leaveDir'),
+      '能进子目录并能退回上级');
+  check(files37.contains('_Breadcrumb'), '面包屑说明当前位置');
+  check(files37.contains('_AccessCard') && files37.contains('_requestAccess'),
+      '未授权时给出引导卡');
+  check(files37.contains('didChangeAppLifecycleState'),
+      '回到前台重新检查授权（系统设置里开完即生效）');
+  check(files37.contains('bool get _canManage => _dir == null'),
+      '下载目录之外只读：别处不开放删除与重命名');
+  check(files37.contains('此目录只读'), '只读目录在菜单里说明原因');
+  // 返回键必须先把「页面自己的子状态」问一遍，再切标签：
+  // 以前 main.dart 先无条件 setTab(0)，文件页的退多选/退目录永远轮不到。
+  final main37 = read('lib/main.dart');
+  final backIdx = main37.indexOf('await state.handleBack()');
+  final tabIdx = main37.indexOf('state.setTab(0)');
+  check(backIdx > 0 && tabIdx > 0 && backIdx < tabIdx,
+      '返回键先问页面状态，再退回浏览器标签');
+
+  // 通行证是 HttpOnly，只能让 WebView 自己发一次请求，读它的真实出站头。
+  stdout.writeln('=== 38. WebView 代取通行证 ===');
+  check(activity37.contains('WEBPROBE_CHANNEL = "com.nerelict/webprobe"'),
+      '原生注册代取通道');
+  check(activity37.contains('shouldInterceptRequest') &&
+          activity37.contains('requestHeaders'),
+      '从真实出站请求头里取 Cookie');
+  check(activity37.contains('wv.destroy()'), '抓到或超时都销毁 WebView');
+  check(activity37.contains('12_000'), '代取有 12 秒超时，不死等');
+  final probe38 = read('lib/services/web_probe.dart');
+  check(probe38.contains("'com.nerelict/webprobe'"), '两端通道名一致');
+  check(probe38.contains('captureCookie'), '只对外暴露 Cookie 串');
+  final hd38 = read('lib/services/hls_downloader.dart');
+  check(hd38.contains('captureCookie') && hd38.contains('_clearanceOverrides'),
+      '下载器接受代取结果并按 host 复用');
+  final capIdx = hd38.indexOf('await _captureBeforeRetry();');
+  final delayIdx = hd38.indexOf('await Future<void>.delayed(Duration(milliseconds: 400');
+  check(capIdx > 0 && delayIdx > 0 && capIdx < delayIdx,
+      '先补凭证再退避重试（顺序反了就白跑一次）');
+  check(hd38.contains('missingClearance') || hd38.contains('_lastClearanceSent == false'),
+      '只在「缺通行证」时触发代取，不无脑抓');
+  check(read('lib/state/app_state.dart').contains('WebProbe.captureCookie'),
+      '状态层把代取接到下载器');
+  // 代取到的 Cookie 只有「重试时重新算头」才用得上：
+  // 头在闭包外算一次的话，三次重试发的都是同一份旧头，代取等于白做。
+  check(hd38.contains('每轮重试都重新算头'),
+      '重试时重算请求头（否则代取到的 Cookie 用不上）');
+  // 直链以前完全没有重试：被挑战只能直接失败，必须补一条「补凭证后重试」。
+  check(hd38.contains('Future<Response<ResponseBody>> start()'),
+      '直链下载抽出可重试的请求');
+  final capCount = '_captureBeforeRetry()'.allMatches(hd38).length;
+  check(capCount >= 2, '播放列表/分片与直链两条路都接了代取重试');
+  check(files37.contains('if (!file.isDir) parts.add(file.sizeText)'),
+      '目录行不显示大小');
+  // 拦截器全局注册，必须各自判断「我是不是当前页」，否则会互相抢返回
+  check(files37.contains('_app.tabIndex != 1'), '文件页只在自己那页处理返回');
+  check(read('lib/ui/browser_tab.dart').contains('_state.tabIndex != 0'),
+      '浏览器页只在自己那页处理返回');
+
+  // 下载被 Cloudflare 挡下的两层原因：Cookie 读不到（可能 HttpOnly）与请求特征不像浏览器。
+  // 方案见 docs/download-auth-and-challenge.md，这里锁住「实现别走偏」：
+  // 头只补浏览器必带的项、诊断三种情况不混、ExoPlayer 直连不被动过。
+  stdout.writeln('=== 34. 回源请求的浏览器一致性与 403 诊断 ===');
+  final bh34 = read('lib/services/browser_headers.dart');
+  check(bh34.contains("'Sec-Fetch-Site'") && bh34.contains("'Sec-Fetch-Dest'"),
+      '补齐 Sec-Fetch-* 三项');
+  check(bh34.contains("'Accept': '*/*'"), '补 Accept');
+  check(!bh34.contains("'User-Agent'") && !bh34.contains("'Cookie'"),
+      '不产出 UA / Cookie（会覆盖真实会话）');
+  // 注释里会提到 Range / sec-ch-ua 以解释「为什么不加」，所以只匹配作为键出现的形态
+  check(!bh34.contains("'Range'") && !bh34.contains("'sec-ch-ua"),
+      '不产出 Range，也不猜 sec-ch-ua（值必须与 UA 版本对应）');
+  final hd34 = read('lib/services/hls_downloader.dart');
+  check(hd34.contains('browserMediaHeaders(url'), '下载回源用到这份头');
+  check(hd34.contains('describeAuthFailure('), '403 文案走统一诊断');
+  check(hd34.contains('PageCookieProbe.lengthFor('), '诊断里带上页面可见 Cookie 读数');
+  // 「带了 9 项 Cookie」和「带了通行证」不是一回事：前者可能是 9 个无关的小饼干，
+  // 后者才是能过 Cloudflare 的那一张。这一位决定下一步是代取凭证还是查指纹。
+  check(hd34.contains('_lastClearanceSent') && hd34.contains('hasClearanceCookie'),
+      '记录这次带的 Cookie 里有没有通行证');
+  check(read('lib/services/download_diagnosis.dart').contains('kClearanceCookieNames'),
+      '通行证名字表集中在诊断模块');
+  check(read('lib/services/streaming_proxy.dart')
+          .contains('browserMediaHeaders(url'),
+      '播放代理与下载器共用同一份头');
+  check(!read('lib/services/media_source.dart').contains('Sec-Fetch'),
+      'ExoPlayer 直连不被动过（当前播放是通的）');
+  check(read('lib/services/page_cookie_probe.dart').contains('lastHost'),
+      '页面 Cookie 读数按 host 存，换站不串');
+  check(read('lib/ui/browser_tab.dart').contains('PageCookieProbe.attach(') &&
+          read('lib/ui/browser_tab.dart').contains('_readDocumentCookieLength'),
+      'WebView 侧注入读数探针');
+  check(projectFile('tool/verify_browser_headers.dart').existsSync(),
+      '提供头映射与诊断的纯 Dart 断言');
+  check(projectFile('docs/download-auth-and-challenge.md').existsSync(),
+      '方案文档落在 docs 下');
+  // 实测：master 与 media 两条 m3u8 都会因 Cookie 缺失被拦，换源绕不过这一层。
+  // 提示不能再声称「换 video.m3u8 通常能过」。
+  check(!hd34.contains('换那条下载通常能过') && hd34.contains('Cookie 这条仍然存在'),
+      '提示不再承诺「换源就能过」（两条都被拦过）');
+  check(hd34.contains('crossHost') &&
+          read('lib/services/download_diagnosis.dart').contains('crossHost'),
+      '跨域与 HttpOnly 分开判（分片的 Cookie 读数不通用）');
 
   stdout.writeln();
   if (failures.isEmpty) {

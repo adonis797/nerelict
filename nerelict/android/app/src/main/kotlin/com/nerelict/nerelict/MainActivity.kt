@@ -8,12 +8,22 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.DocumentsContract
+import android.provider.Settings
 import android.provider.OpenableColumns
+import android.util.Log
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
@@ -31,6 +41,8 @@ class MainActivity : FlutterActivity() {
         private const val NETWORK_CHANNEL = "com.nerelict/network"
         private const val COOKIE_CHANNEL = "com.nerelict/cookie"
         private const val EXTERNAL_CHANNEL = "com.nerelict/external"
+        private const val MEDIA_CHANNEL = "com.nerelict/media"
+        private const val WEBPROBE_CHANNEL = "com.nerelict/webprobe"
         private const val REQ_PICK_DIR = 1001
         private const val REQ_PICK_APK = 1002
     }
@@ -49,6 +61,8 @@ class MainActivity : FlutterActivity() {
         configureNetworkChannel(flutterEngine)
         configureCookieChannel(flutterEngine)
         configureExternalChannel(flutterEngine)
+        configureMediaChannel(flutterEngine)
+        configureWebProbeChannel(flutterEngine)
     }
 
     /**
@@ -111,6 +125,191 @@ class MainActivity : FlutterActivity() {
                             // 没有能处理该 scheme 的应用（ActivityNotFoundException）
                             result.success(false)
                         }
+                    }
+
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    /**
+     * 用 WebView 上下文代取请求头。
+     *
+     * 为什么需要：Cloudflare 的 `cf_clearance` 带 HttpOnly，`CookieManager.getCookie()`
+     * 走的是 JS 可见的那份存储，读不到；而 `shouldInterceptRequest` 拿到的是**真实出站头**，
+     * 包含 HttpOnly。这里只抓「某个地址这一次请求的头」，抓完立即销毁 WebView，
+     * 不加载页面、不执行页面脚本、不保存任何 Cookie 值。
+     */
+    private fun configureWebProbeChannel(flutterEngine: FlutterEngine) {
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, WEBPROBE_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "captureHeaders" -> {
+                        val url = call.argument<String>("url")
+                        val ua = call.argument<String>("userAgent")
+                        if (url.isNullOrEmpty()) {
+                            result.success(null)
+                            return@setMethodCallHandler
+                        }
+                        runOnUiThread { captureHeadersViaWebView(url, ua, result) }
+                    }
+
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    private fun captureHeadersViaWebView(
+        url: String,
+        ua: String?,
+        result: MethodChannel.Result,
+    ) {
+        var finished = false
+        var webView: WebView? = null
+        var seenRequests = 0
+        var sawCookie = false
+        var fetched = false
+
+        fun log(msg: String) {
+            Log.d("NerelictProbe", msg)
+        }
+
+        fun finish(payload: Map<String, String>?) {
+            if (finished) return
+            finished = true
+            log("finish requests=$seenRequests cookie=$sawCookie payload=${payload != null}")
+            try {
+                webView?.let { wv ->
+                    wv.stopLoading()
+                    (wv.parent as? ViewGroup)?.removeView(wv)
+                    wv.destroy()
+                }
+            } catch (_: Exception) {
+            }
+            webView = null
+            result.success(payload)
+        }
+
+        fun startFetch(wv: WebView) {
+            if (fetched) return
+            fetched = true
+            // 主框架导航拿不到完整请求头（Cookie 常被略去），
+            // 用页面内 fetch 触发一次**子资源**请求，那里才有 Cookie。
+            val quoted = org.json.JSONObject.quote(url)
+            val js = "fetch($quoted,{credentials:'include',cache:'no-store'})" +
+                ".then(function(r){return r.text()})" +
+                ".then(function(t){return 'ok:'+t.length})" +
+                ".catch(function(e){return 'err:'+e})"
+            log("startFetch $url")
+            wv.evaluateJavascript(js) { value -> log("fetchResult=$value") }
+        }
+
+        try {
+            val target = Uri.parse(url)
+            val host = target.host ?: ""
+            val originRoot = "${target.scheme}://$host/"
+            val wv = WebView(this)
+            webView = wv
+            wv.settings.javaScriptEnabled = true
+            // 不要图片：我们要的是请求头，不是页面内容
+            wv.settings.blockNetworkImage = true
+            wv.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+            if (!ua.isNullOrEmpty()) wv.settings.userAgentString = ua
+            wv.webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                ): WebResourceResponse? {
+                    val req = request ?: return null
+                    val reqUrl = req.url ?: return null
+                    // 只认目标主机：跳转到登录页之类的不参与
+                    if (host.isNotEmpty() && reqUrl.host != host) return null
+                    seenRequests++
+                    val headers = req.requestHeaders ?: emptyMap()
+                    val cookieKey = headers.keys.firstOrNull {
+                        it.equals("Cookie", ignoreCase = true)
+                    }
+                    log("req #$seenRequests ${reqUrl.path} headers=${headers.size} cookie=${cookieKey != null}")
+                    if (cookieKey != null) {
+                        sawCookie = true
+                        val payload = HashMap(headers)
+                        payload["__probeRequests"] = seenRequests.toString()
+                        finish(payload)
+                        return null
+                    }
+                    return null
+                }
+
+                override fun onPageFinished(view: WebView?, pageUrl: String?) {
+                    super.onPageFinished(view, pageUrl)
+                    log("onPageFinished $pageUrl")
+                    if (view != null) startFetch(view)
+                }
+            }
+            // 必须挂到窗口里才会真正发请求：1x1、不可见、不占布局
+            val root = findViewById<ViewGroup>(android.R.id.content)
+            root.addView(wv, ViewGroup.LayoutParams(1, 1))
+            log("load $originRoot")
+            wv.loadUrl(originRoot)
+            // 根页若是挑战页、脚本跑不起来，退一步直接加载目标地址再试
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (!finished && !sawCookie) {
+                    log("fallback load target")
+                    webView?.loadUrl(url)
+                }
+            }, 5_000)
+            Handler(Looper.getMainLooper()).postDelayed({ finish(null) }, 12_000)
+        } catch (_: Exception) {
+            finish(null)
+        }
+    }
+
+    /**
+     * 本地媒体元数据：时长与分辨率。
+     *
+     * 只读元信息、不解码整段（`MediaMetadataRetriever` 内部按需解析头部），
+     * 失败一律回 null，由 Dart 侧标成「读不出元数据」而不是时长 0。
+     */
+    private fun configureMediaChannel(flutterEngine: FlutterEngine) {
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, MEDIA_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "probe" -> {
+                        val path = call.argument<String>("path")
+                        if (path.isNullOrEmpty() || !File(path).exists()) {
+                            result.success(null)
+                            return@setMethodCallHandler
+                        }
+                        // 元数据读取是阻塞操作，放到工作线程，避免卡住主线程
+                        Thread {
+                            var retriever: MediaMetadataRetriever? = null
+                            try {
+                                retriever = MediaMetadataRetriever()
+                                retriever.setDataSource(path)
+                                val duration = retriever
+                                    .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                                    ?.toLongOrNull() ?: 0L
+                                val width = retriever
+                                    .extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                                    ?.toIntOrNull() ?: 0
+                                val height = retriever
+                                    .extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                                    ?.toIntOrNull() ?: 0
+                                val payload = mapOf(
+                                    "durationMs" to duration,
+                                    "width" to width,
+                                    "height" to height,
+                                )
+                                runOnUiThread { result.success(payload) }
+                            } catch (_: Exception) {
+                                runOnUiThread { result.success(null) }
+                            } finally {
+                                try {
+                                    retriever?.release()
+                                } catch (_: Exception) {
+                                }
+                            }
+                        }.start()
                     }
 
                     else -> result.notImplemented()
@@ -401,9 +600,56 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "pickDirectory" -> pickDirectory(result)
                     "exportFile" -> exportFile(call, result)
+                    "allFilesAccess" -> result.success(hasAllFilesAccess())
+                    "openAllFilesSettings" -> result.success(openAllFilesSettings())
+                    "externalRoot" -> result.success(
+                        Environment.getExternalStorageDirectory()?.absolutePath
+                    )
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    /**
+     * 「所有文件访问权限」是否已授予。
+     *
+     * Android 11+ 用 `Environment.isExternalStorageManager()` 判断；
+     * 低版本没有这个限制，恒为 true。
+     */
+    private fun hasAllFilesAccess(): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                Environment.isExternalStorageManager()
+            } catch (_: Exception) {
+                false
+            }
+        } else {
+            true
+        }
+
+    /**
+     * 跳到系统的「所有文件访问权限」开关。
+     *
+     * 先试应用自己的那一页，部分国产 ROM 没有实现，退回通用列表页；
+     * 都打不开就返回 false，由 Dart 侧提示手动去找。
+     */
+    private fun openAllFilesSettings(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return true
+        val direct = Intent(
+            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+            Uri.parse("package:$packageName")
+        )
+        try {
+            startActivity(direct)
+            return true
+        } catch (_: Exception) {
+        }
+        return try {
+            startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun pickDirectory(result: MethodChannel.Result) {

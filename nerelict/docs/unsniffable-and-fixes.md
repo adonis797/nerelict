@@ -89,6 +89,11 @@
 4. **P2**：音轨不支持提示、下载后转码入口。
 5. **永远不做**：DRM 解密、WASM 私有解密、Canvas/WebRTC 录屏。
 
+> 「能播不能下」这一路的鉴权 / 人机验证问题单独收在
+> `docs/download-auth-and-challenge.md`：`cf_clearance` 是 HttpOnly 读不到、
+> 回源请求缺浏览器特征头、以及为什么要用 WebView 代取 Cookie，都在那篇里。
+> 0.4.5 起 403 的提示会区分「该域没有 Cookie」「只有 HttpOnly」「带了 Cookie 仍被挑战」三种。
+
 已完成的：AES-128 解密、`#EXT-X-MAP`、`#EXT-X-BYTERANGE`、`#EXT-X-DISCONTINUITY`、
 跨域 iframe 地址上报、Cookie/Referer 鉴权、**自定义请求头透传（0.4.4）**、
 广告遮挡层与弹窗拦截、错误文案归一化。

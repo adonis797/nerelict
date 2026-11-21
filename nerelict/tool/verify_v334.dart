@@ -30,6 +30,9 @@ void main() {
     'notes.md': LocalFileKind.document,
     'sub.srt': LocalFileKind.document,
     'pack.zip': LocalFileKind.archive,
+    'index.m3u8': LocalFileKind.video,
+    'book.epub': LocalFileKind.ebook,
+    'app.apk': LocalFileKind.apk,
     'data.bin': LocalFileKind.other,
     'noext': LocalFileKind.other,
     'archive.tar.gz': LocalFileKind.archive,
@@ -44,7 +47,9 @@ void main() {
     LocalFileKind.audio: '音频',
     LocalFileKind.image: '图片',
     LocalFileKind.document: '文档',
+    LocalFileKind.ebook: '电子书',
     LocalFileKind.archive: '压缩包',
+    LocalFileKind.apk: '安装包',
     LocalFileKind.other: '其他',
   };
   labels.forEach((kind, label) {

@@ -216,9 +216,14 @@ void main() {
   stdout.writeln('=== 7. 403 诊断与 UA ===');
   check(downloader.contains('_lastRequestUrl'), '记录最近一次被拒的请求地址');
   check(downloader.contains('_lastRequestPath'), '错误提示能说出是哪一步被拒');
-  check(downloader.contains("'Cookie 已带'") &&
-          downloader.contains("'Cookie 未取到'"),
-      '403 时明确是否带上了 Cookie');
+  // 0.4.5 起「是否带上 Cookie」的措辞移进了 download_diagnosis.dart
+  // （它把「没带上」进一步拆成「该域没有」与「只有 HttpOnly」两种情况），
+  // 这里改为断言下载器接到了诊断，且两种基本状态仍然分得开。
+  final diag = read('lib/services/download_diagnosis.dart');
+  check(downloader.contains('describeAuthFailure('),
+      '403 时明确是否带上了 Cookie（走统一诊断）');
+  check(diag.contains('Cookie 已带') && diag.contains('Cookie 未取到'),
+      '诊断仍区分「已带」与「未取到」');
   check(downloader.contains('_responseSnippet'), '403 时附上服务端原文');
   check(downloader.contains('服务器返回 \$code\$at'), '错误提示带上路径');
 

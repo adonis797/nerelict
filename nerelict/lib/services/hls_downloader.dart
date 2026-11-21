@@ -7,7 +7,10 @@ import 'package:dio/dio.dart';
 import 'package:pointycastle/export.dart';
 
 import '../models/download_task.dart';
+import 'browser_headers.dart';
+import 'download_diagnosis.dart';
 import 'hls_parser.dart';
+import 'page_cookie_probe.dart';
 import 'user_agent.dart';
 import 'app_paths.dart';
 
@@ -25,6 +28,7 @@ class HlsDownloader {
     this.resolveTempDir,
     this.resolveCookie,
     this.invalidateCookie,
+    this.captureCookie,
   })  : dio = dio ??
             Dio(BaseOptions(
               connectTimeout: const Duration(seconds: 20),
@@ -50,6 +54,21 @@ class HlsDownloader {
   /// 403 时这一个 bit 就能把范围砍一半：带上 Cookie 还被拒，多半是 UA /
   /// Referer / 签名或站点侧风控；没带上，就是登录态根本没读到。
   bool _lastCookiePresent = false;
+
+  /// 最近一次读到（并带上）的 Cookie 条数。只用于诊断展示，不含名字与值。
+  int _lastCookieCount = 0;
+
+  /// 这次带的 Cookie 里有没有 Cloudflare 通行证。
+  ///
+  /// 只存布尔：判断「缺凭证」还是「有凭证仍被拒」，是两条完全不同的修法。
+  bool? _lastClearanceSent;
+
+  /// 最近一次响应的 `server` 与 `cf-mitigated`。
+  ///
+  /// 单看 403 分不出「来源页校验」和「人机验证」，这两个响应头是最直接的线索：
+  /// Cloudflare 挑战会带 `cf-mitigated: challenge`，普通防盗链不会。
+  String _lastServer = '';
+  bool _lastCfMitigated = false;
 
   /// 最近一次出站请求的地址。
   ///
@@ -83,6 +102,25 @@ class HlsDownloader {
   /// 三次重试用的是同一份过期 Cookie，等于白试。403 时先失效缓存再重试，
   /// 才有可能拿到浏览器刚刷新的那一张。
   final void Function(String url)? invalidateCookie;
+
+  /// 走 WebView 上下文代取一次 Cookie（含 HttpOnly 的 `cf_clearance`）。
+  ///
+  /// 只在「403 + 命中人机验证 + 这次没带上通行证」时调用：`CookieManager` 看不到
+  /// HttpOnly，唯一的办法是让 WebView 自己发一次请求，读它的真实出站头。
+  /// 由调用方注入，主机端验证脚本可传 null。
+  final Future<String?> Function(String url)? captureCookie;
+
+  /// 代取到的 Cookie，按 host 存，仅本次下载器实例内存活（不落盘、不进任务 JSON）。
+  final Map<String, String> _clearanceOverrides = <String, String>{};
+
+  /// 上一个 403 是否值得去代取一次（由 `_onRequestRejected` 标记）。
+  String? _captureTarget;
+
+  /// 已经代取过的 host：代取完仍失败时，文案要说「已试过」，不能再劝用户重复同一步。
+  final Set<String> _captureTriedHosts = <String>{};
+
+  /// 代取真的拿到 Cookie 的 host。「没拿到」和「拿到仍被拒」要分开说。
+  final Set<String> _captureGotCookieHosts = <String>{};
 
   /// 按任务保存所有在途请求的 CancelToken，暂停/删除时立刻全部中断。
   final Map<String, Set<CancelToken>> _tokens = <String, Set<CancelToken>>{};
@@ -332,26 +370,43 @@ class HlsDownloader {
     try {
       // 直链同样需要登录态：很多站点把整段视频也放在鉴权后面
       _lastRequestUrl = task.url;
-      final directHeaders =
-          await _headersFor(task.url, task.referer, task.requestHeaders);
-      if (offset > 0) directHeaders['Range'] = 'bytes=$offset-';
-      // 源文件在暂停期间被替换时，服务端会忽略 Range 返回 200；
-      // 现有逻辑随即从头重写，避免把新旧两个版本拼在一起。
-      if (offset > 0 && validator != null && validator.isNotEmpty) {
-        directHeaders['If-Range'] = validator;
-      }
-      final response = await _guarded(
-        const Duration(minutes: 10),
-        (token) => dio.get<ResponseBody>(
-          task.url,
-          cancelToken: token,
-          options: Options(
-            responseType: ResponseType.stream,
-            headers: directHeaders,
+      final host = Uri.tryParse(task.url)?.host.toLowerCase() ?? '';
+
+      Future<Response<ResponseBody>> start() async {
+        // 每次重试都重算头：代取到通行证后要立刻生效
+        final directHeaders =
+            await _headersFor(task.url, task.referer, task.requestHeaders);
+        if (offset > 0) directHeaders['Range'] = 'bytes=$offset-';
+        // 源文件在暂停期间被替换时，服务端会忽略 Range 返回 200；
+        // 现有逻辑随即从头重写，避免把新旧两个版本拼在一起。
+        if (offset > 0 && validator != null && validator.isNotEmpty) {
+          directHeaders['If-Range'] = validator;
+        }
+        return _guarded(
+          const Duration(minutes: 10),
+          (token) => dio.get<ResponseBody>(
+            task.url,
+            cancelToken: token,
+            options: Options(
+              responseType: ResponseType.stream,
+              headers: directHeaders,
+            ),
           ),
-        ),
-        taskId: task.id,
-      );
+          taskId: task.id,
+        );
+      }
+
+      Response<ResponseBody> response;
+      try {
+        response = await start();
+      } catch (e) {
+        // 直链以前完全没有重试：被挑战时只能直接失败。
+        // 这里先按 403 诊断走一遍代取，真补到凭证才重试，否则原样抛出。
+        if (e is DioException) _onRequestRejected(e, task.url);
+        await _captureBeforeRetry();
+        if (host.isEmpty || !_clearanceOverrides.containsKey(host)) rethrow;
+        response = await start();
+      }
 
       // 服务端不支持 Range 或校验值不匹配时会返回 200，此时从头重写，
       // 保证不会把暂停前后两个不同版本的源文件拼在一起。
@@ -719,21 +774,45 @@ class HlsDownloader {
     // WebView 建好后会换成真实 UA，下载器必须跟着变
     headers['User-Agent'] = UserAgent.current;
     if (referer != null && referer.isNotEmpty) headers['Referer'] = referer;
+    // 浏览器等效头（Accept / Accept-Language / Sec-Fetch-*）。
+    // 少了这几项，挂在 Cloudflare 后面的站点很容易把请求判成自动化；
+    // 页面带来的白名单头在下面合并，仍然优先。
+    headers.addAll(browserMediaHeaders(url, referer: referer));
     if (extra != null && extra.isNotEmpty) {
       // 已过白名单，这里直接展开；若与上面的 Referer 同名，白名单已排除该情况
       headers.addAll(extra);
     }
     _lastCookiePresent = false;
+    _lastCookieCount = 0;
+    _lastClearanceSent = null;
     try {
-      final cookie = await resolveCookie?.call(url);
+      final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
+      // 代取值优先：那是 WebView 真实发出的那一份，含 HttpOnly 凭证
+      final override = _clearanceOverrides[host];
+      final cookie = override ?? await resolveCookie?.call(url);
       if (cookie != null && cookie.trim().isNotEmpty) {
         headers['Cookie'] = cookie.trim();
         _lastCookiePresent = true;
+        _lastCookieCount = _countCookies(cookie);
+        _lastClearanceSent = hasClearanceCookie(cookie);
       }
     } catch (_) {
       // 平台通道不可用（如主机验证脚本未注入）时按匿名请求处理
     }
     return headers;
+  }
+
+  /// 数 Cookie 条数。
+  ///
+  /// 只统计，不记录名字与值：这个模块必须保持纯 Dart（`app_log` 依赖 Flutter，
+  /// 引进来会让 `verify_download` / `verify_v042` 编译不过）。条数已经够诊断——
+  /// 真正要区分的是「有没有带上」，名字留给需要深挖时由调用方自己看。
+  int _countCookies(String raw) {
+    return raw
+        .split(';')
+        .map((e) => e.trim())
+        .where((e) => e.contains('='))
+        .length;
   }
 
   /// 返回正文与**重定向后的最终 URI**，供相对分片解析使用。
@@ -744,20 +823,24 @@ class HlsDownloader {
     bool Function() canceled,
   ) async {
     _lastRequestUrl = url;
-    final headers = await _headersFor(url, referer, task.requestHeaders);
     final res = await _withRetry<Response<String>>(
-      () => _guarded<Response<String>>(
-        requestTimeout,
-        (token) => dio.get<String>(
-          url,
-          cancelToken: token,
-          options: Options(
-            responseType: ResponseType.plain,
-            headers: headers,
+      () async {
+        // 每轮重试都重新算头：代取到通行证后，重试必须带上新的 Cookie，
+        // 否则三次重试发的还是第一次那份头，代取等于白做
+        final headers = await _headersFor(url, referer, task.requestHeaders);
+        return _guarded<Response<String>>(
+          requestTimeout,
+          (token) => dio.get<String>(
+            url,
+            cancelToken: token,
+            options: Options(
+              responseType: ResponseType.plain,
+              headers: headers,
+            ),
           ),
-        ),
-        taskId: task.id,
-      ),
+          taskId: task.id,
+        );
+      },
       shouldStop: canceled,
       onFail: (e) => _onRequestRejected(e, url),
     );
@@ -783,23 +866,26 @@ class HlsDownloader {
     ({int offset, int length})? range,
   }) async {
     _lastRequestUrl = url;
-    final headers = await _headersFor(url, referer, task.requestHeaders);
-    if (range != null) {
-      headers['Range'] = 'bytes=${range.offset}-${range.offset + range.length - 1}';
-    }
     final res = await _withRetry(
-      () => _guarded(
-        requestTimeout,
-        (token) => dio.get<List<int>>(
-          url,
-          cancelToken: token,
-          options: Options(
-            responseType: ResponseType.bytes,
-            headers: headers,
+      () async {
+        final headers = await _headersFor(url, referer, task.requestHeaders);
+        if (range != null) {
+          headers['Range'] =
+              'bytes=${range.offset}-${range.offset + range.length - 1}';
+        }
+        return _guarded(
+          requestTimeout,
+          (token) => dio.get<List<int>>(
+            url,
+            cancelToken: token,
+            options: Options(
+              responseType: ResponseType.bytes,
+              headers: headers,
+            ),
           ),
-        ),
-        taskId: task.id,
-      ),
+          taskId: task.id,
+        );
+      },
       shouldStop: canceled,
       onFail: (e) => _onRequestRejected(e, url),
     );
@@ -867,6 +953,25 @@ class HlsDownloader {
     });
   }
 
+  /// 真正去代取一次，并把结果挂到 host 上；失败就保持原样，让重试按旧身份跑。
+  Future<void> _captureBeforeRetry() async {
+    final target = _captureTarget;
+    _captureTarget = null;
+    final capture = captureCookie;
+    if (target == null || capture == null) return;
+    final host = Uri.tryParse(target)?.host.toLowerCase() ?? '';
+    if (host.isEmpty || _clearanceOverrides.containsKey(host)) return;
+    try {
+      _captureTriedHosts.add(host);
+      final cookie = await capture(target);
+      if (cookie == null || cookie.trim().isEmpty) return;
+      _clearanceOverrides[host] = cookie.trim();
+      _captureGotCookieHosts.add(host);
+    } catch (_) {
+      // 代取失败不是致命错误：按原身份重试，失败照常报给用户
+    }
+  }
+
   Future<T> _withRetry<T>(
     Future<T> Function() fn, {
     int attempts = 3,
@@ -884,6 +989,8 @@ class HlsDownloader {
         }
         last = e;
         onFail?.call(e);
+        // 先补凭证再重试：顺序反了就白跑一次
+        await _captureBeforeRetry();
         await Future<void>.delayed(Duration(milliseconds: 400 * (i + 1)));
       }
     }
@@ -896,8 +1003,21 @@ class HlsDownloader {
   /// 不失效的话，三次重试实际都在用同一份旧凭证，全部失败。
   void _onRequestRejected(Object error, String url) {
     if (error is! DioException) return;
+    // 先把能说明「为什么被拒」的响应特征留下来，错误文案要用
+    final headers = error.response?.headers;
+    _lastServer = headers?.value('server') ?? '';
+    _lastCfMitigated = headers?.value('cf-mitigated') != null;
     if (error.response?.statusCode != 403) return;
     invalidateCookie?.call(url);
+    // 带了一堆 Cookie 却没带通行证：值得去 WebView 那边代取一次
+    final missingClearance = _lastCookiePresent && (_lastClearanceSent == false);
+    final noCookieAtAll = !_lastCookiePresent;
+    if ((missingClearance || noCookieAtAll) && captureCookie != null) {
+      final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
+      if (host.isNotEmpty && !_clearanceOverrides.containsKey(host)) {
+        _captureTarget = url;
+      }
+    }
   }
 
   Future<Directory> _outputDir() async {
@@ -963,6 +1083,10 @@ class HlsDownloader {
   /// 这类 403 与「没登录」「防盗链」不是一回事：页面是挑战页，重试和改 Cookie
   /// 都未必有用，提示必须说清楚，否则用户会一直在网页里反复播放。
   bool _isBotChallenge(DioException e) {
+    // 先用 _onRequestRejected 留下的响应特征：正文可能被截断或换成二进制，
+    // 头里的 `cf-mitigated` 是更早、更可靠的证据
+    if (_lastCfMitigated) return true;
+    if (_lastServer.toLowerCase().contains('cloudflare')) return true;
     final response = e.response;
     final headers = response?.headers;
     if (headers != null) {
@@ -982,7 +1106,8 @@ class HlsDownloader {
     return raw.contains('__cf_chl') || raw.contains('cf-chl-');
   }
 
-  String _friendlyError(Object e) {    if (e is DioException) {
+  String _friendlyError(Object e) {
+    if (e is DioException) {
       switch (e.type) {
         case DioExceptionType.connectionTimeout:
         case DioExceptionType.receiveTimeout:
@@ -997,20 +1122,38 @@ class HlsDownloader {
           final detail = _responseSnippet(e.response?.data);
           final tail = detail == null ? '' : ' · 服务端原文：$detail';
           if (code == 401 || code == 403) {
-            final cookie = _lastCookiePresent ? 'Cookie 已带' : 'Cookie 未取到';
-            if (_isBotChallenge(e)) {
-              // master 播放列表常是站点的入口页，被挑战的概率比实际 media
-              // 播放列表高；面板里往往同时有 video.m3u8 这类地址，换一条更省事
+            final challenged = _isBotChallenge(e);
+            final host = Uri.tryParse(_lastRequestUrl)?.host ?? '';
+            final pageHost = PageCookieProbe.lastHost;
+            final crossHost = pageHost.isNotEmpty &&
+                host.isNotEmpty &&
+                pageHost != host.toLowerCase();
+            final diag = describeAuthFailure(
+              cookieSent: _lastCookiePresent,
+              cookieCount: _lastCookieCount,
+              // 跨域时 lengthFor 会返回 null（那是页面那个域的读数），
+              // 但文案要靠 crossHost 说清「是跨域」，不能含糊成「读数不可用」
+              pageCookieLength: PageCookieProbe.lengthFor(host),
+              challenged: challenged,
+              clearanceSent: _lastClearanceSent,
+              captureTried: _captureTriedHosts.contains(host.toLowerCase()),
+              captureGotCookie:
+                  _captureGotCookieHosts.contains(host.toLowerCase()),
+              crossHost: crossHost,
+            );
+            // 诊断只增不改：文案仍以用户能照做的事开头，细节放后半段
+            if (challenged) {
+              // master 播放列表常是站点的入口页，规则比实际 media 播放列表更严。
+              // 但换源只能绕过「入口页更严」这一层，Cookie 缺失这条仍在——
+              // 所以措辞不能写成「换那条就能过」。
               final isMaster = _lastRequestUrl.toLowerCase().contains('playlist');
               final alt = isMaster
-                  ? '若面板里还有 video.m3u8 之类的地址，换那条下载通常能过；'
+                  ? '换 video.m3u8 只能绕过入口页更严的规则，Cookie 这条仍然存在；'
                   : '';
-              return '被站点的 Cloudflare 人机验证拦下$at（$cookie）。'
-                  '这类验证由服务端判定，下载请求比浏览更容易被打成自动化访问。'
-                  '$alt可先在网页里把该视频播放十几秒再试，或直接在浏览器里保存';
+              return '被站点的 Cloudflare 人机验证拦下$at（${diag.cookieLabel}）。'
+                  '$alt${diag.hint}';
             }
-            return '服务器返回 $code$at（$cookie）：需要登录态或来源页校验失败。'
-                '可先在浏览器里打开该页面并播放一次，再回来重试$tail';
+            return '服务器返回 $code$at（${diag.cookieLabel}）：${diag.hint}$tail';
           }
           return '服务器返回 $code$at，可能需要 Referer 或链接已失效$tail';
         default:
