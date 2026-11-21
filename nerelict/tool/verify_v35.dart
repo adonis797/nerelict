@@ -1009,6 +1009,12 @@ void main() {
   check(hd34.contains('browserMediaHeaders(url'), '下载回源用到这份头');
   check(hd34.contains('describeAuthFailure('), '403 文案走统一诊断');
   check(hd34.contains('PageCookieProbe.lengthFor('), '诊断里带上页面可见 Cookie 读数');
+  // 「带了 9 项 Cookie」和「带了通行证」不是一回事：前者可能是 9 个无关的小饼干，
+  // 后者才是能过 Cloudflare 的那一张。这一位决定下一步是代取凭证还是查指纹。
+  check(hd34.contains('_lastClearanceSent') && hd34.contains('hasClearanceCookie'),
+      '记录这次带的 Cookie 里有没有通行证');
+  check(read('lib/services/download_diagnosis.dart').contains('kClearanceCookieNames'),
+      '通行证名字表集中在诊断模块');
   check(read('lib/services/streaming_proxy.dart')
           .contains('browserMediaHeaders(url'),
       '播放代理与下载器共用同一份头');

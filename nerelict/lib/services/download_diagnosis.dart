@@ -24,6 +24,28 @@ class AuthFailureReport {
   String toString() => '$cookieLabel：$hint';
 }
 
+/// Cloudflare 通行证类 Cookie 的名字：缺少它时，403 的成因与「有它但仍被拒」完全不同。
+const Set<String> kClearanceCookieNames = <String>{
+  'cf_clearance',
+  '__cf_bm',
+  'cf_chl_2',
+  'cf_chl_prog',
+  '__cflb',
+};
+
+/// 从 Cookie 串里挑出名字（只要名字，不要值），并判断有没有通行证。
+///
+/// 名字不是秘密，值才是；这里返回布尔，避免调用方不小心把值带进日志。
+bool hasClearanceCookie(String rawCookie) {
+  for (final part in rawCookie.split(';')) {
+    final eq = part.indexOf('=');
+    if (eq <= 0) continue;
+    final name = part.substring(0, eq).trim().toLowerCase();
+    if (kClearanceCookieNames.contains(name)) return true;
+  }
+  return false;
+}
+
 /// 关键凭证是不是 HttpOnly —— 也就是「该走浏览器代取」的那种情况。
 ///
 /// 判定条件：我们一条 Cookie 都没带上，但页面自己有可见 Cookie。
@@ -42,6 +64,9 @@ bool looksHttpOnlyOnly({
 /// - [cookieCount]：带上（或读到）的 Cookie 条数，只用于展示，不含名字与值；
 /// - [pageCookieLength]：`document.cookie.length`，`null` 表示读不到；
 /// - [challenged]：是否命中人机验证特征（`cf-mitigated` / 挑战页正文等）；
+/// - [clearanceSent]：带的 Cookie 里有没有 Cloudflare 的通行证（`cf_clearance`）。
+///   `null` 表示没带上 Cookie、无从判断。这一位是「去代取凭证」还是「去解决指纹」的分水岭：
+///   带了 9 项 Cookie 却没带 `cf_clearance` 和「带了仍然被拒」是两件完全不同的事。
 /// - [crossHost]：被拒的地址与当前页面是否不同域。分片常挂在独立 CDN 域名上，
 ///   此时「页面可见 Cookie」量的是页面那个域，对分片域没有参考价值，
 ///   必须单独成一种情况，否则会把「跨域」误判成「HttpOnly」。
@@ -50,16 +75,26 @@ AuthFailureReport describeAuthFailure({
   required int cookieCount,
   required int? pageCookieLength,
   required bool challenged,
+  bool? clearanceSent,
   bool crossHost = false,
 }) {
   if (cookieSent) {
-    final label = 'Cookie 已带（$cookieCount 项）';
-    return AuthFailureReport(
-      label,
-      challenged
-          ? '已带 Cookie 仍被判为自动化访问：属于请求特征差异（头部与指纹），不是登录态问题'
-          : '仍被拒，多半是来源页校验或链接签名已过期',
-    );
+    final label = clearanceSent == false
+        ? 'Cookie 已带（$cookieCount 项，但缺 cf_clearance）'
+        : 'Cookie 已带（$cookieCount 项）';
+    if (challenged) {
+      if (clearanceSent == false) {
+        return AuthFailureReport(
+          label,
+          '通行证是 HttpOnly，Cookie 通道读不到；需要由 WebView 上下文代取一次',
+        );
+      }
+      return AuthFailureReport(
+        label,
+        '通行证已带上仍被判为自动化：属于 TLS / HTTP2 指纹差异，换 Cookie 或加头都无效',
+      );
+    }
+    return AuthFailureReport(label, '仍被拒，多半是来源页校验或链接签名已过期');
   }
 
   if (crossHost) {

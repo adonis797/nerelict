@@ -57,6 +57,11 @@ class HlsDownloader {
   /// 最近一次读到（并带上）的 Cookie 条数。只用于诊断展示，不含名字与值。
   int _lastCookieCount = 0;
 
+  /// 这次带的 Cookie 里有没有 Cloudflare 通行证。
+  ///
+  /// 只存布尔：判断「缺凭证」还是「有凭证仍被拒」，是两条完全不同的修法。
+  bool? _lastClearanceSent;
+
   /// 最近一次响应的 `server` 与 `cf-mitigated`。
   ///
   /// 单看 403 分不出「来源页校验」和「人机验证」，这两个响应头是最直接的线索：
@@ -742,12 +747,14 @@ class HlsDownloader {
     }
     _lastCookiePresent = false;
     _lastCookieCount = 0;
+    _lastClearanceSent = null;
     try {
       final cookie = await resolveCookie?.call(url);
       if (cookie != null && cookie.trim().isNotEmpty) {
         headers['Cookie'] = cookie.trim();
         _lastCookiePresent = true;
         _lastCookieCount = _countCookies(cookie);
+        _lastClearanceSent = hasClearanceCookie(cookie);
       }
     } catch (_) {
       // 平台通道不可用（如主机验证脚本未注入）时按匿名请求处理
@@ -1051,6 +1058,7 @@ class HlsDownloader {
               // 但文案要靠 crossHost 说清「是跨域」，不能含糊成「读数不可用」
               pageCookieLength: PageCookieProbe.lengthFor(host),
               challenged: challenged,
+              clearanceSent: _lastClearanceSent,
               crossHost: crossHost,
             );
             // 诊断只增不改：文案仍以用户能照做的事开头，细节放后半段

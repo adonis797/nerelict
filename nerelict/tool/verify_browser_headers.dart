@@ -121,6 +121,35 @@ void main() {
   check(httpOnly.cookieLabel != noCookieNoPage.cookieLabel,
       '两种「没取到 Cookie」不会混成一句');
 
+  // 同上，但区分「这 9 项里有没有通行证」：这是两条完全不同的修法，
+  // 一条去代取凭证，一条去解决 TLS 指纹。
+  final noPass = describeAuthFailure(
+    cookieSent: true,
+    cookieCount: 9,
+    pageCookieLength: 120,
+    challenged: true,
+    clearanceSent: false,
+  );
+  check(noPass.cookieLabel.contains('缺 cf_clearance'),
+      '缺通行证时在标签里点明');
+  check(noPass.hint.contains('WebView'), '缺通行证指向「WebView 代取」');
+  final withPass = describeAuthFailure(
+    cookieSent: true,
+    cookieCount: 9,
+    pageCookieLength: 120,
+    challenged: true,
+    clearanceSent: true,
+  );
+  check(withPass.hint.contains('指纹'), '带了通行证仍被拒 → 指纹问题');
+  check(!withPass.hint.contains('WebView'),
+      '指纹问题不再引导去代取凭证（那条路走不通）');
+  check(noPass.hint != withPass.hint, '两种情况文案不同');
+
+  check(hasClearanceCookie('cf_clearance=abc; _ga=1'), '识别出 cf_clearance');
+  check(hasClearanceCookie('a=1; __cf_bm=2'), '识别出 __cf_bm');
+  check(!hasClearanceCookie('_ga=1; session=2'), '普通 Cookie 不算通行证');
+  check(!hasClearanceCookie(''), '空串不算通行证');
+
   final unknown = describeAuthFailure(
     cookieSent: false,
     cookieCount: 0,
