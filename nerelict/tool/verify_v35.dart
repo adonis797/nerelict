@@ -985,6 +985,30 @@ void main() {
   final tabIdx = main37.indexOf('state.setTab(0)');
   check(backIdx > 0 && tabIdx > 0 && backIdx < tabIdx,
       '返回键先问页面状态，再退回浏览器标签');
+
+  // 通行证是 HttpOnly，只能让 WebView 自己发一次请求，读它的真实出站头。
+  stdout.writeln('=== 38. WebView 代取通行证 ===');
+  check(activity37.contains('WEBPROBE_CHANNEL = "com.nerelict/webprobe"'),
+      '原生注册代取通道');
+  check(activity37.contains('shouldInterceptRequest') &&
+          activity37.contains('requestHeaders'),
+      '从真实出站请求头里取 Cookie');
+  check(activity37.contains('wv.destroy()'), '抓到或超时都销毁 WebView');
+  check(activity37.contains('12_000'), '代取有 12 秒超时，不死等');
+  final probe38 = read('lib/services/web_probe.dart');
+  check(probe38.contains("'com.nerelict/webprobe'"), '两端通道名一致');
+  check(probe38.contains('captureCookie'), '只对外暴露 Cookie 串');
+  final hd38 = read('lib/services/hls_downloader.dart');
+  check(hd38.contains('captureCookie') && hd38.contains('_clearanceOverrides'),
+      '下载器接受代取结果并按 host 复用');
+  final capIdx = hd38.indexOf('await _captureBeforeRetry();');
+  final delayIdx = hd38.indexOf('await Future<void>.delayed(Duration(milliseconds: 400');
+  check(capIdx > 0 && delayIdx > 0 && capIdx < delayIdx,
+      '先补凭证再退避重试（顺序反了就白跑一次）');
+  check(hd38.contains('missingClearance') || hd38.contains('_lastClearanceSent == false'),
+      '只在「缺通行证」时触发代取，不无脑抓');
+  check(read('lib/state/app_state.dart').contains('WebProbe.captureCookie'),
+      '状态层把代取接到下载器');
   check(files37.contains('if (!file.isDir) parts.add(file.sizeText)'),
       '目录行不显示大小');
   // 拦截器全局注册，必须各自判断「我是不是当前页」，否则会互相抢返回

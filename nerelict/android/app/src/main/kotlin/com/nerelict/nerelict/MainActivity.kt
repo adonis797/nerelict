@@ -15,8 +15,14 @@ import android.os.Looper
 import android.provider.DocumentsContract
 import android.provider.Settings
 import android.provider.OpenableColumns
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
@@ -35,6 +41,7 @@ class MainActivity : FlutterActivity() {
         private const val COOKIE_CHANNEL = "com.nerelict/cookie"
         private const val EXTERNAL_CHANNEL = "com.nerelict/external"
         private const val MEDIA_CHANNEL = "com.nerelict/media"
+        private const val WEBPROBE_CHANNEL = "com.nerelict/webprobe"
         private const val REQ_PICK_DIR = 1001
         private const val REQ_PICK_APK = 1002
     }
@@ -54,6 +61,7 @@ class MainActivity : FlutterActivity() {
         configureCookieChannel(flutterEngine)
         configureExternalChannel(flutterEngine)
         configureMediaChannel(flutterEngine)
+        configureWebProbeChannel(flutterEngine)
     }
 
     /**
@@ -121,6 +129,90 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    /**
+     * 用 WebView 上下文代取请求头。
+     *
+     * 为什么需要：Cloudflare 的 `cf_clearance` 带 HttpOnly，`CookieManager.getCookie()`
+     * 走的是 JS 可见的那份存储，读不到；而 `shouldInterceptRequest` 拿到的是**真实出站头**，
+     * 包含 HttpOnly。这里只抓「某个地址这一次请求的头」，抓完立即销毁 WebView，
+     * 不加载页面、不执行页面脚本、不保存任何 Cookie 值。
+     */
+    private fun configureWebProbeChannel(flutterEngine: FlutterEngine) {
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, WEBPROBE_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "captureHeaders" -> {
+                        val url = call.argument<String>("url")
+                        val ua = call.argument<String>("userAgent")
+                        if (url.isNullOrEmpty()) {
+                            result.success(null)
+                            return@setMethodCallHandler
+                        }
+                        runOnUiThread { captureHeadersViaWebView(url, ua, result) }
+                    }
+
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    private fun captureHeadersViaWebView(
+        url: String,
+        ua: String?,
+        result: MethodChannel.Result,
+    ) {
+        var finished = false
+        var webView: WebView? = null
+
+        fun finish(payload: Map<String, String>?) {
+            if (finished) return
+            finished = true
+            try {
+                webView?.let { wv ->
+                    wv.stopLoading()
+                    (wv.parent as? ViewGroup)?.removeView(wv)
+                    wv.destroy()
+                }
+            } catch (_: Exception) {
+            }
+            webView = null
+            result.success(payload)
+        }
+
+        try {
+            val host = Uri.parse(url).host ?: ""
+            val wv = WebView(this)
+            webView = wv
+            wv.settings.javaScriptEnabled = true
+            // 不要图片：我们要的是请求头，不是页面内容
+            wv.settings.blockNetworkImage = true
+            wv.settings.cacheMode = WebSettings.LOAD_DEFAULT
+            if (!ua.isNullOrEmpty()) wv.settings.userAgentString = ua
+            wv.webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                ): WebResourceResponse? {
+                    val req = request ?: return null
+                    val target = req.url ?: return null
+                    // 只认目标主机：跳转到登录页之类的不参与
+                    if (host.isNotEmpty() && target.host != host) return null
+                    val headers = req.requestHeaders ?: emptyMap()
+                    finish(HashMap(headers))
+                    // 自己不取正文，交给 WebView 决定；反正很快就 destroy
+                    return null
+                }
+            }
+            // 必须挂到窗口里才会真正发请求：1x1、不可见、不占布局
+            val root = findViewById<ViewGroup>(android.R.id.content)
+            root.addView(wv, ViewGroup.LayoutParams(1, 1))
+            wv.loadUrl(url)
+            Handler(Looper.getMainLooper()).postDelayed({ finish(null) }, 12_000)
+        } catch (_: Exception) {
+            finish(null)
+        }
     }
 
     /**

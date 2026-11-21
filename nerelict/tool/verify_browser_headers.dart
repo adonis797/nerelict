@@ -133,6 +133,29 @@ void main() {
   check(noPass.cookieLabel.contains('缺 cf_clearance'),
       '缺通行证时在标签里点明');
   check(noPass.hint.contains('WebView'), '缺通行证指向「WebView 代取」');
+  final triedPass = describeAuthFailure(
+    cookieSent: true,
+    cookieCount: 9,
+    pageCookieLength: 120,
+    challenged: true,
+    clearanceSent: false,
+    captureTried: true,
+    captureGotCookie: true,
+  );
+  check(triedPass.hint.contains('已代取到通行证仍被拒'),
+      '代取过还说「去代取」= 让用户重复同一步');
+  check(triedPass.hint != noPass.hint, '代取前 / 代取后文案不同');
+  final triedEmpty = describeAuthFailure(
+    cookieSent: true,
+    cookieCount: 9,
+    pageCookieLength: 120,
+    challenged: true,
+    clearanceSent: false,
+    captureTried: true,
+    captureGotCookie: false,
+  );
+  check(triedEmpty.hint.contains('没拿到'), '代取没拿到 → 指向「先过验证」');
+  check(triedEmpty.hint != triedPass.hint, '没拿到 ≠ 拿到仍被拒');
   final withPass = describeAuthFailure(
     cookieSent: true,
     cookieCount: 9,

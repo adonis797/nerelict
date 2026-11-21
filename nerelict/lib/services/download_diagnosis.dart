@@ -67,6 +67,10 @@ bool looksHttpOnlyOnly({
 /// - [clearanceSent]：带的 Cookie 里有没有 Cloudflare 的通行证（`cf_clearance`）。
 ///   `null` 表示没带上 Cookie、无从判断。这一位是「去代取凭证」还是「去解决指纹」的分水岭：
 ///   带了 9 项 Cookie 却没带 `cf_clearance` 和「带了仍然被拒」是两件完全不同的事。
+/// - [captureTried]：是否已经用 WebView 代取过一次。代取过还说「去代取」，
+///   等于让用户重复同一步，所以这两种要分开说；
+/// - [captureGotCookie]：代取那次到底拿到 Cookie 没有。「没拿到」多半是页面还没过验证，
+///   「拿到了仍被拒」才是凭证与请求绑定不符——两者的下一步完全不同。
 /// - [crossHost]：被拒的地址与当前页面是否不同域。分片常挂在独立 CDN 域名上，
 ///   此时「页面可见 Cookie」量的是页面那个域，对分片域没有参考价值，
 ///   必须单独成一种情况，否则会把「跨域」误判成「HttpOnly」。
@@ -76,6 +80,8 @@ AuthFailureReport describeAuthFailure({
   required int? pageCookieLength,
   required bool challenged,
   bool? clearanceSent,
+  bool captureTried = false,
+  bool captureGotCookie = false,
   bool crossHost = false,
 }) {
   if (cookieSent) {
@@ -84,9 +90,21 @@ AuthFailureReport describeAuthFailure({
         : 'Cookie 已带（$cookieCount 项）';
     if (challenged) {
       if (clearanceSent == false) {
+        if (!captureTried) {
+          return AuthFailureReport(
+            label,
+            '通行证是 HttpOnly，Cookie 通道读不到；需要由 WebView 上下文代取一次',
+          );
+        }
+        if (!captureGotCookie) {
+          return AuthFailureReport(
+            label,
+            '代取没拿到 Cookie：先在页面里把该视频播放十几秒，确认人机验证已过再回来重试',
+          );
+        }
         return AuthFailureReport(
           label,
-          '通行证是 HttpOnly，Cookie 通道读不到；需要由 WebView 上下文代取一次',
+          '已代取到通行证仍被拒：凭证多半与本次请求的出口 IP / UA 绑定，或该地址禁止下载',
         );
       }
       return AuthFailureReport(

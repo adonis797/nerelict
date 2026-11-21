@@ -28,6 +28,7 @@ class HlsDownloader {
     this.resolveTempDir,
     this.resolveCookie,
     this.invalidateCookie,
+    this.captureCookie,
   })  : dio = dio ??
             Dio(BaseOptions(
               connectTimeout: const Duration(seconds: 20),
@@ -101,6 +102,25 @@ class HlsDownloader {
   /// 三次重试用的是同一份过期 Cookie，等于白试。403 时先失效缓存再重试，
   /// 才有可能拿到浏览器刚刷新的那一张。
   final void Function(String url)? invalidateCookie;
+
+  /// 走 WebView 上下文代取一次 Cookie（含 HttpOnly 的 `cf_clearance`）。
+  ///
+  /// 只在「403 + 命中人机验证 + 这次没带上通行证」时调用：`CookieManager` 看不到
+  /// HttpOnly，唯一的办法是让 WebView 自己发一次请求，读它的真实出站头。
+  /// 由调用方注入，主机端验证脚本可传 null。
+  final Future<String?> Function(String url)? captureCookie;
+
+  /// 代取到的 Cookie，按 host 存，仅本次下载器实例内存活（不落盘、不进任务 JSON）。
+  final Map<String, String> _clearanceOverrides = <String, String>{};
+
+  /// 上一个 403 是否值得去代取一次（由 `_onRequestRejected` 标记）。
+  String? _captureTarget;
+
+  /// 已经代取过的 host：代取完仍失败时，文案要说「已试过」，不能再劝用户重复同一步。
+  final Set<String> _captureTriedHosts = <String>{};
+
+  /// 代取真的拿到 Cookie 的 host。「没拿到」和「拿到仍被拒」要分开说。
+  final Set<String> _captureGotCookieHosts = <String>{};
 
   /// 按任务保存所有在途请求的 CancelToken，暂停/删除时立刻全部中断。
   final Map<String, Set<CancelToken>> _tokens = <String, Set<CancelToken>>{};
@@ -749,7 +769,10 @@ class HlsDownloader {
     _lastCookieCount = 0;
     _lastClearanceSent = null;
     try {
-      final cookie = await resolveCookie?.call(url);
+      final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
+      // 代取值优先：那是 WebView 真实发出的那一份，含 HttpOnly 凭证
+      final override = _clearanceOverrides[host];
+      final cookie = override ?? await resolveCookie?.call(url);
       if (cookie != null && cookie.trim().isNotEmpty) {
         headers['Cookie'] = cookie.trim();
         _lastCookiePresent = true;
@@ -906,6 +929,25 @@ class HlsDownloader {
     });
   }
 
+  /// 真正去代取一次，并把结果挂到 host 上；失败就保持原样，让重试按旧身份跑。
+  Future<void> _captureBeforeRetry() async {
+    final target = _captureTarget;
+    _captureTarget = null;
+    final capture = captureCookie;
+    if (target == null || capture == null) return;
+    final host = Uri.tryParse(target)?.host.toLowerCase() ?? '';
+    if (host.isEmpty || _clearanceOverrides.containsKey(host)) return;
+    try {
+      _captureTriedHosts.add(host);
+      final cookie = await capture(target);
+      if (cookie == null || cookie.trim().isEmpty) return;
+      _clearanceOverrides[host] = cookie.trim();
+      _captureGotCookieHosts.add(host);
+    } catch (_) {
+      // 代取失败不是致命错误：按原身份重试，失败照常报给用户
+    }
+  }
+
   Future<T> _withRetry<T>(
     Future<T> Function() fn, {
     int attempts = 3,
@@ -923,6 +965,8 @@ class HlsDownloader {
         }
         last = e;
         onFail?.call(e);
+        // 先补凭证再重试：顺序反了就白跑一次
+        await _captureBeforeRetry();
         await Future<void>.delayed(Duration(milliseconds: 400 * (i + 1)));
       }
     }
@@ -941,6 +985,15 @@ class HlsDownloader {
     _lastCfMitigated = headers?.value('cf-mitigated') != null;
     if (error.response?.statusCode != 403) return;
     invalidateCookie?.call(url);
+    // 带了一堆 Cookie 却没带通行证：值得去 WebView 那边代取一次
+    final missingClearance = _lastCookiePresent && (_lastClearanceSent == false);
+    final noCookieAtAll = !_lastCookiePresent;
+    if ((missingClearance || noCookieAtAll) && captureCookie != null) {
+      final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
+      if (host.isNotEmpty && !_clearanceOverrides.containsKey(host)) {
+        _captureTarget = url;
+      }
+    }
   }
 
   Future<Directory> _outputDir() async {
@@ -1059,6 +1112,9 @@ class HlsDownloader {
               pageCookieLength: PageCookieProbe.lengthFor(host),
               challenged: challenged,
               clearanceSent: _lastClearanceSent,
+              captureTried: _captureTriedHosts.contains(host.toLowerCase()),
+              captureGotCookie:
+                  _captureGotCookieHosts.contains(host.toLowerCase()),
               crossHost: crossHost,
             );
             // 诊断只增不改：文案仍以用户能照做的事开头，细节放后半段

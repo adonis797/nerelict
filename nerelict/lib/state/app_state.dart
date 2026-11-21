@@ -18,6 +18,8 @@ import '../services/favorites.dart';
 import '../services/file_manager.dart';
 import '../services/hls_downloader.dart';
 import '../services/file_trash.dart';
+import '../services/user_agent.dart';
+import '../services/web_probe.dart';
 import '../services/hls_parser.dart' show HlsMasterPlaylist;
 import '../services/header_policy.dart';
 import '../services/cookie_store.dart';
@@ -47,6 +49,10 @@ class AppState extends ChangeNotifier {
       // 403 时让缓存失效，下一次重试才会回源重读（人机验证 Cookie 会轮换）
       invalidateCookie: (url) =>
           CookieStore.instance.invalidate(Uri.tryParse(url)?.host),
+      // 通行证是 HttpOnly，CookieManager 读不到：让 WebView 自己发一次请求，
+      // 从真实出站头里把它取回来（仅本次任务内存里用，不落盘）
+      captureCookie: (url) =>
+          WebProbe.captureCookie(url, userAgent: UserAgent.current),
     );
     // 切后台 / 被系统回收前再落盘一次，尽量不丢最后几秒的进度
     _lifecycle = AppLifecycleListener(
