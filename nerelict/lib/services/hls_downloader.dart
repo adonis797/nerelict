@@ -11,6 +11,7 @@ import 'browser_headers.dart';
 import 'download_diagnosis.dart';
 import 'hls_parser.dart';
 import 'page_cookie_probe.dart';
+import 'web_probe_result.dart';
 import 'user_agent.dart';
 import 'app_paths.dart';
 
@@ -28,7 +29,8 @@ class HlsDownloader {
     this.resolveTempDir,
     this.resolveCookie,
     this.invalidateCookie,
-    this.captureCookie,
+    this.captureProbe,
+    this.nativeFetch,
   })  : dio = dio ??
             Dio(BaseOptions(
               connectTimeout: const Duration(seconds: 20),
@@ -37,9 +39,11 @@ class HlsDownloader {
               followRedirects: true,
               maxRedirects: 8,
               responseType: ResponseType.bytes,
+              // 这里只放兜底 UA。**不要**再塞 `Accept`：它会被合并进每一个请求，
+              // 让「精简模式」（对齐播放器的那套头）名不副实——播放代理从不发 Accept，
+              // 下载却发了，站点的 WAF 一眼就能分出这两个客户端。
               headers: {
                 'User-Agent': UserAgent.kFallback,
-                'Accept': '*/*',
               },
             ));
 
@@ -63,12 +67,17 @@ class HlsDownloader {
   /// 只存布尔：判断「缺凭证」还是「有凭证仍被拒」，是两条完全不同的修法。
   bool? _lastClearanceSent;
 
-  /// 最近一次响应的 `server` 与 `cf-mitigated`。
+  /// 最近一次响应是否带 `cf-mitigated`。
   ///
-  /// 单看 403 分不出「来源页校验」和「人机验证」，这两个响应头是最直接的线索：
-  /// Cloudflare 挑战会带 `cf-mitigated: challenge`，普通防盗链不会。
-  String _lastServer = '';
+  /// 只认这个头：`server: cloudflare` 太宽——任何挂在 Cloudflare 后面的站点
+  /// 普通防盗链 403 都会带它，据此判定「人机验证」会误导排查方向。
   bool _lastCfMitigated = false;
+
+  /// 最近一次请求**实际**带的头名字（不含值）。
+  ///
+  /// 「已经用最小头了为什么还被拒」这种问题，唯一可信的证据是实际发出去的东西。
+  /// 这台 ROM 会过滤第三方日志，所以把它带进错误提示，而不是只在日志里。
+  String _lastHeaderNames = '';
 
   /// 最近一次出站请求的地址。
   ///
@@ -108,7 +117,34 @@ class HlsDownloader {
   /// 只在「403 + 命中人机验证 + 这次没带上通行证」时调用：`CookieManager` 看不到
   /// HttpOnly，唯一的办法是让 WebView 自己发一次请求，读它的真实出站头。
   /// 由调用方注入，主机端验证脚本可传 null。
-  final Future<String?> Function(String url)? captureCookie;
+  final Future<WebProbeResult?> Function(String url)? captureProbe;
+
+  /// 该 host 改用「与播放器相同的最小请求头」重试。
+  ///
+  /// 实测依据：浮层播放器只发 `User-Agent` + `Referer` 就能 200 播，
+  /// 而下载带 Cookie / `Sec-Fetch-*` / `Accept-Language` 却 403。
+  /// 签名直链的 WAF 常把「带 Cookie 的下载」当成非播放器行为拒掉，
+  /// 所以 403 先降级到播放器那套头试一次，比去猜凭证便宜得多。
+  final Set<String> _minimalHosts = <String>{};
+
+  /// 已经降级过头的 host：提示里要说明「这招试过了」。
+  final Set<String> _minimalTriedHosts = <String>{};
+
+  /// 用 Android 自带 HTTP 栈取字节（与 ExoPlayer 同一条链路）。
+  ///
+  /// 有些站点按 TLS / HTTP 栈识别客户端：同样的头，ExoPlayer 能过、`dart:io` 被拒。
+  /// 注入方式是回调，保持本模块纯 Dart；主机端验证脚本传 null 即可。
+  final Future<({int status, Uint8List bytes, String url})?> Function(
+    String url,
+    Map<String, String> headers,
+    String? range,
+  )? nativeFetch;
+
+  /// 代取失败的说明（按 host 存）：直接进错误提示。
+  ///
+  /// 这台 ROM 会过滤第三方应用的 `Log.d`，靠日志问用户「卡在哪」不现实，
+  /// 所以把诊断写进用户能看到的那句话里。
+  final Map<String, String> _captureNotes = <String, String>{};
 
   /// 代取到的 Cookie，按 host 存，仅本次下载器实例内存活（不落盘、不进任务 JSON）。
   final Map<String, String> _clearanceOverrides = <String, String>{};
@@ -770,6 +806,22 @@ class HlsDownloader {
     Map<String, String>? extra,
   ]) async {
     final headers = <String, dynamic>{};
+    final reqHost = Uri.tryParse(url)?.host.toLowerCase() ?? '';
+    // 精简模式：对齐播放器（只有 UA + Referer），不写 Cookie、不写浏览器特征头。
+    // 一旦代取到通行证就退出精简模式——那时凭证才是缺的那一环。
+    final minimal = _minimalHosts.contains(reqHost) &&
+        !_clearanceOverrides.containsKey(reqHost);
+    if (minimal) {
+      headers['User-Agent'] = UserAgent.current;
+      if (referer != null && referer.isNotEmpty) headers['Referer'] = referer;
+      if (extra != null && extra.isNotEmpty) headers.addAll(extra);
+      _lastCookiePresent = false;
+      _lastCookieCount = 0;
+      _lastClearanceSent = null;
+      _minimalTriedHosts.add(reqHost);
+      _lastHeaderNames = _headerNamesOf(headers);
+      return headers;
+    }
     // 每次都显式带上当前 UA：BaseOptions 里的是构造时的兜底值，
     // WebView 建好后会换成真实 UA，下载器必须跟着变
     headers['User-Agent'] = UserAgent.current;
@@ -799,7 +851,14 @@ class HlsDownloader {
     } catch (_) {
       // 平台通道不可用（如主机验证脚本未注入）时按匿名请求处理
     }
+    _lastHeaderNames = _headerNamesOf(headers);
     return headers;
+  }
+
+  /// 头名字列表（小写、排序、不含值）：给错误提示用，不泄露内容。
+  String _headerNamesOf(Map<String, dynamic> headers) {
+    final names = headers.keys.map((e) => e.toLowerCase()).toList()..sort();
+    return names.join(', ');
   }
 
   /// 数 Cookie 条数。
@@ -823,6 +882,7 @@ class HlsDownloader {
     bool Function() canceled,
   ) async {
     _lastRequestUrl = url;
+    try {
     final res = await _withRetry<Response<String>>(
       () async {
         // 每轮重试都重新算头：代取到通行证后，重试必须带上新的 Cookie，
@@ -852,6 +912,84 @@ class HlsDownloader {
     // 这类相对引用；必须基于请求地址解析成绝对 URI，否则分片 URL 会缺 host。
     final uri = Uri.parse(url).resolveUri(res.realUri);
     return (body: body, uri: uri);
+    } catch (_) {
+      // Dio 走不通时，换**播放代理同款**的 dart:io `HttpClient` 再取一次。
+      //
+      // 依据：同一个地址、同样只剩 UA + Referer 的头，播放代理（`StreamingProxy`
+      // 用的就是 HttpClient）能取到，Dio 却一直 403。差异只可能在客户端本身
+      // （连接复用、头处理）。这里直接复用「已经跑通」的那套实现，不再调整头。
+      final alt = await _fetchTextFallback(url, referer);
+      if (alt != null) return alt;
+      rethrow;
+    }
+  }
+
+  /// 最小请求头：只有 UA 与 Referer，与播放器直连时发的一致。
+  Map<String, String> _minimalHeaders(String? referer) => <String, String>{
+        'User-Agent': UserAgent.current,
+        if (referer != null && referer.isNotEmpty) 'Referer': referer,
+      };
+
+  /// 兜底取文本：先走 Android 原生栈，再退回 dart:io。
+  Future<({String body, Uri uri})?> _fetchTextFallback(
+    String url,
+    String? referer,
+  ) async {
+    final headers = _minimalHeaders(referer);
+    final native = await _tryNative(url, headers, null);
+    if (native != null) {
+      if (native.status < 200 || native.status >= 300) return null;
+      final body = utf8.decode(native.bytes, allowMalformed: true);
+      if (!body.trimLeft().startsWith('#EXTM3U')) return null;
+      return (body: body, uri: Uri.parse(native.url));
+    }
+    return _fetchTextViaClient(url, referer);
+  }
+
+  Future<({int status, Uint8List bytes, String url})?> _tryNative(
+    String url,
+    Map<String, String> headers,
+    String? range,
+  ) async {
+    final fn = nativeFetch;
+    if (fn == null) return null;
+    try {
+      return await fn(url, headers, range);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 用与播放代理完全相同的客户端取文本。
+  ///
+  /// 刻意只设 `User-Agent` / `Referer`：跟代理的 `_applyHeaders` 保持一致，
+  /// 不加 Cookie、不加浏览器特征头、不加任何 Dio 的默认头。
+  Future<({String body, Uri uri})?> _fetchTextViaClient(
+    String url,
+    String? referer,
+  ) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 20);
+    try {
+      final req = await client.getUrl(Uri.parse(url));
+      req.headers.set('User-Agent', UserAgent.current);
+      if (referer != null && referer.isNotEmpty) {
+        req.headers.set('Referer', referer);
+      }
+      final res = await req.close().timeout(const Duration(seconds: 30));
+      if (res.statusCode < 200 || res.statusCode >= 300) return null;
+      final body = await res.transform(utf8.decoder).join();
+      if (!body.trimLeft().startsWith('#EXTM3U')) return null;
+      final base = Uri.parse(url);
+      final finalUri = res.redirects.isEmpty
+          ? base
+          : base.resolveUri(res.redirects.last.location);
+      return (body: body, uri: finalUri);
+    } catch (_) {
+      return null;
+    } finally {
+      client.close(force: true);
+    }
   }
 
   /// 读取任意二进制资源（分片 / init 段 / 密钥）。
@@ -866,6 +1004,7 @@ class HlsDownloader {
     ({int offset, int length})? range,
   }) async {
     _lastRequestUrl = url;
+    try {
     final res = await _withRetry(
       () async {
         final headers = await _headersFor(url, referer, task.requestHeaders);
@@ -902,6 +1041,67 @@ class HlsDownloader {
           '字节区间不符（期望 ${range.length}，收到 ${bytes.length}，状态 $status）');
     }
     return bytes;
+    } catch (_) {
+      // 分片同理：清单能过、分片却 403 时也走代理同款客户端
+      final alt = await _fetchBytesFallback(url, referer, range);
+      if (alt != null) return alt;
+      rethrow;
+    }
+  }
+
+  /// 兜底取字节：先走 Android 原生栈，再退回 dart:io。
+  Future<Uint8List?> _fetchBytesFallback(
+    String url,
+    String? referer,
+    ({int offset, int length})? range,
+  ) async {
+    final headers = _minimalHeaders(referer);
+    final rangeHeader = range == null
+        ? null
+        : 'bytes=${range.offset}-${range.offset + range.length - 1}';
+    final native = await _tryNative(url, headers, rangeHeader);
+    if (native != null) {
+      if (native.status < 200 || native.status >= 300) return null;
+      if (native.bytes.isEmpty) return null;
+      if (range != null && native.bytes.length != range.length) return null;
+      return native.bytes;
+    }
+    return _fetchBytesViaClient(url, referer, range);
+  }
+
+  /// 用播放代理同款客户端取字节（含 Range）。
+  Future<Uint8List?> _fetchBytesViaClient(
+    String url,
+    String? referer,
+    ({int offset, int length})? range,
+  ) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 20);
+    try {
+      final req = await client.getUrl(Uri.parse(url));
+      req.headers.set('User-Agent', UserAgent.current);
+      if (referer != null && referer.isNotEmpty) {
+        req.headers.set('Referer', referer);
+      }
+      if (range != null) {
+        req.headers.set(HttpHeaders.rangeHeader,
+            'bytes=${range.offset}-${range.offset + range.length - 1}');
+      }
+      final res = await req.close().timeout(const Duration(seconds: 40));
+      if (res.statusCode < 200 || res.statusCode >= 300) return null;
+      final builder = BytesBuilder(copy: false);
+      await for (final chunk in res) {
+        builder.add(chunk);
+      }
+      final bytes = builder.takeBytes();
+      if (bytes.isEmpty) return null;
+      if (range != null && bytes.length != range.length) return null;
+      return bytes;
+    } catch (_) {
+      return null;
+    } finally {
+      client.close(force: true);
+    }
   }
 
   /// 解析主播放列表，供下载前选清晰度 / 查看音轨。
@@ -957,14 +1157,22 @@ class HlsDownloader {
   Future<void> _captureBeforeRetry() async {
     final target = _captureTarget;
     _captureTarget = null;
-    final capture = captureCookie;
+    final capture = captureProbe;
     if (target == null || capture == null) return;
     final host = Uri.tryParse(target)?.host.toLowerCase() ?? '';
     if (host.isEmpty || _clearanceOverrides.containsKey(host)) return;
     try {
       _captureTriedHosts.add(host);
-      final cookie = await capture(target);
-      if (cookie == null || cookie.trim().isEmpty) return;
+      final probe = await capture(target);
+      if (probe == null) {
+        _captureNotes[host] = '代取通道不可用';
+        return;
+      }
+      final cookie = probe.cookie;
+      if (cookie == null || cookie.trim().isEmpty) {
+        _captureNotes[host] = probe.note;
+        return;
+      }
       _clearanceOverrides[host] = cookie.trim();
       _captureGotCookieHosts.add(host);
     } catch (_) {
@@ -1004,19 +1212,21 @@ class HlsDownloader {
   void _onRequestRejected(Object error, String url) {
     if (error is! DioException) return;
     // 先把能说明「为什么被拒」的响应特征留下来，错误文案要用
-    final headers = error.response?.headers;
-    _lastServer = headers?.value('server') ?? '';
-    _lastCfMitigated = headers?.value('cf-mitigated') != null;
+    _lastCfMitigated = error.response?.headers.value('cf-mitigated') != null;
     if (error.response?.statusCode != 403) return;
     invalidateCookie?.call(url);
-    // 带了一堆 Cookie 却没带通行证：值得去 WebView 那边代取一次
+    final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
+    if (host.isEmpty) return;
+    // 第一步先降级到播放器那套最小请求头：这一步最便宜，也最可能直接解决
+    if (!_minimalHosts.contains(host)) {
+      _minimalHosts.add(host);
+      return;
+    }
+    // 已经是精简头还被拒：这才轮到「缺凭证」的假设，去 WebView 代取一次
     final missingClearance = _lastCookiePresent && (_lastClearanceSent == false);
     final noCookieAtAll = !_lastCookiePresent;
-    if ((missingClearance || noCookieAtAll) && captureCookie != null) {
-      final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
-      if (host.isNotEmpty && !_clearanceOverrides.containsKey(host)) {
-        _captureTarget = url;
-      }
+    if ((missingClearance || noCookieAtAll) && captureProbe != null) {
+      if (!_clearanceOverrides.containsKey(host)) _captureTarget = url;
     }
   }
 
@@ -1086,13 +1296,13 @@ class HlsDownloader {
     // 先用 _onRequestRejected 留下的响应特征：正文可能被截断或换成二进制，
     // 头里的 `cf-mitigated` 是更早、更可靠的证据
     if (_lastCfMitigated) return true;
-    if (_lastServer.toLowerCase().contains('cloudflare')) return true;
     final response = e.response;
     final headers = response?.headers;
     if (headers != null) {
+      // 只看明确的挑战信号。以前「server 含 cloudflare 就算被挑战」是误判：
+      // 任何挂在 Cloudflare 后面的站点，普通防盗链 403 都会带这个头，
+      // 结果把「多带了 Cookie 被拒」误诊成「人机验证」。
       if (headers.value('cf-mitigated') != null) return true;
-      final server = headers.value('server')?.toLowerCase() ?? '';
-      if (server.contains('cloudflare')) return true;
     }
     final snippet = _responseSnippet(response?.data) ?? '';
     if (snippet.contains('Attention Required') ||
@@ -1137,6 +1347,9 @@ class HlsDownloader {
               challenged: challenged,
               clearanceSent: _lastClearanceSent,
               captureTried: _captureTriedHosts.contains(host.toLowerCase()),
+              captureNote: _captureNotes[host.toLowerCase()] ?? '',
+              minimalTried: _minimalTriedHosts.contains(host.toLowerCase()),
+              headerNames: _lastHeaderNames,
               captureGotCookie:
                   _captureGotCookieHosts.contains(host.toLowerCase()),
               crossHost: crossHost,

@@ -208,13 +208,13 @@ void main() {
 
   stdout.writeln('=== 9. 版本号与二级设置 ===');
   final pubspec = read('pubspec.yaml');
-  check(pubspec.contains('version: 0.4.7+27'), 'pubspec 基础版本为 0.4.7 / code 27');
+  check(pubspec.contains('version: 0.4.12+32'), 'pubspec 基础版本为 0.4.12 / code 32');
   final gradle = read('android/app/build.gradle.kts');
   check(gradle.contains('versionName = flutter.versionName'),
       '展示版本统一取 pubspec 三段版本');
   check(!gradle.contains('versionName = "0.3.9.0"'), '不再覆盖第四段展示版本');
   final settingsFile = read('lib/ui/settings_tab.dart');
-  check(settingsFile.contains("appVersion = '0.4.7'"), '设置页版本为 0.4.7');
+  check(settingsFile.contains("appVersion = '0.4.12'"), '设置页版本为 0.4.12');
   check(read('README.md').contains('v0.4.4'), 'README 版本号已同步');
   check(settingsFile.contains('_CategoryTile'), '设置改为分类入口');
   check(settingsFile.contains('_SettingsPage'), '存在二级设置页');
@@ -491,7 +491,7 @@ void main() {
       .firstMatch(pubspecText);
   final semver = versionLine?.group(1) ?? '';
   final currentCode = int.tryParse(versionLine?.group(2) ?? '') ?? 0;
-  check(semver == '0.4.7', '当前展示版本为 0.4.7');
+  check(semver == '0.4.12', '当前展示版本为 0.4.12');
   check(currentCode > publishedVersionCode,
       'versionCode $currentCode 严格大于已发布最高值 $publishedVersionCode');
   check(settingsText.contains("appVersion = '$semver'"),
@@ -994,12 +994,35 @@ void main() {
           activity37.contains('requestHeaders'),
       '从真实出站请求头里取 Cookie');
   check(activity37.contains('wv.destroy()'), '抓到或超时都销毁 WebView');
-  check(activity37.contains('12_000'), '代取有 12 秒超时，不死等');
+  check(activity37.contains('18_000'), '代取有整体超时，不死等');
+  // 光有状态码分不出「防盗链 403」和「人机验证 403」，正文才是判据。
+  check(activity37.contains('__probeFetchResult'), '回传 fetch 的状态码与正文开头');
+  check(activity37.contains('__probeDomainCookies'), '回传该域一共几份 Cookie');
+  final res38 = read('lib/services/web_probe_result.dart');
+  check(res38.contains('Cloudflare 挑战页'), '能认出正文是挑战页');
+  check(res38.contains('该域一份 Cookie 都没下发'),
+      '区分「该域没给 cookie」与「给了但没带上」');
+  // 人机验证常是「先给挑战页、几秒后自动跳回」：只 fetch 一次正好撞在挑战页上，
+  // 所以要一轮轮重试。
+  check(activity37.contains('fetchLoop') && activity37.contains('postDelayed(this'),
+      '代取每 2 秒重试一次 fetch，给挑战页留出自动通过的窗口');
+  check(activity37.contains('__probeFetches'), '回传一共试了几轮，区分「试过多次」与「只来得及一次」');
+  // 这台 ROM 会过滤第三方应用的 Log.d——用 Log.i，并且**诊断必须回传给界面**，
+  // 否则「为什么没抓到」只能靠用户描述。
+  check(!activity37.contains('Log.d("NerelictProbe"'),
+      '探针不用 Log.d（部分 ROM 会过滤第三方 debug 日志）');
+  check(activity37.contains('Log.i("NerelictProbe"'), '探针用 Log.i');
+  check(activity37.contains('__probeRequests') &&
+          activity37.contains('__probeWithCookie') &&
+          activity37.contains('__probePages'),
+      '没抓到 Cookie 也要回传诊断字段，不能只回 null');
+  check(read('lib/services/web_probe_result.dart').contains('隐藏页面'),
+      '诊断能说清卡在「页面没开 / 没发请求 / 没带 Cookie」哪一步');
   final probe38 = read('lib/services/web_probe.dart');
   check(probe38.contains("'com.nerelict/webprobe'"), '两端通道名一致');
   check(probe38.contains('captureCookie'), '只对外暴露 Cookie 串');
   final hd38 = read('lib/services/hls_downloader.dart');
-  check(hd38.contains('captureCookie') && hd38.contains('_clearanceOverrides'),
+  check(hd38.contains('captureProbe') && hd38.contains('_clearanceOverrides'),
       '下载器接受代取结果并按 host 复用');
   final capIdx = hd38.indexOf('await _captureBeforeRetry();');
   final delayIdx = hd38.indexOf('await Future<void>.delayed(Duration(milliseconds: 400');
@@ -1007,12 +1030,43 @@ void main() {
       '先补凭证再退避重试（顺序反了就白跑一次）');
   check(hd38.contains('missingClearance') || hd38.contains('_lastClearanceSent == false'),
       '只在「缺通行证」时触发代取，不无脑抓');
-  check(read('lib/state/app_state.dart').contains('WebProbe.captureCookie'),
+  check(read('lib/state/app_state.dart').contains('WebProbe.capture('),
       '状态层把代取接到下载器');
   // 代取到的 Cookie 只有「重试时重新算头」才用得上：
   // 头在闭包外算一次的话，三次重试发的都是同一份旧头，代取等于白做。
   check(hd38.contains('每轮重试都重新算头'),
       '重试时重算请求头（否则代取到的 Cookie 用不上）');
+  // 同一个地址、同样只剩 UA+Referer，播放代理（dart:io HttpClient）能取到、Dio 403：
+  // 差异在客户端本身，所以失败时直接复用「已经跑通」的那套实现。
+  check(hd38.contains('_fetchTextViaClient') && hd38.contains('_fetchBytesViaClient'),
+      '清单与分片都有「代理同款 HttpClient」兜底');
+  final altIdx = hd38.indexOf('_fetchTextViaClient(url, referer)');
+  check(altIdx > 0, 'Dio 失败后才走兜底，不改变正常路径');
+  check(activity37.contains('window.__nr'),
+      'fetch 结果写到 window 上（evaluateJavascript 对 Promise 只回 {}）');
+
+  // 用户实测：关掉「边下边播缓存」时 HLS 直连能播，开启后改走 Dart 代理就播不了。
+  // 说明站点按 TLS / HTTP 栈识别客户端：ExoPlayer（Android 栈）能过，dart:io 被拒。
+  check(activity37.contains('NATIVE_HTTP_CHANNEL = "com.nerelict/nativehttp"'),
+      '原生提供 Android HTTP 栈的取字节通道');
+  check(activity37.contains('HttpURLConnection'), '用与 ExoPlayer 同层的 HttpURLConnection');
+  check(read('lib/services/native_http.dart').contains("'com.nerelict/nativehttp'"),
+      '两端通道名一致');
+  check(hd38.contains('nativeFetch') && hd38.contains('_fetchTextFallback'),
+      '下载兜底优先走原生栈');
+  final nativeIdx = hd38.indexOf('_tryNative(url, headers, null)');
+  final clientIdx = hd38.indexOf('_fetchTextViaClient(url, referer);');
+  check(nativeIdx > 0 && clientIdx > 0 && nativeIdx < clientIdx,
+      '先原生、再 dart:io（顺序反了就还在用被拦的那条）');
+  check(read('lib/state/app_state.dart').contains('NativeHttp.fetch'),
+      '状态层把原生取字节接到下载器');
+
+  // 代理失败不能直接报错：换个客户端就播不了，等于「开缓存」=「这个站废了」。
+  final pp38 = read('lib/ui/player_page.dart');
+  check(pp38.contains('_proxyDisabled') && pp38.contains('_proxyBlockedHosts'),
+      '代理失败时记住 host，并允许本次改直连');
+  check(pp38.contains('proxy failed, retry direct'),
+      '代理失败自动换直连重试，而不是直接甩错误');
   // 直链以前完全没有重试：被挑战只能直接失败，必须补一条「补凭证后重试」。
   check(hd38.contains('Future<Response<ResponseBody>> start()'),
       '直链下载抽出可重试的请求');
@@ -1048,9 +1102,32 @@ void main() {
       '记录这次带的 Cookie 里有没有通行证');
   check(read('lib/services/download_diagnosis.dart').contains('kClearanceCookieNames'),
       '通行证名字表集中在诊断模块');
-  check(read('lib/services/streaming_proxy.dart')
-          .contains('browserMediaHeaders(url'),
-      '播放代理与下载器共用同一份头');
+  // 播放器只发 UA + Referer 就能 200，下载多带 Cookie / Sec-Fetch 却 403：
+  // 403 的第一步应该是「退回播放器那套头」，而不是去猜凭证。
+  check(hd34.contains('_minimalHosts') && hd34.contains('_minimalTriedHosts'),
+      '403 先降级到播放器的最小请求头');
+  check(hd34.contains('_minimalTriedHosts.add(reqHost)'),
+      '精简模式只给 UA + Referer，不写 Cookie');
+  // Dio 的 BaseOptions 会合并进每个请求：那里还留着 `Accept: */*` 的话，
+  // 「精简模式」其实是 UA + Referer + Accept，跟播放代理并不一致。
+  check(!hd34.contains("'Accept': '*/*'"),
+      'BaseOptions 不再兜底带 Accept（否则精简模式名不副实）');
+  check(hd34.contains('_lastHeaderNames') && hd34.contains('_headerNamesOf'),
+      '记录本次实际发出的头名字，并带进错误提示');
+  // 「server 含 cloudflare 就算被挑战」是误判来源：普通防盗链 403 也会带这个头
+  check(!hd34.contains("server.contains('cloudflare')"),
+      '不再把 server: cloudflare 当成被挑战');
+  check(hd34.contains("value('cf-mitigated')"), '只认 cf-mitigated 这个明确信号');
+  // 播放代理**不能**跟着下载器一起加浏览器特征头：0.4.6 加过一次，
+  // 把本来能播的 HLS 站点打回 403。播放是通的路径，不许拿来做实验。
+  final proxy34 = read('lib/services/streaming_proxy.dart');
+  check(!proxy34.contains('browserMediaHeaders'),
+      '播放代理不加浏览器特征头（只发 UA + Referer + Cookie）');
+  check(proxy34.contains("req.headers.set('User-Agent', MediaSource.userAgent)") &&
+          proxy34.contains("req.headers.set('Referer', referer)"),
+      '播放代理的身份头仍是 UA + Referer 那套最小集合');
+  check(read('lib/services/browser_headers.dart').contains('只给下载器用'),
+      '浏览器头的适用边界写在模块里，避免再被复用');
   check(!read('lib/services/media_source.dart').contains('Sec-Fetch'),
       'ExoPlayer 直连不被动过（当前播放是通的）');
   check(read('lib/services/page_cookie_probe.dart').contains('lastHost'),

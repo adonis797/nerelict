@@ -18,6 +18,7 @@ import '../services/favorites.dart';
 import '../services/file_manager.dart';
 import '../services/hls_downloader.dart';
 import '../services/file_trash.dart';
+import '../services/native_http.dart';
 import '../services/user_agent.dart';
 import '../services/web_probe.dart';
 import '../services/hls_parser.dart' show HlsMasterPlaylist;
@@ -51,8 +52,12 @@ class AppState extends ChangeNotifier {
           CookieStore.instance.invalidate(Uri.tryParse(url)?.host),
       // 通行证是 HttpOnly，CookieManager 读不到：让 WebView 自己发一次请求，
       // 从真实出站头里把它取回来（仅本次任务内存里用，不落盘）
-      captureCookie: (url) =>
-          WebProbe.captureCookie(url, userAgent: UserAgent.current),
+      captureProbe: (url) =>
+          WebProbe.capture(url, userAgent: UserAgent.current),
+      // 有些站点按 TLS / HTTP 栈识别客户端：同样的头，ExoPlayer 直连能过、
+      // dart:io 被拒。下载兜底改走 Android 自带栈，与播放同一条链路。
+      nativeFetch: (url, headers, range) =>
+          NativeHttp.fetch(url, headers, range: range),
     );
     // 切后台 / 被系统回收前再落盘一次，尽量不丢最后几秒的进度
     _lifecycle = AppLifecycleListener(

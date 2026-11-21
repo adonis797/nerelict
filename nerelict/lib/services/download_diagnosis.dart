@@ -82,6 +82,10 @@ AuthFailureReport describeAuthFailure({
   bool? clearanceSent,
   bool captureTried = false,
   bool captureGotCookie = false,
+  String captureNote = '',
+  bool minimalTried = false,
+  /// 这次实际发出去的头名字（不含值）。用来证明「精简模式」到底精简了什么。
+  String headerNames = '',
   bool crossHost = false,
 }) {
   if (cookieSent) {
@@ -97,9 +101,11 @@ AuthFailureReport describeAuthFailure({
           );
         }
         if (!captureGotCookie) {
+          final detail = captureNote.isEmpty ? '' : '（$captureNote）';
           return AuthFailureReport(
             label,
-            '代取没拿到 Cookie：先在页面里把该视频播放十几秒，确认人机验证已过再回来重试',
+            '代取没拿到 Cookie$detail：先在页面里把该视频播放十几秒，'
+                '确认人机验证已过再回来重试',
           );
         }
         return AuthFailureReport(
@@ -112,13 +118,38 @@ AuthFailureReport describeAuthFailure({
         '通行证已带上仍被判为自动化：属于 TLS / HTTP2 指纹差异，换 Cookie 或加头都无效',
       );
     }
-    return AuthFailureReport(label, '仍被拒，多半是来源页校验或链接签名已过期');
+    return AuthFailureReport(
+      label,
+      minimalTried
+          ? '已改用与播放器相同的精简请求头（仅 UA + Referer）重试仍被拒：'
+              '多半是签名已过期，或该地址不接受下载请求'
+          : '仍被拒，多半是来源页校验或链接签名已过期',
+    );
   }
 
   if (crossHost) {
+    // 跨域是最容易被误读的一种：一味说「要按该域单独取凭证」，会让用户以为
+    // 还没试过。这里把「试过什么」逐项摊开，下一步做什么才不重复。
+    final tried = <String>[];
+    if (minimalTried) {
+      final where = headerNames.isEmpty ? '' : '（实际只发了 $headerNames）';
+      tried.add('已改用与播放器相同的最小请求头$where重试');
+    }
+    if (captureTried) {
+      tried.add(captureGotCookie
+          ? '已按该域代取到凭证但仍被拒'
+          : '已按该域代取过凭证但没取到${captureNote.isEmpty ? '' : '：$captureNote'}');
+    }
+    final head = '分片在独立域名上，页面的登录态带不过去';
+    if (tried.isEmpty) {
+      return AuthFailureReport(
+        'Cookie 未取到（该域 0 项，且与当前页面不同域）',
+        '$head：这类站点要按该域单独取凭证',
+      );
+    }
     return AuthFailureReport(
       'Cookie 未取到（该域 0 项，且与当前页面不同域）',
-      '分片在独立域名上，页面的登录态带不过去：这类站点要按该域单独取凭证',
+      '$head；${tried.join('，')}。该域自己有一道验证，只能在该域上过一次再下',
     );
   }
 
