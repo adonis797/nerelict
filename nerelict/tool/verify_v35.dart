@@ -208,13 +208,13 @@ void main() {
 
   stdout.writeln('=== 9. 版本号与二级设置 ===');
   final pubspec = read('pubspec.yaml');
-  check(pubspec.contains('version: 0.4.10+30'), 'pubspec 基础版本为 0.4.10 / code 30');
+  check(pubspec.contains('version: 0.4.11+31'), 'pubspec 基础版本为 0.4.11 / code 31');
   final gradle = read('android/app/build.gradle.kts');
   check(gradle.contains('versionName = flutter.versionName'),
       '展示版本统一取 pubspec 三段版本');
   check(!gradle.contains('versionName = "0.3.9.0"'), '不再覆盖第四段展示版本');
   final settingsFile = read('lib/ui/settings_tab.dart');
-  check(settingsFile.contains("appVersion = '0.4.10'"), '设置页版本为 0.4.10');
+  check(settingsFile.contains("appVersion = '0.4.11'"), '设置页版本为 0.4.11');
   check(read('README.md').contains('v0.4.4'), 'README 版本号已同步');
   check(settingsFile.contains('_CategoryTile'), '设置改为分类入口');
   check(settingsFile.contains('_SettingsPage'), '存在二级设置页');
@@ -491,7 +491,7 @@ void main() {
       .firstMatch(pubspecText);
   final semver = versionLine?.group(1) ?? '';
   final currentCode = int.tryParse(versionLine?.group(2) ?? '') ?? 0;
-  check(semver == '0.4.10', '当前展示版本为 0.4.10');
+  check(semver == '0.4.11', '当前展示版本为 0.4.11');
   check(currentCode > publishedVersionCode,
       'versionCode $currentCode 严格大于已发布最高值 $publishedVersionCode');
   check(settingsText.contains("appVersion = '$semver'"),
@@ -1036,6 +1036,14 @@ void main() {
   // 头在闭包外算一次的话，三次重试发的都是同一份旧头，代取等于白做。
   check(hd38.contains('每轮重试都重新算头'),
       '重试时重算请求头（否则代取到的 Cookie 用不上）');
+  // 同一个地址、同样只剩 UA+Referer，播放代理（dart:io HttpClient）能取到、Dio 403：
+  // 差异在客户端本身，所以失败时直接复用「已经跑通」的那套实现。
+  check(hd38.contains('_fetchTextViaClient') && hd38.contains('_fetchBytesViaClient'),
+      '清单与分片都有「代理同款 HttpClient」兜底');
+  final altIdx = hd38.indexOf('_fetchTextViaClient(url, referer)');
+  check(altIdx > 0, 'Dio 失败后才走兜底，不改变正常路径');
+  check(activity37.contains('window.__nr'),
+      'fetch 结果写到 window 上（evaluateJavascript 对 Promise 只回 {}）');
   // 直链以前完全没有重试：被挑战只能直接失败，必须补一条「补凭证后重试」。
   check(hd38.contains('Future<Response<ResponseBody>> start()'),
       '直链下载抽出可重试的请求');

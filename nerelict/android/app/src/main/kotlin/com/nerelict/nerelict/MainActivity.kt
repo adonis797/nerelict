@@ -239,17 +239,22 @@ class MainActivity : FlutterActivity() {
         fun startFetch(wv: WebView, round: Int) {
             fetchRounds = round
             val quoted = org.json.JSONObject.quote(url)
+            // evaluateJavascript 对 Promise 只会回 `{}`（序列化不了），
+            // 所以必须让 JS 把结果写到 window 上，下一轮再来取。
+            wv.evaluateJavascript("(window.__nr||'')") { value ->
+                val prev = decodeJsString(value)
+                if (prev.isNotEmpty() && prev != "pending") lastFetchResult = prev
+            }
             // 带上响应体开头：被 Cloudflare 拦下时正文是挑战页，
             // 只看状态码分不出「403 防盗链」和「403 人机验证」。
-            val js = "fetch($quoted,{credentials:'include',cache:'no-store'})" +
+            val js = "(function(){window.__nr='pending';" +
+                "fetch($quoted,{credentials:'include',cache:'no-store'})" +
                 ".then(function(r){return r.text().then(function(t){" +
-                "return 'ok:'+r.status+':'+t.replace(/\\s+/g,' ').slice(0,120)})})" +
-                ".catch(function(e){return 'err:'+e})"
+                "window.__nr='ok:'+r.status+':'+t.replace(/\\s+/g,' ').slice(0,120)})})" +
+                ".catch(function(e){window.__nr='err:'+e});" +
+                "return 'sent'})()"
             log("fetch #$round")
-            wv.evaluateJavascript(js) { value ->
-                lastFetchResult = decodeJsString(value)
-                log("fetch#$round -> $value")
-            }
+            wv.evaluateJavascript(js) { }
         }
 
         /** 每 2 秒重试一次 fetch，给挑战页留出自动通过的时间窗。 */
@@ -320,7 +325,19 @@ class MainActivity : FlutterActivity() {
                     webView?.loadUrl(url)
                 }
             }, 5_000)
-            main.postDelayed({ finish(null) }, 18_000)
+            main.postDelayed({
+                // 收尾前再取一次结果：最后一轮 fetch 可能刚好完成
+                val wvm = webView
+                if (wvm == null) {
+                    finish(null)
+                } else {
+                    wvm.evaluateJavascript("(window.__nr||'')") { value ->
+                        val last = decodeJsString(value)
+                        if (last.isNotEmpty() && last != "pending") lastFetchResult = last
+                        finish(null)
+                    }
+                }
+            }, 18_000)
         } catch (e: Exception) {
             errorText = e.message ?: e.javaClass.simpleName
             finish(null)

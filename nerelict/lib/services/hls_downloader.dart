@@ -871,6 +871,7 @@ class HlsDownloader {
     bool Function() canceled,
   ) async {
     _lastRequestUrl = url;
+    try {
     final res = await _withRetry<Response<String>>(
       () async {
         // 每轮重试都重新算头：代取到通行证后，重试必须带上新的 Cookie，
@@ -900,6 +901,48 @@ class HlsDownloader {
     // 这类相对引用；必须基于请求地址解析成绝对 URI，否则分片 URL 会缺 host。
     final uri = Uri.parse(url).resolveUri(res.realUri);
     return (body: body, uri: uri);
+    } catch (_) {
+      // Dio 走不通时，换**播放代理同款**的 dart:io `HttpClient` 再取一次。
+      //
+      // 依据：同一个地址、同样只剩 UA + Referer 的头，播放代理（`StreamingProxy`
+      // 用的就是 HttpClient）能取到，Dio 却一直 403。差异只可能在客户端本身
+      // （连接复用、头处理）。这里直接复用「已经跑通」的那套实现，不再调整头。
+      final alt = await _fetchTextViaClient(url, referer);
+      if (alt != null) return alt;
+      rethrow;
+    }
+  }
+
+  /// 用与播放代理完全相同的客户端取文本。
+  ///
+  /// 刻意只设 `User-Agent` / `Referer`：跟代理的 `_applyHeaders` 保持一致，
+  /// 不加 Cookie、不加浏览器特征头、不加任何 Dio 的默认头。
+  Future<({String body, Uri uri})?> _fetchTextViaClient(
+    String url,
+    String? referer,
+  ) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 20);
+    try {
+      final req = await client.getUrl(Uri.parse(url));
+      req.headers.set('User-Agent', UserAgent.current);
+      if (referer != null && referer.isNotEmpty) {
+        req.headers.set('Referer', referer);
+      }
+      final res = await req.close().timeout(const Duration(seconds: 30));
+      if (res.statusCode < 200 || res.statusCode >= 300) return null;
+      final body = await res.transform(utf8.decoder).join();
+      if (!body.trimLeft().startsWith('#EXTM3U')) return null;
+      final base = Uri.parse(url);
+      final finalUri = res.redirects.isEmpty
+          ? base
+          : base.resolveUri(res.redirects.last.location);
+      return (body: body, uri: finalUri);
+    } catch (_) {
+      return null;
+    } finally {
+      client.close(force: true);
+    }
   }
 
   /// 读取任意二进制资源（分片 / init 段 / 密钥）。
@@ -914,6 +957,7 @@ class HlsDownloader {
     ({int offset, int length})? range,
   }) async {
     _lastRequestUrl = url;
+    try {
     final res = await _withRetry(
       () async {
         final headers = await _headersFor(url, referer, task.requestHeaders);
@@ -950,6 +994,47 @@ class HlsDownloader {
           '字节区间不符（期望 ${range.length}，收到 ${bytes.length}，状态 $status）');
     }
     return bytes;
+    } catch (_) {
+      // 分片同理：清单能过、分片却 403 时也走代理同款客户端
+      final alt = await _fetchBytesViaClient(url, referer, range);
+      if (alt != null) return alt;
+      rethrow;
+    }
+  }
+
+  /// 用播放代理同款客户端取字节（含 Range）。
+  Future<Uint8List?> _fetchBytesViaClient(
+    String url,
+    String? referer,
+    ({int offset, int length})? range,
+  ) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 20);
+    try {
+      final req = await client.getUrl(Uri.parse(url));
+      req.headers.set('User-Agent', UserAgent.current);
+      if (referer != null && referer.isNotEmpty) {
+        req.headers.set('Referer', referer);
+      }
+      if (range != null) {
+        req.headers.set(HttpHeaders.rangeHeader,
+            'bytes=${range.offset}-${range.offset + range.length - 1}');
+      }
+      final res = await req.close().timeout(const Duration(seconds: 40));
+      if (res.statusCode < 200 || res.statusCode >= 300) return null;
+      final builder = BytesBuilder(copy: false);
+      await for (final chunk in res) {
+        builder.add(chunk);
+      }
+      final bytes = builder.takeBytes();
+      if (bytes.isEmpty) return null;
+      if (range != null && bytes.length != range.length) return null;
+      return bytes;
+    } catch (_) {
+      return null;
+    } finally {
+      client.close(force: true);
+    }
   }
 
   /// 解析主播放列表，供下载前选清晰度 / 查看音轨。
