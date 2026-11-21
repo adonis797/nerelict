@@ -370,26 +370,43 @@ class HlsDownloader {
     try {
       // 直链同样需要登录态：很多站点把整段视频也放在鉴权后面
       _lastRequestUrl = task.url;
-      final directHeaders =
-          await _headersFor(task.url, task.referer, task.requestHeaders);
-      if (offset > 0) directHeaders['Range'] = 'bytes=$offset-';
-      // 源文件在暂停期间被替换时，服务端会忽略 Range 返回 200；
-      // 现有逻辑随即从头重写，避免把新旧两个版本拼在一起。
-      if (offset > 0 && validator != null && validator.isNotEmpty) {
-        directHeaders['If-Range'] = validator;
-      }
-      final response = await _guarded(
-        const Duration(minutes: 10),
-        (token) => dio.get<ResponseBody>(
-          task.url,
-          cancelToken: token,
-          options: Options(
-            responseType: ResponseType.stream,
-            headers: directHeaders,
+      final host = Uri.tryParse(task.url)?.host.toLowerCase() ?? '';
+
+      Future<Response<ResponseBody>> start() async {
+        // 每次重试都重算头：代取到通行证后要立刻生效
+        final directHeaders =
+            await _headersFor(task.url, task.referer, task.requestHeaders);
+        if (offset > 0) directHeaders['Range'] = 'bytes=$offset-';
+        // 源文件在暂停期间被替换时，服务端会忽略 Range 返回 200；
+        // 现有逻辑随即从头重写，避免把新旧两个版本拼在一起。
+        if (offset > 0 && validator != null && validator.isNotEmpty) {
+          directHeaders['If-Range'] = validator;
+        }
+        return _guarded(
+          const Duration(minutes: 10),
+          (token) => dio.get<ResponseBody>(
+            task.url,
+            cancelToken: token,
+            options: Options(
+              responseType: ResponseType.stream,
+              headers: directHeaders,
+            ),
           ),
-        ),
-        taskId: task.id,
-      );
+          taskId: task.id,
+        );
+      }
+
+      Response<ResponseBody> response;
+      try {
+        response = await start();
+      } catch (e) {
+        // 直链以前完全没有重试：被挑战时只能直接失败。
+        // 这里先按 403 诊断走一遍代取，真补到凭证才重试，否则原样抛出。
+        if (e is DioException) _onRequestRejected(e, task.url);
+        await _captureBeforeRetry();
+        if (host.isEmpty || !_clearanceOverrides.containsKey(host)) rethrow;
+        response = await start();
+      }
 
       // 服务端不支持 Range 或校验值不匹配时会返回 200，此时从头重写，
       // 保证不会把暂停前后两个不同版本的源文件拼在一起。
@@ -806,20 +823,24 @@ class HlsDownloader {
     bool Function() canceled,
   ) async {
     _lastRequestUrl = url;
-    final headers = await _headersFor(url, referer, task.requestHeaders);
     final res = await _withRetry<Response<String>>(
-      () => _guarded<Response<String>>(
-        requestTimeout,
-        (token) => dio.get<String>(
-          url,
-          cancelToken: token,
-          options: Options(
-            responseType: ResponseType.plain,
-            headers: headers,
+      () async {
+        // 每轮重试都重新算头：代取到通行证后，重试必须带上新的 Cookie，
+        // 否则三次重试发的还是第一次那份头，代取等于白做
+        final headers = await _headersFor(url, referer, task.requestHeaders);
+        return _guarded<Response<String>>(
+          requestTimeout,
+          (token) => dio.get<String>(
+            url,
+            cancelToken: token,
+            options: Options(
+              responseType: ResponseType.plain,
+              headers: headers,
+            ),
           ),
-        ),
-        taskId: task.id,
-      ),
+          taskId: task.id,
+        );
+      },
       shouldStop: canceled,
       onFail: (e) => _onRequestRejected(e, url),
     );
@@ -845,23 +866,26 @@ class HlsDownloader {
     ({int offset, int length})? range,
   }) async {
     _lastRequestUrl = url;
-    final headers = await _headersFor(url, referer, task.requestHeaders);
-    if (range != null) {
-      headers['Range'] = 'bytes=${range.offset}-${range.offset + range.length - 1}';
-    }
     final res = await _withRetry(
-      () => _guarded(
-        requestTimeout,
-        (token) => dio.get<List<int>>(
-          url,
-          cancelToken: token,
-          options: Options(
-            responseType: ResponseType.bytes,
-            headers: headers,
+      () async {
+        final headers = await _headersFor(url, referer, task.requestHeaders);
+        if (range != null) {
+          headers['Range'] =
+              'bytes=${range.offset}-${range.offset + range.length - 1}';
+        }
+        return _guarded(
+          requestTimeout,
+          (token) => dio.get<List<int>>(
+            url,
+            cancelToken: token,
+            options: Options(
+              responseType: ResponseType.bytes,
+              headers: headers,
+            ),
           ),
-        ),
-        taskId: task.id,
-      ),
+          taskId: task.id,
+        );
+      },
       shouldStop: canceled,
       onFail: (e) => _onRequestRejected(e, url),
     );

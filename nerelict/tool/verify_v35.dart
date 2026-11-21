@@ -1009,6 +1009,15 @@ void main() {
       '只在「缺通行证」时触发代取，不无脑抓');
   check(read('lib/state/app_state.dart').contains('WebProbe.captureCookie'),
       '状态层把代取接到下载器');
+  // 代取到的 Cookie 只有「重试时重新算头」才用得上：
+  // 头在闭包外算一次的话，三次重试发的都是同一份旧头，代取等于白做。
+  check(hd38.contains('每轮重试都重新算头'),
+      '重试时重算请求头（否则代取到的 Cookie 用不上）');
+  // 直链以前完全没有重试：被挑战只能直接失败，必须补一条「补凭证后重试」。
+  check(hd38.contains('Future<Response<ResponseBody>> start()'),
+      '直链下载抽出可重试的请求');
+  final capCount = '_captureBeforeRetry()'.allMatches(hd38).length;
+  check(capCount >= 2, '播放列表/分片与直链两条路都接了代取重试');
   check(files37.contains('if (!file.isDir) parts.add(file.sizeText)'),
       '目录行不显示大小');
   // 拦截器全局注册，必须各自判断「我是不是当前页」，否则会互相抢返回
