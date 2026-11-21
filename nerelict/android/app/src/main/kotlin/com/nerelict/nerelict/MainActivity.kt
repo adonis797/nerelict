@@ -29,6 +29,8 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 
 class MainActivity : FlutterActivity() {
 
@@ -43,6 +45,7 @@ class MainActivity : FlutterActivity() {
         private const val EXTERNAL_CHANNEL = "com.nerelict/external"
         private const val MEDIA_CHANNEL = "com.nerelict/media"
         private const val WEBPROBE_CHANNEL = "com.nerelict/webprobe"
+        private const val NATIVE_HTTP_CHANNEL = "com.nerelict/nativehttp"
         private const val REQ_PICK_DIR = 1001
         private const val REQ_PICK_APK = 1002
     }
@@ -63,6 +66,7 @@ class MainActivity : FlutterActivity() {
         configureExternalChannel(flutterEngine)
         configureMediaChannel(flutterEngine)
         configureWebProbeChannel(flutterEngine)
+        configureNativeHttpChannel(flutterEngine)
     }
 
     /**
@@ -133,6 +137,71 @@ class MainActivity : FlutterActivity() {
     }
 
     /**
+     * 用 Android 自带的 HTTP 栈取字节。
+     *
+     * 为什么需要：有些站点按 TLS / HTTP 栈识别客户端。同一个地址、同样只剩
+     * `UA` + `Referer`，ExoPlayer 直连能过，而 Dart 的 `dart:io` 被拦（实测某站点
+     * HLS 关掉「边下边播缓存」能播、开启后走 Dart 代理就 403）。
+     * `HttpURLConnection` 与 ExoPlayer 用的是同一层 TLS 实现，因此下载改走这里。
+     *
+     * 只做最小转发：调用方给什么头就发什么头，不猜、不补。
+     */
+    private fun configureNativeHttpChannel(flutterEngine: FlutterEngine) {
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, NATIVE_HTTP_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "fetch" -> {
+                        val url = call.argument<String>("url")
+                        if (url.isNullOrEmpty()) {
+                            result.success(null)
+                            return@setMethodCallHandler
+                        }
+                        val headers = call.argument<Map<String, String>>("headers")
+                            ?: emptyMap()
+                        val range = call.argument<String>("range")
+                        // 网络请求必须离开主线程
+                        Thread {
+                            var conn: HttpURLConnection? = null
+                            try {
+                                conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                                    connectTimeout = 20_000
+                                    readTimeout = 40_000
+                                    instanceFollowRedirects = true
+                                    requestMethod = "GET"
+                                    headers.forEach { (k, v) -> setRequestProperty(k, v) }
+                                    if (!range.isNullOrEmpty()) setRequestProperty("Range", range)
+                                }
+                                val code = conn.responseCode
+                                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                                val bytes = stream?.use { it.readBytes() } ?: ByteArray(0)
+                                val finalUrl = conn.url?.toString() ?: url
+                                runOnUiThread {
+                                    result.success(
+                                        mapOf(
+                                            "status" to code,
+                                            "bytes" to bytes,
+                                            "url" to finalUrl,
+                                        )
+                                    )
+                                }
+                            } catch (e: Exception) {
+                                Log.i("NerelictHttp", "fetch failed: " + e.javaClass.simpleName)
+                                runOnUiThread { result.success(null) }
+                            } finally {
+                                try {
+                                    conn?.disconnect()
+                                } catch (_: Exception) {
+                                }
+                            }
+                        }.start()
+                    }
+
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    /**
      * 用 WebView 上下文代取请求头。
      *
      * 为什么需要：Cloudflare 的 `cf_clearance` 带 HttpOnly，`CookieManager.getCookie()`
@@ -167,17 +236,46 @@ class MainActivity : FlutterActivity() {
         var finished = false
         var webView: WebView? = null
         var seenRequests = 0
-        var sawCookie = false
-        var fetched = false
+        var reqsWithCookie = 0
+        var pagesLoaded = 0
+        var fetchRounds = 0
+        var loopStarted = false
+        var errorText: String? = null
+        var lastFetchResult = ""
 
+        val main = Handler(Looper.getMainLooper())
+
+        // 用 Log.i 而不是 Log.d：部分 ROM（含实测这台）会过滤第三方应用的 debug 日志
         fun log(msg: String) {
-            Log.d("NerelictProbe", msg)
+            Log.i("NerelictProbe", msg)
         }
 
-        fun finish(payload: Map<String, String>?) {
+        /** 永远回传诊断字段，哪怕没抓到 Cookie——否则 Dart 侧只能看到 null，无从判断。 */
+        fun finish(headers: Map<String, String>?) {
             if (finished) return
             finished = true
-            log("finish requests=$seenRequests cookie=$sawCookie payload=${payload != null}")
+            log("finish req=$seenRequests withCookie=$reqsWithCookie pages=$pagesLoaded fetches=$fetchRounds")
+            val payload = HashMap<String, String>()
+            headers?.let { payload.putAll(it) }
+            payload["__probeRequests"] = seenRequests.toString()
+            payload["__probeWithCookie"] = reqsWithCookie.toString()
+            payload["__probePages"] = pagesLoaded.toString()
+            payload["__probeFetches"] = fetchRounds.toString()
+            // fetch 的真实返回：`ok:403` 说明请求发出去了但被拒，
+            // `err:...` 说明连发都没发出去（CSP / 混合内容）。这两种修法完全不同。
+            if (lastFetchResult.isNotEmpty()) payload["__probeFetchResult"] = lastFetchResult
+            // 该域在 WebView 里到底有没有 cookie：0 表示挑战根本没走完，
+            // 大于 0 却仍没带上是另一回事（头被裁）。两者不能混。
+            try {
+                val parsed = Uri.parse(url)
+                val cookieUrl = parsed.scheme + "://" + parsed.host + "/"
+                val raw = CookieManager.getInstance().getCookie(cookieUrl) ?: ""
+                val count = raw.split(";").count { it.trim().contains("=") }
+                payload["__probeDomainCookies"] = count.toString()
+            } catch (_: Exception) {
+                payload["__probeDomainCookies"] = "-1"
+            }
+            if (!errorText.isNullOrEmpty()) payload["__probeError"] = errorText!!
             try {
                 webView?.let { wv ->
                     wv.stopLoading()
@@ -190,18 +288,59 @@ class MainActivity : FlutterActivity() {
             result.success(payload)
         }
 
-        fun startFetch(wv: WebView) {
-            if (fetched) return
-            fetched = true
-            // 主框架导航拿不到完整请求头（Cookie 常被略去），
-            // 用页面内 fetch 触发一次**子资源**请求，那里才有 Cookie。
+        /** evaluateJavascript 回传的是 JSON 字面量，去掉外层引号与转义。 */
+        fun decodeJsString(raw: String?): String {
+            if (raw.isNullOrEmpty() || raw == "null") return ""
+            return try {
+                org.json.JSONTokener(raw).nextValue() as? String ?: raw
+            } catch (_: Exception) {
+                raw
+            }
+        }
+
+        /**
+         * 发一次页面内 fetch。
+         *
+         * 主框架导航拿不到完整请求头（Cookie 常被略去），子资源请求才有；
+         * 另一点是**要允许重复发**：人机验证常常是「页面先显示挑战、几秒后
+         * 自动跳回」，只在 onPageFinished 那一刻发一次，正好撞在挑战页上。
+         */
+        fun startFetch(wv: WebView, round: Int) {
+            fetchRounds = round
             val quoted = org.json.JSONObject.quote(url)
-            val js = "fetch($quoted,{credentials:'include',cache:'no-store'})" +
-                ".then(function(r){return r.text()})" +
-                ".then(function(t){return 'ok:'+t.length})" +
-                ".catch(function(e){return 'err:'+e})"
-            log("startFetch $url")
-            wv.evaluateJavascript(js) { value -> log("fetchResult=$value") }
+            // evaluateJavascript 对 Promise 只会回 `{}`（序列化不了），
+            // 所以必须让 JS 把结果写到 window 上，下一轮再来取。
+            wv.evaluateJavascript("(window.__nr||'')") { value ->
+                val prev = decodeJsString(value)
+                if (prev.isNotEmpty() && prev != "pending") lastFetchResult = prev
+            }
+            // 带上响应体开头：被 Cloudflare 拦下时正文是挑战页，
+            // 只看状态码分不出「403 防盗链」和「403 人机验证」。
+            val js = "(function(){window.__nr='pending';" +
+                "fetch($quoted,{credentials:'include',cache:'no-store'})" +
+                ".then(function(r){return r.text().then(function(t){" +
+                "window.__nr='ok:'+r.status+':'+t.replace(/\\s+/g,' ').slice(0,120)})})" +
+                ".catch(function(e){window.__nr='err:'+e});" +
+                "return 'sent'})()"
+            log("fetch #$round")
+            wv.evaluateJavascript(js) { }
+        }
+
+        /** 每 2 秒重试一次 fetch，给挑战页留出自动通过的时间窗。 */
+        val fetchLoop = object : Runnable {
+            override fun run() {
+                if (finished) return
+                if (fetchRounds >= 6) return
+                val wvm = webView ?: return
+                startFetch(wvm, fetchRounds + 1)
+                main.postDelayed(this, 2_000)
+            }
+        }
+
+        fun kickLoop() {
+            if (loopStarted) return
+            loopStarted = true
+            main.postDelayed(fetchLoop, 2_000)
         }
 
         try {
@@ -211,7 +350,6 @@ class MainActivity : FlutterActivity() {
             val wv = WebView(this)
             webView = wv
             wv.settings.javaScriptEnabled = true
-            // 不要图片：我们要的是请求头，不是页面内容
             wv.settings.blockNetworkImage = true
             wv.settings.cacheMode = WebSettings.LOAD_NO_CACHE
             if (!ua.isNullOrEmpty()) wv.settings.userAgentString = ua
@@ -222,19 +360,16 @@ class MainActivity : FlutterActivity() {
                 ): WebResourceResponse? {
                     val req = request ?: return null
                     val reqUrl = req.url ?: return null
-                    // 只认目标主机：跳转到登录页之类的不参与
                     if (host.isNotEmpty() && reqUrl.host != host) return null
                     seenRequests++
                     val headers = req.requestHeaders ?: emptyMap()
                     val cookieKey = headers.keys.firstOrNull {
                         it.equals("Cookie", ignoreCase = true)
                     }
+                    if (cookieKey != null) reqsWithCookie++
                     log("req #$seenRequests ${reqUrl.path} headers=${headers.size} cookie=${cookieKey != null}")
                     if (cookieKey != null) {
-                        sawCookie = true
-                        val payload = HashMap(headers)
-                        payload["__probeRequests"] = seenRequests.toString()
-                        finish(payload)
+                        finish(HashMap(headers))
                         return null
                     }
                     return null
@@ -242,24 +377,38 @@ class MainActivity : FlutterActivity() {
 
                 override fun onPageFinished(view: WebView?, pageUrl: String?) {
                     super.onPageFinished(view, pageUrl)
-                    log("onPageFinished $pageUrl")
-                    if (view != null) startFetch(view)
+                    pagesLoaded++
+                    log("onPageFinished #$pagesLoaded")
+                    // 先来一轮，之后交给轮询
+                    if (view != null && fetchRounds == 0) startFetch(view, 1)
+                    kickLoop()
                 }
             }
-            // 必须挂到窗口里才会真正发请求：1x1、不可见、不占布局
             val root = findViewById<ViewGroup>(android.R.id.content)
             root.addView(wv, ViewGroup.LayoutParams(1, 1))
             log("load $originRoot")
             wv.loadUrl(originRoot)
-            // 根页若是挑战页、脚本跑不起来，退一步直接加载目标地址再试
-            Handler(Looper.getMainLooper()).postDelayed({
-                if (!finished && !sawCookie) {
+            main.postDelayed({
+                if (!finished && reqsWithCookie == 0) {
                     log("fallback load target")
                     webView?.loadUrl(url)
                 }
             }, 5_000)
-            Handler(Looper.getMainLooper()).postDelayed({ finish(null) }, 12_000)
-        } catch (_: Exception) {
+            main.postDelayed({
+                // 收尾前再取一次结果：最后一轮 fetch 可能刚好完成
+                val wvm = webView
+                if (wvm == null) {
+                    finish(null)
+                } else {
+                    wvm.evaluateJavascript("(window.__nr||'')") { value ->
+                        val last = decodeJsString(value)
+                        if (last.isNotEmpty() && last != "pending") lastFetchResult = last
+                        finish(null)
+                    }
+                }
+            }, 18_000)
+        } catch (e: Exception) {
+            errorText = e.message ?: e.javaClass.simpleName
             finish(null)
         }
     }

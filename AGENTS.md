@@ -132,6 +132,15 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
   一律先 `adb shell uiautomator dump /sdcard/ui.xml` 拉下来读 `bounds`，再点。
   目测换算会偏几十到上百像素，轻则点空，重则点到相邻控件——本项目曾因此误删用户的一个成品视频。
 - vivo 百度输入法会把 `adb shell input text` 的 ASCII 当拼音；可临时 `ime disable` / `ime enable` 恢复，用完必须还原。
+- **`shouldInterceptRequest` 的 `requestHeaders` 里没有 `Cookie`**（Android 安全设计，cookie 在网络栈注入）。
+  「用隐藏 WebView 抓真实出站头拿 HttpOnly 凭证」这条路从根上不成立；`CookieManager.getCookie()`
+  又能读到该域的一部分 cookie，所以「读不到」和「没下发」是两件事，别混。
+- **`evaluateJavascript` 对 Promise 只回 `{}`**。要拿异步结果必须让 JS 写进 `window.xxx`，下一轮再读。
+  诊断写了却不生效时，先怀疑测量工具本身。
+- **Cloudflare 这类站点按 TLS / HTTP 栈识别客户端，不按请求头**：同一个地址、同样只剩 UA + Referer，
+  ExoPlayer 直连能过，Dart 的 `dart:io` 一律被拒。排查「能播不能下」时，**先确认播放走的是直连还是代理**
+  ——`playerStreamingCache` 打开时 HLS 会改走 `StreamingProxy`（dart:io），关掉才是 ExoPlayer 直连。
+  下载同理：优先用 `com.nerelict/nativehttp` 的 `HttpURLConnection`，别在请求头上继续加东西。
 - `adb reverse` 不跨命令持久，需与设备操作放在同一条命令里；PC 侧访问 `adb forward` 端口要加 `--noproxy '*'`。
 - Git Bash 会把设备侧 `/sdcard/...` 转成 Windows 路径，涉及设备路径的操作改用 PowerShell。
 - Gradle wrapper 可能因 hash 目录只有 `.part` 而卡住；**不要改仓库里的 `distributionUrl`**，改为补齐本机缓存。
