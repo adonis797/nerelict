@@ -31,6 +31,7 @@ class MainActivity : FlutterActivity() {
         private const val NETWORK_CHANNEL = "com.nerelict/network"
         private const val COOKIE_CHANNEL = "com.nerelict/cookie"
         private const val EXTERNAL_CHANNEL = "com.nerelict/external"
+        private const val MEDIA_CHANNEL = "com.nerelict/media"
         private const val REQ_PICK_DIR = 1001
         private const val REQ_PICK_APK = 1002
     }
@@ -49,6 +50,7 @@ class MainActivity : FlutterActivity() {
         configureNetworkChannel(flutterEngine)
         configureCookieChannel(flutterEngine)
         configureExternalChannel(flutterEngine)
+        configureMediaChannel(flutterEngine)
     }
 
     /**
@@ -111,6 +113,59 @@ class MainActivity : FlutterActivity() {
                             // 没有能处理该 scheme 的应用（ActivityNotFoundException）
                             result.success(false)
                         }
+                    }
+
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    /**
+     * 本地媒体元数据：时长与分辨率。
+     *
+     * 只读元信息、不解码整段（`MediaMetadataRetriever` 内部按需解析头部），
+     * 失败一律回 null，由 Dart 侧标成「读不出元数据」而不是时长 0。
+     */
+    private fun configureMediaChannel(flutterEngine: FlutterEngine) {
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, MEDIA_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "probe" -> {
+                        val path = call.argument<String>("path")
+                        if (path.isNullOrEmpty() || !File(path).exists()) {
+                            result.success(null)
+                            return@setMethodCallHandler
+                        }
+                        // 元数据读取是阻塞操作，放到工作线程，避免卡住主线程
+                        Thread {
+                            var retriever: MediaMetadataRetriever? = null
+                            try {
+                                retriever = MediaMetadataRetriever()
+                                retriever.setDataSource(path)
+                                val duration = retriever
+                                    .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                                    ?.toLongOrNull() ?: 0L
+                                val width = retriever
+                                    .extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                                    ?.toIntOrNull() ?: 0
+                                val height = retriever
+                                    .extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                                    ?.toIntOrNull() ?: 0
+                                val payload = mapOf(
+                                    "durationMs" to duration,
+                                    "width" to width,
+                                    "height" to height,
+                                )
+                                runOnUiThread { result.success(payload) }
+                            } catch (_: Exception) {
+                                runOnUiThread { result.success(null) }
+                            } finally {
+                                try {
+                                    retriever?.release()
+                                } catch (_: Exception) {
+                                }
+                            }
+                        }.start()
                     }
 
                     else -> result.notImplemented()

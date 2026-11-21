@@ -208,13 +208,13 @@ void main() {
 
   stdout.writeln('=== 9. 版本号与二级设置 ===');
   final pubspec = read('pubspec.yaml');
-  check(pubspec.contains('version: 0.4.6+26'), 'pubspec 基础版本为 0.4.6 / code 26');
+  check(pubspec.contains('version: 0.4.7+27'), 'pubspec 基础版本为 0.4.7 / code 27');
   final gradle = read('android/app/build.gradle.kts');
   check(gradle.contains('versionName = flutter.versionName'),
       '展示版本统一取 pubspec 三段版本');
   check(!gradle.contains('versionName = "0.3.9.0"'), '不再覆盖第四段展示版本');
   final settingsFile = read('lib/ui/settings_tab.dart');
-  check(settingsFile.contains("appVersion = '0.4.6'"), '设置页版本为 0.4.6');
+  check(settingsFile.contains("appVersion = '0.4.7'"), '设置页版本为 0.4.7');
   check(read('README.md').contains('v0.4.4'), 'README 版本号已同步');
   check(settingsFile.contains('_CategoryTile'), '设置改为分类入口');
   check(settingsFile.contains('_SettingsPage'), '存在二级设置页');
@@ -490,7 +490,7 @@ void main() {
       .firstMatch(pubspecText);
   final semver = versionLine?.group(1) ?? '';
   final currentCode = int.tryParse(versionLine?.group(2) ?? '') ?? 0;
-  check(semver == '0.4.6', '当前展示版本为 0.4.6');
+  check(semver == '0.4.7', '当前展示版本为 0.4.7');
   check(currentCode > publishedVersionCode,
       'versionCode $currentCode 严格大于已发布最高值 $publishedVersionCode');
   check(settingsText.contains("appVersion = '$semver'"),
@@ -882,6 +882,68 @@ void main() {
       '原生侧用 ACTION_VIEW 打开深链');
   check(projectFile('tool/click_js_test.js').existsSync(),
       '提供点击脚本的 Node 行为验证');
+
+  // 文件页：分类宫格 + 最近播放 + 单列行，视频不做独立页面。
+  // 数据层的规则单独由 verify_media_meta.dart 跑，这里锁「结构没被改回去」。
+  stdout.writeln('=== 35. 文件页与媒体元数据 ===');
+  final kinds35 = read('lib/services/file_kinds.dart');
+  check(kinds35.contains('ebook') && kinds35.contains('apk'),
+      '类型细分出电子书与安装包');
+  check(kinds35.contains("'.m3u8': LocalFileKind.video"),
+      '.m3u8 归入视频（可播放）');
+  check(kinds35.contains('kPlaylistExts') && kinds35.contains('isPlaylistName'),
+      '清单文件单独识别');
+  final meta35 = read('lib/services/media_meta.dart');
+  check(meta35.contains('parsePlaylistText') && meta35.contains('formatDuration'),
+      '清单解析与时长格式化在纯 Dart 层');
+  check(meta35.contains("startsWith('#EXTM3U')"),
+      '首个非空行必须是 #EXTM3U（防盗链的 HTML 不会被当成清单）');
+  check(meta35.contains('resolutionLabel'), '分辨率档位化');
+  final probe35 = read('lib/services/media_probe.dart');
+  check(probe35.contains("'com.nerelict/media'"), '元数据走独立原生通道');
+  check(probe35.contains('modifiedMs') && probe35.contains('_inflight'),
+      '按 size+mtime 缓存并合并并发探测');
+  check(probe35.contains('_maxSegmentChecks'), '清单分片核对有上限，不阻塞 UI');
+  final activity35 =
+      read('android/app/src/main/kotlin/com/nerelict/nerelict/MainActivity.kt');
+  check(activity35.contains('MEDIA_CHANNEL = "com.nerelict/media"') &&
+          activity35.contains('MediaMetadataRetriever'),
+      '原生用 MediaMetadataRetriever 读时长与分辨率');
+  final files35 = read('lib/ui/files_tab.dart');
+  check(files35.contains('_KindGrid') && files35.contains('kGridKinds'),
+      '分类宫格取代原来的类型 chips');
+  check(!files35.contains('_FilterBar('), '旧的横向筛选条已移除');
+  check(files35.contains('_SearchField') && files35.contains('_showSortSheet'),
+      '搜索与排序入口在页内');
+  check(files35.contains('_enterSelection') && files35.contains('_BatchBar'),
+      '长按进多选、底部批量操作条');
+  check(files35.contains('_showRowMenu') && files35.contains('_FileRow'),
+      '行尾 ⋮ 菜单承载重命名/删除/信息');
+  check(files35.contains('MediaProbe.instance.probe('),
+      '行内元数据懒加载');
+  check(!files35.contains('PlayerPage'), '视频不另开页面，直接走 Nerelict 播放器');
+  check(projectFile('tool/verify_media_meta.dart').existsSync(),
+      '提供文件页数据层的纯 Dart 断言');
+
+  // 删除先落回收站：起因是一次真实的误删，成品视频直接被删掉、无法挽回。
+  stdout.writeln('=== 36. 删除可撤销 ===');
+  final trash36 = read('lib/services/file_trash.dart');
+  check(trash36.contains("dirName = '.trash'"), '回收站目录是 .trash（扫描会跳过）');
+  check(trash36.contains('keepFor') && trash36.contains('days: 7'),
+      '回收站保留 7 天');
+  check(trash36.contains('moveToTrash') && trash36.contains('restore('),
+      '支持移入与还原');
+  check(trash36.contains('_恢复_'), '同名文件还原时不覆盖，改名留痕');
+  final state36 = read('lib/state/app_state.dart');
+  check(state36.contains('FileTrash.moveToTrash('), '删除走回收站');
+  check(state36.contains('return trashed'), '删除返回回收站路径供撤销');
+  check(state36.contains('restoreFromTrash'), '提供撤销还原入口');
+  check(state36.contains('FileManager.delete(path)'),
+      '回收站搬不动时退回硬删，不让「删除」点了没反应');
+  check(state36.contains('purgeExpired'), '过期回收站会被清理');
+  final files36 = read('lib/ui/files_tab.dart');
+  check(files36.contains("label: '撤销'"), '删除后给一次撤销机会');
+  check(files36.contains('restoreFromTrash'), '撤销接到状态层');
 
   // 下载被 Cloudflare 挡下的两层原因：Cookie 读不到（可能 HttpOnly）与请求特征不像浏览器。
   // 方案见 docs/download-auth-and-challenge.md，这里锁住「实现别走偏」：

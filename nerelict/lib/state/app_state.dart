@@ -17,6 +17,7 @@ import '../services/download_store.dart';
 import '../services/favorites.dart';
 import '../services/file_manager.dart';
 import '../services/hls_downloader.dart';
+import '../services/file_trash.dart';
 import '../services/hls_parser.dart' show HlsMasterPlaylist;
 import '../services/header_policy.dart';
 import '../services/cookie_store.dart';
@@ -367,7 +368,14 @@ class AppState extends ChangeNotifier {
   bool _lastScanIncomplete = false;
   bool get lastScanIncomplete => _lastScanIncomplete;
 
+  bool _trashPurged = false;
+
   Future<void> refreshLocalFiles() async {
+    // 每次进程生命周期里清一次过期回收站：删除先落 .trash，保留 7 天
+    if (!_trashPurged) {
+      _trashPurged = true;
+      unawaited(FileTrash.purgeExpired());
+    }
     final seq = ++_scanSeq;
     final scan = await scanLocalFilesDetailed();
     if (_disposed || seq != _scanSeq) return;
@@ -410,22 +418,33 @@ class AppState extends ChangeNotifier {
   }
 
   /// 删除单个成品文件（文件管理面板的单条操作）。
-  Future<void> deleteDownloadedFile(String path) =>
+  Future<List<String>> deleteDownloadedFile(String path) =>
       deleteDownloadedFiles(<String>[path]);
 
   /// 批量删除（文件管理多选）：文件、任务引用、进度记忆、收藏与列表
   /// 一次性同步；单个文件失败不阻塞其余文件，最后把第一个错误抛给界面。
-  Future<void> deleteDownloadedFiles(Iterable<String> paths) async {
+  ///
+  /// 文件先移进回收站（`<下载目录>/.trash/`，保留 7 天），返回回收站路径，
+  /// 界面据此提供「撤销」。只有回收站搬不动时才退回硬删——宁可少一次撤销，
+  /// 也不能让「删除」点了没反应。
+  Future<List<String>> deleteDownloadedFiles(Iterable<String> paths) async {
     final targets = paths.where((e) => e.trim().isNotEmpty).toSet().toList();
-    if (targets.isEmpty) return;
+    if (targets.isEmpty) return <String>[];
+    final trashed = <String>[];
 
     FileManagerException? firstError;
     for (final path in targets) {
-      try {
-        await FileManager.delete(path);
-      } on FileManagerException catch (e) {
-        firstError ??= e;
-        continue;
+      final moved = await FileTrash.moveToTrash(path);
+      if (moved != null) {
+        trashed.add(moved);
+      } else {
+        // 回收站搬不动（跨卷、权限、文件已不在）：退回原来的硬删路径
+        try {
+          await FileManager.delete(path);
+        } on FileManagerException catch (e) {
+          firstError ??= e;
+          continue;
+        }
       }
       // 若某个已完成任务因此没有任何文件，则一并移除，
       // 避免留下「已完成 / 可播放」但文件不存在的状态不一致条目。
@@ -455,6 +474,18 @@ class AppState extends ChangeNotifier {
     await refreshLocalFiles();
     _persistNow();
     if (firstError != null) throw firstError;
+    return trashed;
+  }
+
+  /// 撤销删除：把回收站里的条目还原回下载目录。
+  Future<int> restoreFromTrash(Iterable<String> trashPaths) async {
+    var restored = 0;
+    for (final path in trashPaths) {
+      final back = await FileTrash.restore(path);
+      if (back != null) restored++;
+    }
+    if (restored > 0) await refreshLocalFiles();
+    return restored;
   }
 
   Future<void> _syncFileSideStores(String oldPath, String? nextPath) async {

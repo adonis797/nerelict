@@ -54,6 +54,7 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 | `verify_v35.dart` | 主回归脚本，安装能力、版本号、文案、常量与第 N 节分块断言 |
 | `verify_paths.dart` | `app_paths.dart` 路径层边界（配置缺失 / 相对 / 绝对 / 穿越 / 回退 / 端口） |
 | `verify_browser_headers.dart` | 回源请求的浏览器等效头（`Sec-Fetch-*` 推导、不覆盖 UA/Cookie/Range）+ 403 诊断三种情况不混 |
+| `verify_media_meta.dart` | 文件页数据层：分类宫格覆盖、`.m3u8` 认作清单、清单解析、时长/分辨率文案、元数据缓存序列化 |
 | `verify_playback.dart` | 播放代理链路：302 回源、最终 URI、m3u8 改写、MIME、缓存键 |
 | `verify_p0.dart` | 重定向 base、直播标记、续传不串片、直链 `If-Range` |
 | `verify_p1.dart` | `ss_*` 残留清理、直链背压写盘、中途暂停状态收敛 |
@@ -94,7 +95,7 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
   `verify_v35.dart` 第 23 节会扫描并阻止回归。
 - **状态管理用 `provider` + `ChangeNotifier`**（`lib/state/` 下 `AppState` / `SettingsState` / `HistoryState` / `WebFavoritesState`），不引入其他状态库。
 - **JS 注入脚本与 Dart 通信走 `JavaScriptChannel`**：`SniffChannel`（嗅探）、`PlayerChannel`（可播放视频探测与接管）、`FloatChannel`（网页 `<video>` 长按浮标）。三个脚本各自包一层 `fetch` / `XHR` / `media src`，链式调用必须互不干扰。
-- **原生能力走 `MethodChannel`，两端名字必须同步改**：`com.nerelict/mp4`、`com.nerelict/storage`、`com.nerelict/player`、`com.nerelict/screen`、`com.nerelict/install`、`com.nerelict/network`、`com.nerelict/cookie`、`com.nerelict/external`。Dart 端在 `lib/services/*.dart`，Kotlin 端在 `MainActivity.kt` 注册。
+- **原生能力走 `MethodChannel`，两端名字必须同步改**：`com.nerelict/mp4`、`com.nerelict/storage`、`com.nerelict/player`、`com.nerelict/screen`、`com.nerelict/install`、`com.nerelict/network`、`com.nerelict/cookie`、`com.nerelict/external`、`com.nerelict/media`。Dart 端在 `lib/services/*.dart`，Kotlin 端在 `MainActivity.kt` 注册。
 - **回源请求的身份要一致**：UA 统一读 `UserAgent.current`（WebView 建好后采纳真实 UA），
   浏览器等效头统一走 `lib/services/browser_headers.dart`。下载器与播放代理必须用同一份，
   否则同一个地址在站点眼里是两个客户端——这就是 0.4.4 之前「能播不能下」的根因。

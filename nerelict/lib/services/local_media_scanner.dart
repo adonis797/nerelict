@@ -38,6 +38,9 @@ class LocalFile {
 
   bool get isMp4 => extension == '.mp4';
 
+  /// 是不是 HLS/DASH 清单：它能播，但没有时长与分辨率，元信息另算。
+  bool get isPlaylist => kPlaylistExts.contains(extension);
+
   /// 具体类型文案：优先给已知扩展名一个更准确的名字
   String get typeLabel {
     final ext = extension;
@@ -49,13 +52,18 @@ class LocalFile {
       '.mov' => 'MOV 视频',
       '.flv' => 'FLV 视频',
       '.avi' => 'AVI 视频',
+      // 清单文件不是媒体本身，单独给个名字，避免被当成「一个 12 KB 的视频」
+      '.m3u8' => 'HLS 清单',
+      '.mpd' => 'DASH 清单',
       '.mp3' => 'MP3 音频',
       '.m4a' => 'M4A 音频',
       '.flac' => 'FLAC 音频',
       '.wav' => 'WAV 音频',
       '.pdf' => 'PDF 文档',
       '.txt' || '.md' => '文本文件',
+      '.epub' || '.mobi' || '.azw3' || '.fb2' => '电子书',
       '.zip' || '.rar' || '.7z' => '压缩包',
+      '.apk' || '.apks' || '.xapk' => 'APK 安装包',
       '' => kind.label,
       _ => ext.substring(1).toUpperCase(),
     };
