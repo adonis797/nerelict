@@ -83,6 +83,16 @@ class _PlayerPanelState extends State<PlayerPanel> {
   bool _controlsVisible = true;
   bool _usingProxy = false;
 
+  /// 本次播放是否已经因代理失败而放弃代理（避免失败后原地重试死循环）。
+  bool _proxyDisabled = false;
+
+  /// 已经证明「走 Dart 代理会失败」的 host。
+  ///
+  /// 有些站点按 TLS / HTTP 栈识别客户端：ExoPlayer 直连能过，dart:io 发同样的头却被拒。
+  /// 一旦某个 host 在代理上失败过，下次直接直连，不再让它白失败一次
+  /// ——否则「开了边下边播缓存」就等于「这个站播不了」。
+  static final Set<String> _proxyBlockedHosts = <String>{};
+
   String? _hint;
   String? _subtitleName;
   Duration? _seekTarget;
@@ -170,9 +180,12 @@ class _PlayerPanelState extends State<PlayerPanel> {
       // 分片组合成的播放列表本身就是本机代理地址，再包一层只是白跑一遍，
       // 还会把已经带好的 Referer 二次编码。
       final alreadyLocal = _source.url.startsWith('http://127.0.0.1:');
+      final sourceHost = Uri.tryParse(_source.url)?.host.toLowerCase() ?? '';
       if (_settings.playerStreamingCache &&
           !_source.local &&
           !alreadyLocal &&
+          !_proxyDisabled &&
+          !_proxyBlockedHosts.contains(sourceHost) &&
           _source.kind == MediaKind.hls) {
         try {
           playbackUrl = await StreamingProxy.instance.playbackUrl(_source);
@@ -272,6 +285,18 @@ class _PlayerPanelState extends State<PlayerPanel> {
   /// 直接甩到界面上，用户既看不懂也不知道下一步做什么。
   void _fail(String message) {
     if (!mounted) return;
+    // 代理失败先别急着报错：这个域的 Dart 侧可能被拦（站点按 TLS 指纹识别客户端），
+    // 而 ExoPlayer 直连是通的。自动换直连再试一次，别让「开缓存」变成「播不了」。
+    if (_usingProxy && !_proxyDisabled) {
+      final host = Uri.tryParse(_source.url)?.host.toLowerCase() ?? '';
+      if (host.isNotEmpty) _proxyBlockedHosts.add(host);
+      logD('Player', 'proxy failed, retry direct: $message');
+      _proxyDisabled = true;
+      _usingProxy = false;
+      _error = null;
+      _retry();
+      return;
+    }
     logD('Player', 'fail: $message');
     var friendly = playbackErrorSummary(message);
     // 播放内核只会甩一句 Source error，真正的原因在代理那一层：

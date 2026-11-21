@@ -29,6 +29,8 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 
 class MainActivity : FlutterActivity() {
 
@@ -43,6 +45,7 @@ class MainActivity : FlutterActivity() {
         private const val EXTERNAL_CHANNEL = "com.nerelict/external"
         private const val MEDIA_CHANNEL = "com.nerelict/media"
         private const val WEBPROBE_CHANNEL = "com.nerelict/webprobe"
+        private const val NATIVE_HTTP_CHANNEL = "com.nerelict/nativehttp"
         private const val REQ_PICK_DIR = 1001
         private const val REQ_PICK_APK = 1002
     }
@@ -63,6 +66,7 @@ class MainActivity : FlutterActivity() {
         configureExternalChannel(flutterEngine)
         configureMediaChannel(flutterEngine)
         configureWebProbeChannel(flutterEngine)
+        configureNativeHttpChannel(flutterEngine)
     }
 
     /**
@@ -125,6 +129,71 @@ class MainActivity : FlutterActivity() {
                             // 没有能处理该 scheme 的应用（ActivityNotFoundException）
                             result.success(false)
                         }
+                    }
+
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    /**
+     * 用 Android 自带的 HTTP 栈取字节。
+     *
+     * 为什么需要：有些站点按 TLS / HTTP 栈识别客户端。同一个地址、同样只剩
+     * `UA` + `Referer`，ExoPlayer 直连能过，而 Dart 的 `dart:io` 被拦（实测某站点
+     * HLS 关掉「边下边播缓存」能播、开启后走 Dart 代理就 403）。
+     * `HttpURLConnection` 与 ExoPlayer 用的是同一层 TLS 实现，因此下载改走这里。
+     *
+     * 只做最小转发：调用方给什么头就发什么头，不猜、不补。
+     */
+    private fun configureNativeHttpChannel(flutterEngine: FlutterEngine) {
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, NATIVE_HTTP_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "fetch" -> {
+                        val url = call.argument<String>("url")
+                        if (url.isNullOrEmpty()) {
+                            result.success(null)
+                            return@setMethodCallHandler
+                        }
+                        val headers = call.argument<Map<String, String>>("headers")
+                            ?: emptyMap()
+                        val range = call.argument<String>("range")
+                        // 网络请求必须离开主线程
+                        Thread {
+                            var conn: HttpURLConnection? = null
+                            try {
+                                conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                                    connectTimeout = 20_000
+                                    readTimeout = 40_000
+                                    instanceFollowRedirects = true
+                                    requestMethod = "GET"
+                                    headers.forEach { (k, v) -> setRequestProperty(k, v) }
+                                    if (!range.isNullOrEmpty()) setRequestProperty("Range", range)
+                                }
+                                val code = conn.responseCode
+                                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                                val bytes = stream?.use { it.readBytes() } ?: ByteArray(0)
+                                val finalUrl = conn.url?.toString() ?: url
+                                runOnUiThread {
+                                    result.success(
+                                        mapOf(
+                                            "status" to code,
+                                            "bytes" to bytes,
+                                            "url" to finalUrl,
+                                        )
+                                    )
+                                }
+                            } catch (e: Exception) {
+                                Log.i("NerelictHttp", "fetch failed: " + e.javaClass.simpleName)
+                                runOnUiThread { result.success(null) }
+                            } finally {
+                                try {
+                                    conn?.disconnect()
+                                } catch (_: Exception) {
+                                }
+                            }
+                        }.start()
                     }
 
                     else -> result.notImplemented()

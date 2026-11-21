@@ -30,6 +30,7 @@ class HlsDownloader {
     this.resolveCookie,
     this.invalidateCookie,
     this.captureProbe,
+    this.nativeFetch,
   })  : dio = dio ??
             Dio(BaseOptions(
               connectTimeout: const Duration(seconds: 20),
@@ -128,6 +129,16 @@ class HlsDownloader {
 
   /// 已经降级过头的 host：提示里要说明「这招试过了」。
   final Set<String> _minimalTriedHosts = <String>{};
+
+  /// 用 Android 自带 HTTP 栈取字节（与 ExoPlayer 同一条链路）。
+  ///
+  /// 有些站点按 TLS / HTTP 栈识别客户端：同样的头，ExoPlayer 能过、`dart:io` 被拒。
+  /// 注入方式是回调，保持本模块纯 Dart；主机端验证脚本传 null 即可。
+  final Future<({int status, Uint8List bytes, String url})?> Function(
+    String url,
+    Map<String, String> headers,
+    String? range,
+  )? nativeFetch;
 
   /// 代取失败的说明（按 host 存）：直接进错误提示。
   ///
@@ -907,9 +918,45 @@ class HlsDownloader {
       // 依据：同一个地址、同样只剩 UA + Referer 的头，播放代理（`StreamingProxy`
       // 用的就是 HttpClient）能取到，Dio 却一直 403。差异只可能在客户端本身
       // （连接复用、头处理）。这里直接复用「已经跑通」的那套实现，不再调整头。
-      final alt = await _fetchTextViaClient(url, referer);
+      final alt = await _fetchTextFallback(url, referer);
       if (alt != null) return alt;
       rethrow;
+    }
+  }
+
+  /// 最小请求头：只有 UA 与 Referer，与播放器直连时发的一致。
+  Map<String, String> _minimalHeaders(String? referer) => <String, String>{
+        'User-Agent': UserAgent.current,
+        if (referer != null && referer.isNotEmpty) 'Referer': referer,
+      };
+
+  /// 兜底取文本：先走 Android 原生栈，再退回 dart:io。
+  Future<({String body, Uri uri})?> _fetchTextFallback(
+    String url,
+    String? referer,
+  ) async {
+    final headers = _minimalHeaders(referer);
+    final native = await _tryNative(url, headers, null);
+    if (native != null) {
+      if (native.status < 200 || native.status >= 300) return null;
+      final body = utf8.decode(native.bytes, allowMalformed: true);
+      if (!body.trimLeft().startsWith('#EXTM3U')) return null;
+      return (body: body, uri: Uri.parse(native.url));
+    }
+    return _fetchTextViaClient(url, referer);
+  }
+
+  Future<({int status, Uint8List bytes, String url})?> _tryNative(
+    String url,
+    Map<String, String> headers,
+    String? range,
+  ) async {
+    final fn = nativeFetch;
+    if (fn == null) return null;
+    try {
+      return await fn(url, headers, range);
+    } catch (_) {
+      return null;
     }
   }
 
@@ -996,10 +1043,30 @@ class HlsDownloader {
     return bytes;
     } catch (_) {
       // 分片同理：清单能过、分片却 403 时也走代理同款客户端
-      final alt = await _fetchBytesViaClient(url, referer, range);
+      final alt = await _fetchBytesFallback(url, referer, range);
       if (alt != null) return alt;
       rethrow;
     }
+  }
+
+  /// 兜底取字节：先走 Android 原生栈，再退回 dart:io。
+  Future<Uint8List?> _fetchBytesFallback(
+    String url,
+    String? referer,
+    ({int offset, int length})? range,
+  ) async {
+    final headers = _minimalHeaders(referer);
+    final rangeHeader = range == null
+        ? null
+        : 'bytes=${range.offset}-${range.offset + range.length - 1}';
+    final native = await _tryNative(url, headers, rangeHeader);
+    if (native != null) {
+      if (native.status < 200 || native.status >= 300) return null;
+      if (native.bytes.isEmpty) return null;
+      if (range != null && native.bytes.length != range.length) return null;
+      return native.bytes;
+    }
+    return _fetchBytesViaClient(url, referer, range);
   }
 
   /// 用播放代理同款客户端取字节（含 Range）。

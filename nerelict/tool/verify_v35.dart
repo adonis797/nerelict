@@ -208,13 +208,13 @@ void main() {
 
   stdout.writeln('=== 9. 版本号与二级设置 ===');
   final pubspec = read('pubspec.yaml');
-  check(pubspec.contains('version: 0.4.11+31'), 'pubspec 基础版本为 0.4.11 / code 31');
+  check(pubspec.contains('version: 0.4.12+32'), 'pubspec 基础版本为 0.4.12 / code 32');
   final gradle = read('android/app/build.gradle.kts');
   check(gradle.contains('versionName = flutter.versionName'),
       '展示版本统一取 pubspec 三段版本');
   check(!gradle.contains('versionName = "0.3.9.0"'), '不再覆盖第四段展示版本');
   final settingsFile = read('lib/ui/settings_tab.dart');
-  check(settingsFile.contains("appVersion = '0.4.11'"), '设置页版本为 0.4.11');
+  check(settingsFile.contains("appVersion = '0.4.12'"), '设置页版本为 0.4.12');
   check(read('README.md').contains('v0.4.4'), 'README 版本号已同步');
   check(settingsFile.contains('_CategoryTile'), '设置改为分类入口');
   check(settingsFile.contains('_SettingsPage'), '存在二级设置页');
@@ -491,7 +491,7 @@ void main() {
       .firstMatch(pubspecText);
   final semver = versionLine?.group(1) ?? '';
   final currentCode = int.tryParse(versionLine?.group(2) ?? '') ?? 0;
-  check(semver == '0.4.11', '当前展示版本为 0.4.11');
+  check(semver == '0.4.12', '当前展示版本为 0.4.12');
   check(currentCode > publishedVersionCode,
       'versionCode $currentCode 严格大于已发布最高值 $publishedVersionCode');
   check(settingsText.contains("appVersion = '$semver'"),
@@ -1044,6 +1044,29 @@ void main() {
   check(altIdx > 0, 'Dio 失败后才走兜底，不改变正常路径');
   check(activity37.contains('window.__nr'),
       'fetch 结果写到 window 上（evaluateJavascript 对 Promise 只回 {}）');
+
+  // 用户实测：关掉「边下边播缓存」时 HLS 直连能播，开启后改走 Dart 代理就播不了。
+  // 说明站点按 TLS / HTTP 栈识别客户端：ExoPlayer（Android 栈）能过，dart:io 被拒。
+  check(activity37.contains('NATIVE_HTTP_CHANNEL = "com.nerelict/nativehttp"'),
+      '原生提供 Android HTTP 栈的取字节通道');
+  check(activity37.contains('HttpURLConnection'), '用与 ExoPlayer 同层的 HttpURLConnection');
+  check(read('lib/services/native_http.dart').contains("'com.nerelict/nativehttp'"),
+      '两端通道名一致');
+  check(hd38.contains('nativeFetch') && hd38.contains('_fetchTextFallback'),
+      '下载兜底优先走原生栈');
+  final nativeIdx = hd38.indexOf('_tryNative(url, headers, null)');
+  final clientIdx = hd38.indexOf('_fetchTextViaClient(url, referer);');
+  check(nativeIdx > 0 && clientIdx > 0 && nativeIdx < clientIdx,
+      '先原生、再 dart:io（顺序反了就还在用被拦的那条）');
+  check(read('lib/state/app_state.dart').contains('NativeHttp.fetch'),
+      '状态层把原生取字节接到下载器');
+
+  // 代理失败不能直接报错：换个客户端就播不了，等于「开缓存」=「这个站废了」。
+  final pp38 = read('lib/ui/player_page.dart');
+  check(pp38.contains('_proxyDisabled') && pp38.contains('_proxyBlockedHosts'),
+      '代理失败时记住 host，并允许本次改直连');
+  check(pp38.contains('proxy failed, retry direct'),
+      '代理失败自动换直连重试，而不是直接甩错误');
   // 直链以前完全没有重试：被挑战只能直接失败，必须补一条「补凭证后重试」。
   check(hd38.contains('Future<Response<ResponseBody>> start()'),
       '直链下载抽出可重试的请求');
