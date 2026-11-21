@@ -774,6 +774,9 @@ class _BrowserTabState extends State<BrowserTab> {
 
   /// 系统返回：先回退网页，退无可退时回首页；首页交还给 HomeScreen 处理。
   Future<bool> _handleSystemBack() async {
+    // 拦截器是全局注册的：不在「浏览器」页时不要抢返回，
+    // 否则在文件页按返回会去导航那个看不见的网页
+    if (_state.tabIndex != 0) return false;
     if (!_hasPage) return false;
     if (_canGoBack) {
       await _controller.goBack();

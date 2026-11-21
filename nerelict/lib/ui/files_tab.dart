@@ -8,6 +8,7 @@ import '../services/local_media_scanner.dart';
 import '../services/media_meta.dart';
 import '../services/media_probe.dart';
 import '../services/playback_memory.dart';
+import '../services/storage_access.dart';
 import '../state/app_state.dart';
 import 'app_theme.dart';
 import 'download_tasks_page.dart';
@@ -31,7 +32,7 @@ class FilesTab extends StatefulWidget {
   State<FilesTab> createState() => _FilesTabState();
 }
 
-class _FilesTabState extends State<FilesTab> {
+class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
   late final AppState _app;
   PlaybackRecord? _resume;
 
@@ -47,11 +48,28 @@ class _FilesTabState extends State<FilesTab> {
   bool _selecting = false;
   final Set<String> _selected = <String>{};
 
+  /// 当前浏览的目录；null 表示「下载目录」（由 AppState 统一维护）
+  String? _dir;
+
+  /// 外部目录的条目（下载目录走 AppState.localFiles）
+  List<LocalFile> _entries = const <LocalFile>[];
+  bool _scanning = false;
+  String? _externalRoot;
+  bool _allFilesOk = false;
+
+  /// 是否允许增删改：只有自家下载目录可以，别处只做浏览与播放。
+  ///
+  /// 这不是偷懒——在系统任意目录上放开 delete/rename，一次误触就是别人的照片没了；
+  /// 先把「看得见、播得了」做扎实，写操作等有明确需求再放开。
+  bool get _canManage => _dir == null;
+
   @override
   void initState() {
     super.initState();
     _app = context.read<AppState>();
     _app.addBackInterceptor(_handleSystemBack);
+    WidgetsBinding.instance.addObserver(this);
+    _refreshAccess();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _app.refreshLocalFiles();
@@ -62,6 +80,7 @@ class _FilesTabState extends State<FilesTab> {
   @override
   void dispose() {
     _app.removeBackInterceptor(_handleSystemBack);
+    WidgetsBinding.instance.removeObserver(this);
     _searchCtrl.dispose();
     _searchFocus.dispose();
     super.dispose();
@@ -69,6 +88,7 @@ class _FilesTabState extends State<FilesTab> {
 
   /// 系统返回的优先级：退多选 → 退搜索 → 退筛选 → 交给 HomeScreen。
   Future<bool> _handleSystemBack() async {
+    if (_app.tabIndex != 1) return false;
     if (_selecting) {
       _clearSelection();
       return true;
@@ -78,9 +98,93 @@ class _FilesTabState extends State<FilesTab> {
       setState(() => _query = '');
       return true;
     }
+    if (_dir != null) {
+      _leaveDir();
+      return true;
+    }
     if (_filter == null) return false;
     setState(() => _filter = null);
     return true;
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 用户去系统设置开权限、或从别的应用回来：重新查一次，开好了立刻可用
+    if (state == AppLifecycleState.resumed) _refreshAccess();
+  }
+
+  Future<void> _refreshAccess() async {
+    final ok = await StorageAccess.hasAllFilesAccess();
+    final root = ok ? await StorageAccess.externalRoot() : null;
+    if (!mounted) return;
+    if (ok != _allFilesOk || root != _externalRoot) {
+      setState(() {
+        _allFilesOk = ok;
+        _externalRoot = root;
+      });
+    }
+  }
+
+  Future<void> _requestAccess() async {
+    final opened = await StorageAccess.openSettings();
+    if (!mounted) return;
+    if (!opened) {
+      _app.showHint('请在系统设置里找到「所有文件访问权限」并允许');
+      return;
+    }
+    // 设置页回来后由 didChangeAppLifecycleState 重新检查
+  }
+
+  Future<void> _enterDir(String path) async {
+    setState(() {
+      _dir = path;
+      _entries = const <LocalFile>[];
+      _scanning = true;
+      _filter = null;
+      _clearSelection();
+    });
+    final scan = await scanDirectory(path);
+    if (!mounted || _dir != path) return;
+    setState(() {
+      _entries = scan.files;
+      _scanning = false;
+    });
+  }
+
+  /// 菜单里的「浏览内部存储」：没授权就先引导，有授权就进根目录。
+  Future<void> _browseStorage() async {
+    if (!_allFilesOk) {
+      await _requestAccess();
+      return;
+    }
+    final root = _externalRoot ?? await StorageAccess.externalRoot();
+    if (!mounted) return;
+    if (root == null) {
+      _app.showHint('拿不到内部存储目录，请重新授权');
+      return;
+    }
+    await _enterDir(root);
+  }
+
+  /// 上一级；已经到内部存储根就退回下载目录。
+  void _leaveDir() {
+    final current = _dir;
+    if (current == null) return;
+    final root = _externalRoot;
+    final parent = current.substring(0, current.lastIndexOf(Platform.pathSeparator));
+    if (root == null ||
+        current == root ||
+        parent.isEmpty ||
+        parent.length < root.length) {
+      setState(() {
+        _dir = null;
+        _entries = const <LocalFile>[];
+        _scanning = false;
+      });
+      _app.refreshLocalFiles();
+      return;
+    }
+    _enterDir(parent);
   }
 
   Future<void> _loadResume() async {
@@ -125,6 +229,10 @@ class _FilesTabState extends State<FilesTab> {
   void _openFile(LocalFile file) {
     if (_selecting) {
       _toggleSelect(file.path);
+      return;
+    }
+    if (file.isDir) {
+      _enterDir(file.path);
       return;
     }
     if (file.isPlayable) {
@@ -262,7 +370,7 @@ class _FilesTabState extends State<FilesTab> {
                 _openFile(file);
               },
             ),
-            if (canConvert)
+            if (canConvert && _canManage)
               ListTile(
                 leading: const Icon(Icons.movie_creation_outlined, size: 20),
                 title: const Text('转成 MP4', style: TextStyle(fontSize: 13.5)),
@@ -270,6 +378,14 @@ class _FilesTabState extends State<FilesTab> {
                   Navigator.of(ctx).pop();
                   showMp4ConvertSheet(context);
                 },
+              ),
+            if (!_canManage)
+              ListTile(
+                leading: const Icon(Icons.lock_outline, size: 20),
+                title: Text(
+                  '此目录只读：重命名与删除仅对下载目录开放',
+                  style: TextStyle(fontSize: 12, color: p.textFaint),
+                ),
               ),
             ListTile(
               leading: const Icon(Icons.info_outline, size: 20),
@@ -283,31 +399,34 @@ class _FilesTabState extends State<FilesTab> {
                 );
               },
             ),
-            ListTile(
-              leading: const Icon(Icons.drive_file_rename_outline, size: 20),
-              title: const Text('重命名', style: TextStyle(fontSize: 13.5)),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                _renameFile(file);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.checklist, size: 20),
-              title: const Text('选择', style: TextStyle(fontSize: 13.5)),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                _enterSelection(file.path);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.delete_outline, size: 20, color: kDanger),
-              title: const Text('删除',
-                  style: TextStyle(fontSize: 13.5, color: kDanger)),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                _deleteFiles(<LocalFile>[file]);
-              },
-            ),
+            if (_canManage) ...<Widget>[
+              ListTile(
+                leading: const Icon(Icons.drive_file_rename_outline, size: 20),
+                title: const Text('重命名', style: TextStyle(fontSize: 13.5)),
+                onTap: () {
+                  Navigator.of(ctx).pop();
+                  _renameFile(file);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.checklist, size: 20),
+                title: const Text('选择', style: TextStyle(fontSize: 13.5)),
+                onTap: () {
+                  Navigator.of(ctx).pop();
+                  _enterSelection(file.path);
+                },
+              ),
+              ListTile(
+                leading:
+                    const Icon(Icons.delete_outline, size: 20, color: kDanger),
+                title: const Text('删除',
+                    style: TextStyle(fontSize: 13.5, color: kDanger)),
+                onTap: () {
+                  Navigator.of(ctx).pop();
+                  _deleteFiles(<LocalFile>[file]);
+                },
+              ),
+            ],
           ],
         ),
       ),
@@ -397,7 +516,7 @@ class _FilesTabState extends State<FilesTab> {
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
     final p = paletteOf(context);
-    final files = state.localFiles;
+    final files = _dir == null ? state.localFiles : _entries;
     final visible = _visibleFiles(files);
 
     // 缓存只为仍然存在的文件保留，避免删改后越积越多
@@ -426,6 +545,10 @@ class _FilesTabState extends State<FilesTab> {
             onChanged: (v) => setState(() => _query = v),
             p: p,
           ),
+          if (_dir != null)
+            _Breadcrumb(dir: _dir!, root: _externalRoot, onUp: _leaveDir, p: p)
+          else if (!_allFilesOk)
+            _AccessCard(p: p, onGrant: _requestAccess),
           _KindGrid(
             counts: counts,
             total: files.length,
@@ -436,18 +559,43 @@ class _FilesTabState extends State<FilesTab> {
             p: p,
           ),
           if (!_selecting &&
+              _dir == null &&
               _filter == null &&
               _query.isEmpty &&
               _resume != null)
             _RecentSection(record: _resume!, p: p, onOpen: _openResume),
           _ListHeader(
+            title: _dir == null ? '全部文件' : '当前文件夹',
             count: visible.length,
             sortLabel: _sortLabel,
             onSort: () => _showSortSheet(p),
             p: p,
           ),
           Expanded(
-            child: files.isEmpty
+            child: _scanning
+                ? Center(
+                    child: SizedBox(
+                      width: 22,
+                      height: 22,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: p.accent),
+                    ),
+                  )
+                : files.isEmpty && _dir != null
+                    ? Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: <Widget>[
+                            Icon(Icons.folder_open_outlined,
+                                size: 44, color: p.textDisabled),
+                            const SizedBox(height: 10),
+                            Text('这个文件夹是空的',
+                                style: TextStyle(
+                                    fontSize: 12.5, color: p.textFaint)),
+                          ],
+                        ),
+                      )
+                : files.isEmpty
                 ? _EmptyState(
                     p: p,
                     hasTasks: state.tasks.isNotEmpty,
@@ -475,7 +623,7 @@ class _FilesTabState extends State<FilesTab> {
           ),
         ],
       ),
-      bottomNavigationBar: _selecting
+      bottomNavigationBar: _selecting && _canManage
           ? _BatchBar(
               count: _selected.length,
               onDelete: () => _deleteFiles(
@@ -519,14 +667,32 @@ class _FilesTabState extends State<FilesTab> {
               case 'downloads':
                 _openDownloads();
                 break;
+              case 'browse':
+                _browseStorage();
+                break;
+              case 'home':
+                setState(() {
+                  _dir = null;
+                  _entries = const <LocalFile>[];
+                });
+                state.refreshLocalFiles();
+                break;
             }
           },
-          itemBuilder: (_) => const <PopupMenuEntry<String>>[
-            PopupMenuItem<String>(value: 'sort', child: Text('排序方式')),
-            PopupMenuItem<String>(value: 'select', child: Text('批量选择')),
-            PopupMenuItem<String>(value: 'scan', child: Text('重新扫描')),
-            PopupMenuItem<String>(value: 'convert', child: Text('MP4 转换')),
-            PopupMenuItem<String>(value: 'downloads', child: Text('下载管理')),
+          itemBuilder: (_) => <PopupMenuEntry<String>>[
+            const PopupMenuItem<String>(value: 'sort', child: Text('排序方式')),
+            if (_canManage)
+              const PopupMenuItem<String>(value: 'select', child: Text('批量选择')),
+            const PopupMenuItem<String>(value: 'scan', child: Text('重新扫描')),
+            const PopupMenuItem<String>(value: 'convert', child: Text('MP4 转换')),
+            const PopupMenuItem<String>(value: 'downloads', child: Text('下载管理')),
+            if (_dir == null)
+              PopupMenuItem<String>(
+                value: 'browse',
+                child: Text(_allFilesOk ? '浏览内部存储' : '浏览内部存储（需授权）'),
+              )
+            else
+              const PopupMenuItem<String>(value: 'home', child: Text('回到下载目录')),
           ],
         ),
       ],
@@ -589,6 +755,112 @@ String _relativeDate(DateTime t) {
   }
   return '${t.year}-${t.month.toString().padLeft(2, '0')}-'
       '${t.day.toString().padLeft(2, '0')}';
+}
+
+/// 面包屑：只在浏览外部目录时出现，用来知道「我在哪」并能一级级退回。
+class _Breadcrumb extends StatelessWidget {
+  const _Breadcrumb({
+    required this.dir,
+    required this.root,
+    required this.onUp,
+    required this.p,
+  });
+
+  final String dir;
+  final String? root;
+  final VoidCallback onUp;
+  final AppPalette p;
+
+  @override
+  Widget build(BuildContext context) {
+    final base = root ?? '';
+    var tail = dir;
+    if (base.isNotEmpty && dir.startsWith(base)) {
+      tail = dir.substring(base.length);
+    }
+    final parts = tail
+        .split(Platform.pathSeparator)
+        .where((e) => e.isNotEmpty)
+        .toList();
+    final label = parts.isEmpty ? '内部存储' : '内部存储 / ${parts.join(' / ')}';
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(10, 2, 10, 6),
+      child: Row(
+        children: <Widget>[
+          InkWell(
+            onTap: onUp,
+            borderRadius: BorderRadius.circular(8),
+            child: Padding(
+              padding: const EdgeInsets.all(4),
+              child: Icon(Icons.arrow_upward, size: 16, color: p.textSub),
+            ),
+          ),
+          const SizedBox(width: 2),
+          Expanded(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11.5, color: p.textFaint),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 未授权时的引导卡：说清楚「为什么需要」和「开了能得到什么」，而不是只弹一个按钮。
+class _AccessCard extends StatelessWidget {
+  const _AccessCard({required this.p, required this.onGrant});
+
+  final AppPalette p;
+  final VoidCallback onGrant;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+      padding: const EdgeInsets.fromLTRB(12, 10, 10, 10),
+      decoration: BoxDecoration(
+        color: p.surface,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: p.border),
+      ),
+      child: Row(
+        children: <Widget>[
+          Icon(Icons.folder_shared_outlined, size: 18, color: p.accent),
+          const SizedBox(width: 9),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  '浏览整个手机存储',
+                  style: TextStyle(fontSize: 12.5, color: p.text),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '需要「所有文件访问权限」，开启后可查看、播放任意目录里的文件',
+                  style: TextStyle(fontSize: 11, color: p.textFaint),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 6),
+          TextButton(
+            onPressed: onGrant,
+            style: TextButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+            ),
+            child: const Text('去授权', style: TextStyle(fontSize: 12)),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 /// 搜索框：常驻但不抢眼，输入即过滤。
@@ -858,12 +1130,14 @@ class _RecentSection extends StatelessWidget {
 
 class _ListHeader extends StatelessWidget {
   const _ListHeader({
+    required this.title,
     required this.count,
     required this.sortLabel,
     required this.onSort,
     required this.p,
   });
 
+  final String title;
   final int count;
   final String sortLabel;
   final VoidCallback onSort;
@@ -876,7 +1150,7 @@ class _ListHeader extends StatelessWidget {
       child: Row(
         children: <Widget>[
           Text(
-            '全部文件',
+            title,
             style: TextStyle(
               fontSize: 12.5,
               fontWeight: FontWeight.w600,
@@ -985,7 +1259,8 @@ class _FileRowState extends State<_FileRow> {
     final parts = <String>[file.typeLabel];
     final inline = meta?.inlineInfo ?? '';
     if (inline.isNotEmpty) parts.add(inline);
-    parts.add(file.sizeText);
+    // 目录没有「大小」，别显示成一个破折号
+    if (!file.isDir) parts.add(file.sizeText);
     parts.add(_relativeDate(file.modifiedAt));
     final subtitle = parts.join(' · ');
 

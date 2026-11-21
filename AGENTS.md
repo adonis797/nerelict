@@ -128,7 +128,9 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 
 ## 已知限制与踩坑记录
 
-- 真机截图是缩放图（1080x2400 设备截图常见为 483x1080），**点击坐标要按比例换算**，否则会点错行。
+- 真机截图在预览里是缩放图（1080x2400 设备截图显示为 483x1080），**不要靠目测换算坐标**：
+  一律先 `adb shell uiautomator dump /sdcard/ui.xml` 拉下来读 `bounds`，再点。
+  目测换算会偏几十到上百像素，轻则点空，重则点到相邻控件——本项目曾因此误删用户的一个成品视频。
 - vivo 百度输入法会把 `adb shell input text` 的 ASCII 当拼音；可临时 `ime disable` / `ime enable` 恢复，用完必须还原。
 - `adb reverse` 不跨命令持久，需与设备操作放在同一条命令里；PC 侧访问 `adb forward` 端口要加 `--noproxy '*'`。
 - Git Bash 会把设备侧 `/sdcard/...` 转成 Windows 路径，涉及设备路径的操作改用 PowerShell。

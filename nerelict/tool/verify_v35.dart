@@ -345,7 +345,8 @@ void main() {
       projectFile('lib/ui/files_tab.dart').existsSync() &&
           !projectFile('lib/ui/downloads_tab.dart').existsSync(),
       '下载页拆分为文件页 + 下载分支');
-  check(filesTab.contains('final files = state.localFiles'), '文件页直接使用扫描到的文件');
+  check(filesTab.contains('_dir == null ? state.localFiles : _entries'),
+      '文件页按当前目录取数据源（下载目录 / 外部目录）');
   check(!filesTab.contains('knownPaths'), '不再排除已完成任务引用的文件（修复文件不显示）');
   check(filesTab.contains('DownloadTasksPage'), '顶部菜单可进入下载分支');
   check(!filesTab.contains('cleaning_services_outlined'), '文件页顶部不再放清理扫把');
@@ -944,6 +945,52 @@ void main() {
   final files36 = read('lib/ui/files_tab.dart');
   check(files36.contains("label: '撤销'"), '删除后给一次撤销机会');
   check(files36.contains('restoreFromTrash'), '撤销接到状态层');
+
+  // 浏览整个内部存储：Android 11+ 只能靠「所有文件访问权限」，且必须用户手动开。
+  stdout.writeln('=== 37. 全盘浏览（所有文件访问权限） ===');
+  final manifest37 = read('android/app/src/main/AndroidManifest.xml');
+  check(manifest37.contains('MANAGE_EXTERNAL_STORAGE'),
+      '声明所有文件访问权限');
+  final activity37 =
+      read('android/app/src/main/kotlin/com/nerelict/nerelict/MainActivity.kt');
+  check(activity37.contains('isExternalStorageManager'),
+      '原生按 isExternalStorageManager 判断授权');
+  check(activity37.contains('ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION') &&
+          activity37.contains('ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION'),
+      '跳转到授权页，并对缺失该页的 ROM 兜底');
+  check(activity37.contains('getExternalStorageDirectory'),
+      '能给出内部存储根路径');
+  final access37 = read('lib/services/storage_access.dart');
+  check(access37.contains('hasAllFilesAccess') && access37.contains('openSettings'),
+      'Dart 侧封装检查与跳转');
+  final scanner37 = read('lib/services/local_media_scanner.dart');
+  check(scanner37.contains('scanDirectory(') && scanner37.contains('includeDirs'),
+      '扫描支持任意目录与目录条目');
+  check(scanner37.contains('isDir'), '目录是单独的条目类型');
+  final files37 = read('lib/ui/files_tab.dart');
+  check(files37.contains('_enterDir') && files37.contains('_leaveDir'),
+      '能进子目录并能退回上级');
+  check(files37.contains('_Breadcrumb'), '面包屑说明当前位置');
+  check(files37.contains('_AccessCard') && files37.contains('_requestAccess'),
+      '未授权时给出引导卡');
+  check(files37.contains('didChangeAppLifecycleState'),
+      '回到前台重新检查授权（系统设置里开完即生效）');
+  check(files37.contains('bool get _canManage => _dir == null'),
+      '下载目录之外只读：别处不开放删除与重命名');
+  check(files37.contains('此目录只读'), '只读目录在菜单里说明原因');
+  // 返回键必须先把「页面自己的子状态」问一遍，再切标签：
+  // 以前 main.dart 先无条件 setTab(0)，文件页的退多选/退目录永远轮不到。
+  final main37 = read('lib/main.dart');
+  final backIdx = main37.indexOf('await state.handleBack()');
+  final tabIdx = main37.indexOf('state.setTab(0)');
+  check(backIdx > 0 && tabIdx > 0 && backIdx < tabIdx,
+      '返回键先问页面状态，再退回浏览器标签');
+  check(files37.contains('if (!file.isDir) parts.add(file.sizeText)'),
+      '目录行不显示大小');
+  // 拦截器全局注册，必须各自判断「我是不是当前页」，否则会互相抢返回
+  check(files37.contains('_app.tabIndex != 1'), '文件页只在自己那页处理返回');
+  check(read('lib/ui/browser_tab.dart').contains('_state.tabIndex != 0'),
+      '浏览器页只在自己那页处理返回');
 
   // 下载被 Cloudflare 挡下的两层原因：Cookie 读不到（可能 HttpOnly）与请求特征不像浏览器。
   // 方案见 docs/download-auth-and-challenge.md，这里锁住「实现别走偏」：

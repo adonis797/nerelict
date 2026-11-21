@@ -8,9 +8,12 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.DocumentsContract
+import android.provider.Settings
 import android.provider.OpenableColumns
 import android.view.WindowManager
 import android.webkit.CookieManager
@@ -456,9 +459,56 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "pickDirectory" -> pickDirectory(result)
                     "exportFile" -> exportFile(call, result)
+                    "allFilesAccess" -> result.success(hasAllFilesAccess())
+                    "openAllFilesSettings" -> result.success(openAllFilesSettings())
+                    "externalRoot" -> result.success(
+                        Environment.getExternalStorageDirectory()?.absolutePath
+                    )
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    /**
+     * 「所有文件访问权限」是否已授予。
+     *
+     * Android 11+ 用 `Environment.isExternalStorageManager()` 判断；
+     * 低版本没有这个限制，恒为 true。
+     */
+    private fun hasAllFilesAccess(): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                Environment.isExternalStorageManager()
+            } catch (_: Exception) {
+                false
+            }
+        } else {
+            true
+        }
+
+    /**
+     * 跳到系统的「所有文件访问权限」开关。
+     *
+     * 先试应用自己的那一页，部分国产 ROM 没有实现，退回通用列表页；
+     * 都打不开就返回 false，由 Dart 侧提示手动去找。
+     */
+    private fun openAllFilesSettings(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return true
+        val direct = Intent(
+            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+            Uri.parse("package:$packageName")
+        )
+        try {
+            startActivity(direct)
+            return true
+        } catch (_: Exception) {
+        }
+        return try {
+            startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun pickDirectory(result: MethodChannel.Result) {

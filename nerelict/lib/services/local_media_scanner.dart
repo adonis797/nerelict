@@ -15,6 +15,7 @@ class LocalFile {
     required this.size,
     required this.modifiedAt,
     required this.kind,
+    this.isDir = false,
   });
 
   final String path;
@@ -22,6 +23,9 @@ class LocalFile {
   final int size;
   final DateTime modifiedAt;
   final LocalFileKind kind;
+
+  /// 目录条目。目录没有大小与类型，但仍然要显示、要能进去。
+  final bool isDir;
 
   String get extension {
     final dot = name.lastIndexOf('.');
@@ -34,7 +38,7 @@ class LocalFile {
   }
 
   /// 只有视频能在 Nerelict 里直接播放；其他类型走文件管理（信息 / 重命名 / 删除）
-  bool get isPlayable => kind == LocalFileKind.video;
+  bool get isPlayable => !isDir && kind == LocalFileKind.video;
 
   bool get isMp4 => extension == '.mp4';
 
@@ -43,6 +47,7 @@ class LocalFile {
 
   /// 具体类型文案：优先给已知扩展名一个更准确的名字
   String get typeLabel {
+    if (isDir) return '文件夹';
     final ext = extension;
     return switch (ext) {
       '.mp4' || '.m4v' => 'MP4 视频',
@@ -115,19 +120,46 @@ class LocalFileScanResult {
 /// 与 [scanLocalFiles] 的区别：出错时不吞掉异常，而是明确返回
 /// [LocalFileScanResult.complete] = false，让上层决定保留旧列表。
 Future<LocalFileScanResult> scanLocalFilesDetailed() async {
+  final dir = await appDownloadDir();
+  // 下载目录只列文件：它是「产物目录」，有自己的分类宫格，不需要再进子目录
+  return scanDirectory(dir.path, includeDirs: false);
+}
+
+/// 扫描任意目录（一层）。给「浏览内部存储」用。
+///
+/// 与下载目录扫描共用同一套规则：跳过隐藏项与 `.part` / `.tmp` 半成品，
+/// 空文件跳过（多半是下载失败留下的），目录按 [includeDirs] 决定要不要列。
+/// 排序统一「目录在前、其余按修改时间倒序」，和系统文件管理器一致。
+Future<LocalFileScanResult> scanDirectory(
+  String path, {
+  bool includeDirs = true,
+}) async {
   final result = <LocalFile>[];
   final seen = <String>{};
   var errors = 0;
   try {
-    final dir = await appDownloadDir();
+    final dir = Directory(path);
     if (await dir.exists()) {
       await for (final entity in dir.list(followLinks: false)) {
         try {
-          if (entity is! File) continue;
           final name = entity.path.split(Platform.pathSeparator).last;
           if (name.startsWith('.')) continue;
           if (name.endsWith('.part') || name.endsWith('.tmp')) continue;
           if (!seen.add(entity.path)) continue;
+          if (entity is Directory) {
+            if (!includeDirs) continue;
+            final stat = await entity.stat();
+            result.add(LocalFile(
+              path: entity.path,
+              name: name,
+              size: 0,
+              modifiedAt: stat.modified,
+              kind: LocalFileKind.other,
+              isDir: true,
+            ));
+            continue;
+          }
+          if (entity is! File) continue;
           final stat = await entity.stat();
           if (stat.size <= 0) continue;
           result.add(LocalFile(
@@ -143,7 +175,10 @@ Future<LocalFileScanResult> scanLocalFilesDetailed() async {
         }
       }
     }
-    result.sort((a, b) => b.modifiedAt.compareTo(a.modifiedAt));
+    result.sort((a, b) {
+      if (a.isDir != b.isDir) return a.isDir ? -1 : 1;
+      return b.modifiedAt.compareTo(a.modifiedAt);
+    });
     return LocalFileScanResult(
         files: result, complete: errors == 0, errors: errors);
   } catch (_) {

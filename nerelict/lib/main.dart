@@ -528,11 +528,13 @@ class _HomeScreenState extends State<HomeScreen> {
       }
       return;
     }
+    // 页面自己的返回优先级优先：退多选、退搜索、退到上一级目录……
+    // 以前先无条件切回「浏览器」标签，导致文件页这些状态根本轮不到处理。
+    if (await state.handleBack()) return;
     if (state.tabIndex != 0) {
       state.setTab(0);
       return;
     }
-    if (await state.handleBack()) return;
 
     final now = DateTime.now();
     if (_lastBackAt != null &&
