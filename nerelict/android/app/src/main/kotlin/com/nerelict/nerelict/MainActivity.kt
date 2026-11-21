@@ -15,6 +15,7 @@ import android.os.Looper
 import android.provider.DocumentsContract
 import android.provider.Settings
 import android.provider.OpenableColumns
+import android.util.Log
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.CookieManager
@@ -165,10 +166,18 @@ class MainActivity : FlutterActivity() {
     ) {
         var finished = false
         var webView: WebView? = null
+        var seenRequests = 0
+        var sawCookie = false
+        var fetched = false
+
+        fun log(msg: String) {
+            Log.d("NerelictProbe", msg)
+        }
 
         fun finish(payload: Map<String, String>?) {
             if (finished) return
             finished = true
+            log("finish requests=$seenRequests cookie=$sawCookie payload=${payload != null}")
             try {
                 webView?.let { wv ->
                     wv.stopLoading()
@@ -181,14 +190,30 @@ class MainActivity : FlutterActivity() {
             result.success(payload)
         }
 
+        fun startFetch(wv: WebView) {
+            if (fetched) return
+            fetched = true
+            // 主框架导航拿不到完整请求头（Cookie 常被略去），
+            // 用页面内 fetch 触发一次**子资源**请求，那里才有 Cookie。
+            val quoted = org.json.JSONObject.quote(url)
+            val js = "fetch($quoted,{credentials:'include',cache:'no-store'})" +
+                ".then(function(r){return r.text()})" +
+                ".then(function(t){return 'ok:'+t.length})" +
+                ".catch(function(e){return 'err:'+e})"
+            log("startFetch $url")
+            wv.evaluateJavascript(js) { value -> log("fetchResult=$value") }
+        }
+
         try {
-            val host = Uri.parse(url).host ?: ""
+            val target = Uri.parse(url)
+            val host = target.host ?: ""
+            val originRoot = "${target.scheme}://$host/"
             val wv = WebView(this)
             webView = wv
             wv.settings.javaScriptEnabled = true
             // 不要图片：我们要的是请求头，不是页面内容
             wv.settings.blockNetworkImage = true
-            wv.settings.cacheMode = WebSettings.LOAD_DEFAULT
+            wv.settings.cacheMode = WebSettings.LOAD_NO_CACHE
             if (!ua.isNullOrEmpty()) wv.settings.userAgentString = ua
             wv.webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(
@@ -196,19 +221,43 @@ class MainActivity : FlutterActivity() {
                     request: WebResourceRequest?,
                 ): WebResourceResponse? {
                     val req = request ?: return null
-                    val target = req.url ?: return null
+                    val reqUrl = req.url ?: return null
                     // 只认目标主机：跳转到登录页之类的不参与
-                    if (host.isNotEmpty() && target.host != host) return null
+                    if (host.isNotEmpty() && reqUrl.host != host) return null
+                    seenRequests++
                     val headers = req.requestHeaders ?: emptyMap()
-                    finish(HashMap(headers))
-                    // 自己不取正文，交给 WebView 决定；反正很快就 destroy
+                    val cookieKey = headers.keys.firstOrNull {
+                        it.equals("Cookie", ignoreCase = true)
+                    }
+                    log("req #$seenRequests ${reqUrl.path} headers=${headers.size} cookie=${cookieKey != null}")
+                    if (cookieKey != null) {
+                        sawCookie = true
+                        val payload = HashMap(headers)
+                        payload["__probeRequests"] = seenRequests.toString()
+                        finish(payload)
+                        return null
+                    }
                     return null
+                }
+
+                override fun onPageFinished(view: WebView?, pageUrl: String?) {
+                    super.onPageFinished(view, pageUrl)
+                    log("onPageFinished $pageUrl")
+                    if (view != null) startFetch(view)
                 }
             }
             // 必须挂到窗口里才会真正发请求：1x1、不可见、不占布局
             val root = findViewById<ViewGroup>(android.R.id.content)
             root.addView(wv, ViewGroup.LayoutParams(1, 1))
-            wv.loadUrl(url)
+            log("load $originRoot")
+            wv.loadUrl(originRoot)
+            // 根页若是挑战页、脚本跑不起来，退一步直接加载目标地址再试
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (!finished && !sawCookie) {
+                    log("fallback load target")
+                    webView?.loadUrl(url)
+                }
+            }, 5_000)
             Handler(Looper.getMainLooper()).postDelayed({ finish(null) }, 12_000)
         } catch (_: Exception) {
             finish(null)

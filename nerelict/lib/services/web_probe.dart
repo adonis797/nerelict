@@ -1,5 +1,7 @@
 import 'package:flutter/services.dart';
 
+import 'app_log.dart';
+
 /// 用 WebView 上下文代取一次请求头。
 ///
 /// 为什么必须这么做：Cloudflare 的 `cf_clearance` 带 `HttpOnly`，
@@ -42,8 +44,15 @@ class WebProbe {
       if (raw == null) return null;
       final out = <String, String>{};
       raw.forEach((k, v) {
-        if (k is String && v != null) out[k] = v.toString();
+        if (k is! String || v == null) return;
+        // `__probe*` 是原生附带的诊断字段，不是真实请求头
+        if (k.startsWith('__')) return;
+        out[k] = v.toString();
       });
+      final requests = raw['__probeRequests'];
+      final hasCookie = out.keys.any((k) => k.toLowerCase() == 'cookie');
+      logD('WebProbe',
+          'requests=${requests ?? '-'} headers=${out.length} cookie=$hasCookie');
       return out.isEmpty ? null : out;
     } on MissingPluginException {
       // 主机端脚本 / 旧原生层没有这个通道
