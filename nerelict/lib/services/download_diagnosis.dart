@@ -84,6 +84,8 @@ AuthFailureReport describeAuthFailure({
   bool captureGotCookie = false,
   String captureNote = '',
   bool minimalTried = false,
+  /// 这次实际发出去的头名字（不含值）。用来证明「精简模式」到底精简了什么。
+  String headerNames = '',
   bool crossHost = false,
 }) {
   if (cookieSent) {
@@ -126,9 +128,28 @@ AuthFailureReport describeAuthFailure({
   }
 
   if (crossHost) {
+    // 跨域是最容易被误读的一种：一味说「要按该域单独取凭证」，会让用户以为
+    // 还没试过。这里把「试过什么」逐项摊开，下一步做什么才不重复。
+    final tried = <String>[];
+    if (minimalTried) {
+      final where = headerNames.isEmpty ? '' : '（实际只发了 $headerNames）';
+      tried.add('已改用与播放器相同的最小请求头$where重试');
+    }
+    if (captureTried) {
+      tried.add(captureGotCookie
+          ? '已按该域代取到凭证但仍被拒'
+          : '已按该域代取过凭证但没取到${captureNote.isEmpty ? '' : '：$captureNote'}');
+    }
+    final head = '分片在独立域名上，页面的登录态带不过去';
+    if (tried.isEmpty) {
+      return AuthFailureReport(
+        'Cookie 未取到（该域 0 项，且与当前页面不同域）',
+        '$head：这类站点要按该域单独取凭证',
+      );
+    }
     return AuthFailureReport(
       'Cookie 未取到（该域 0 项，且与当前页面不同域）',
-      '分片在独立域名上，页面的登录态带不过去：这类站点要按该域单独取凭证',
+      '$head；${tried.join('，')}。该域自己有一道验证，只能在该域上过一次再下',
     );
   }
 

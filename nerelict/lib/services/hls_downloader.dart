@@ -38,9 +38,11 @@ class HlsDownloader {
               followRedirects: true,
               maxRedirects: 8,
               responseType: ResponseType.bytes,
+              // 这里只放兜底 UA。**不要**再塞 `Accept`：它会被合并进每一个请求，
+              // 让「精简模式」（对齐播放器的那套头）名不副实——播放代理从不发 Accept，
+              // 下载却发了，站点的 WAF 一眼就能分出这两个客户端。
               headers: {
                 'User-Agent': UserAgent.kFallback,
-                'Accept': '*/*',
               },
             ));
 
@@ -69,6 +71,12 @@ class HlsDownloader {
   /// 只认这个头：`server: cloudflare` 太宽——任何挂在 Cloudflare 后面的站点
   /// 普通防盗链 403 都会带它，据此判定「人机验证」会误导排查方向。
   bool _lastCfMitigated = false;
+
+  /// 最近一次请求**实际**带的头名字（不含值）。
+  ///
+  /// 「已经用最小头了为什么还被拒」这种问题，唯一可信的证据是实际发出去的东西。
+  /// 这台 ROM 会过滤第三方日志，所以把它带进错误提示，而不是只在日志里。
+  String _lastHeaderNames = '';
 
   /// 最近一次出站请求的地址。
   ///
@@ -800,6 +808,7 @@ class HlsDownloader {
       _lastCookieCount = 0;
       _lastClearanceSent = null;
       _minimalTriedHosts.add(reqHost);
+      _lastHeaderNames = _headerNamesOf(headers);
       return headers;
     }
     // 每次都显式带上当前 UA：BaseOptions 里的是构造时的兜底值，
@@ -831,7 +840,14 @@ class HlsDownloader {
     } catch (_) {
       // 平台通道不可用（如主机验证脚本未注入）时按匿名请求处理
     }
+    _lastHeaderNames = _headerNamesOf(headers);
     return headers;
+  }
+
+  /// 头名字列表（小写、排序、不含值）：给错误提示用，不泄露内容。
+  String _headerNamesOf(Map<String, dynamic> headers) {
+    final names = headers.keys.map((e) => e.toLowerCase()).toList()..sort();
+    return names.join(', ');
   }
 
   /// 数 Cookie 条数。
@@ -1181,6 +1197,7 @@ class HlsDownloader {
               captureTried: _captureTriedHosts.contains(host.toLowerCase()),
               captureNote: _captureNotes[host.toLowerCase()] ?? '',
               minimalTried: _minimalTriedHosts.contains(host.toLowerCase()),
+              headerNames: _lastHeaderNames,
               captureGotCookie:
                   _captureGotCookieHosts.contains(host.toLowerCase()),
               crossHost: crossHost,

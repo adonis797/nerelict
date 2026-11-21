@@ -217,6 +217,37 @@ void main() {
       '跨域不指向 HttpOnly（页面读数不适用于该域）');
   check(crossHostReport.hint.contains('单独取凭证'), '跨域给的是「按该域单独取凭证」');
 
+  // 跨域最容易误读：一味说「要按该域单独取凭证」，会让人以为还没试过。
+  // 试过什么要摊开说，否则用户只能重复同一步。
+  final crossTried = describeAuthFailure(
+    cookieSent: false,
+    cookieCount: 0,
+    pageCookieLength: null,
+    challenged: true,
+    crossHost: true,
+    minimalTried: true,
+    headerNames: 'referer, user-agent',
+  );
+  check(crossTried.hint.contains('referer, user-agent'),
+      '提示里带上实际请求头名字（证明精简模式到底发了什么）');
+  check(crossTried.hint != crossHostReport.hint, '试过与没试过文案不同');
+  check(!crossTried.hint.contains('这类站点要按该域单独取凭证'),
+      '已经试过就不要再劝一次「去取凭证」');
+
+  final crossCapture = describeAuthFailure(
+    cookieSent: false,
+    cookieCount: 0,
+    pageCookieLength: null,
+    challenged: true,
+    crossHost: true,
+    captureTried: true,
+    captureNote: '隐藏页面连续 6 轮共 12 个请求都没带 Cookie',
+  );
+  check(crossCapture.hint.contains('已按该域代取过'),
+      '跨域下代取过要说出来');
+  check(crossCapture.hint.contains('连续 6 轮'),
+      '代取失败的原因原样带出来');
+
   stdout.writeln('=== 4. HttpOnly 判定与探针 ===');
   check(
       looksHttpOnlyOnly(cookieSent: false, pageCookieLength: 10) == true,

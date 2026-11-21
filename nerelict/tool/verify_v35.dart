@@ -208,13 +208,13 @@ void main() {
 
   stdout.writeln('=== 9. 版本号与二级设置 ===');
   final pubspec = read('pubspec.yaml');
-  check(pubspec.contains('version: 0.4.8+28'), 'pubspec 基础版本为 0.4.8 / code 28');
+  check(pubspec.contains('version: 0.4.9+29'), 'pubspec 基础版本为 0.4.9 / code 29');
   final gradle = read('android/app/build.gradle.kts');
   check(gradle.contains('versionName = flutter.versionName'),
       '展示版本统一取 pubspec 三段版本');
   check(!gradle.contains('versionName = "0.3.9.0"'), '不再覆盖第四段展示版本');
   final settingsFile = read('lib/ui/settings_tab.dart');
-  check(settingsFile.contains("appVersion = '0.4.8'"), '设置页版本为 0.4.8');
+  check(settingsFile.contains("appVersion = '0.4.9'"), '设置页版本为 0.4.9');
   check(read('README.md').contains('v0.4.4'), 'README 版本号已同步');
   check(settingsFile.contains('_CategoryTile'), '设置改为分类入口');
   check(settingsFile.contains('_SettingsPage'), '存在二级设置页');
@@ -491,7 +491,7 @@ void main() {
       .firstMatch(pubspecText);
   final semver = versionLine?.group(1) ?? '';
   final currentCode = int.tryParse(versionLine?.group(2) ?? '') ?? 0;
-  check(semver == '0.4.8', '当前展示版本为 0.4.8');
+  check(semver == '0.4.9', '当前展示版本为 0.4.9');
   check(currentCode > publishedVersionCode,
       'versionCode $currentCode 严格大于已发布最高值 $publishedVersionCode');
   check(settingsText.contains("appVersion = '$semver'"),
@@ -994,7 +994,12 @@ void main() {
           activity37.contains('requestHeaders'),
       '从真实出站请求头里取 Cookie');
   check(activity37.contains('wv.destroy()'), '抓到或超时都销毁 WebView');
-  check(activity37.contains('12_000'), '代取有 12 秒超时，不死等');
+  check(activity37.contains('14_000'), '代取有整体超时，不死等');
+  // 人机验证常是「先给挑战页、几秒后自动跳回」：只 fetch 一次正好撞在挑战页上，
+  // 所以要一轮轮重试。
+  check(activity37.contains('fetchLoop') && activity37.contains('postDelayed(this'),
+      '代取每 2 秒重试一次 fetch，给挑战页留出自动通过的窗口');
+  check(activity37.contains('__probeFetches'), '回传一共试了几轮，区分「试过多次」与「只来得及一次」');
   // 这台 ROM 会过滤第三方应用的 Log.d——用 Log.i，并且**诊断必须回传给界面**，
   // 否则「为什么没抓到」只能靠用户描述。
   check(!activity37.contains('Log.d("NerelictProbe"'),
@@ -1065,6 +1070,12 @@ void main() {
       '403 先降级到播放器的最小请求头');
   check(hd34.contains('_minimalTriedHosts.add(reqHost)'),
       '精简模式只给 UA + Referer，不写 Cookie');
+  // Dio 的 BaseOptions 会合并进每个请求：那里还留着 `Accept: */*` 的话，
+  // 「精简模式」其实是 UA + Referer + Accept，跟播放代理并不一致。
+  check(!hd34.contains("'Accept': '*/*'"),
+      'BaseOptions 不再兜底带 Accept（否则精简模式名不副实）');
+  check(hd34.contains('_lastHeaderNames') && hd34.contains('_headerNamesOf'),
+      '记录本次实际发出的头名字，并带进错误提示');
   // 「server 含 cloudflare 就算被挑战」是误判来源：普通防盗链 403 也会带这个头
   check(!hd34.contains("server.contains('cloudflare')"),
       '不再把 server: cloudflare 当成被挑战');

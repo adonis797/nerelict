@@ -8,6 +8,7 @@ class WebProbeResult {
     required this.requests,
     required this.withCookie,
     required this.pages,
+    this.fetches = 0,
     this.error,
   });
 
@@ -22,6 +23,10 @@ class WebProbeResult {
 
   /// 加载完成的页面数：0 说明根页根本没打开（多半被同一套验证挡住）
   final int pages;
+
+  /// 一共发了几轮页面内 fetch。人机验证常是「先给挑战页、几秒后自动跳回」，
+  /// 所以是一轮轮试，[fetches] 用来区分「试过多次都不行」和「只来得及试一次」。
+  final int fetches;
 
   /// 原生侧异常信息
   final String? error;
@@ -45,7 +50,10 @@ class WebProbeResult {
     if (err != null && err.isNotEmpty) return '隐藏页面出错：$err';
     if (pages == 0) return '隐藏页面没打开（0 个页面加载完成）';
     if (requests == 0) return '隐藏页面打开后没发出任何请求';
-    if (withCookie == 0) return '隐藏页面的 $requests 个请求都没带 Cookie';
+    if (withCookie == 0) {
+      final times = fetches > 0 ? '连续 $fetches 轮' : '';
+      return '隐藏页面$times共 $requests 个请求都没带 Cookie';
+    }
     if (cookie == null) return '请求带了 Cookie 头但内容为空';
     return '隐藏页面 $requests 个请求里有 $withCookie 个带 Cookie';
   }

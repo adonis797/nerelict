@@ -169,8 +169,11 @@ class MainActivity : FlutterActivity() {
         var seenRequests = 0
         var reqsWithCookie = 0
         var pagesLoaded = 0
-        var fetched = false
+        var fetchRounds = 0
+        var loopStarted = false
         var errorText: String? = null
+
+        val main = Handler(Looper.getMainLooper())
 
         // 用 Log.i 而不是 Log.d：部分 ROM（含实测这台）会过滤第三方应用的 debug 日志
         fun log(msg: String) {
@@ -181,12 +184,13 @@ class MainActivity : FlutterActivity() {
         fun finish(headers: Map<String, String>?) {
             if (finished) return
             finished = true
-            log("finish req=$seenRequests withCookie=$reqsWithCookie pages=$pagesLoaded")
+            log("finish req=$seenRequests withCookie=$reqsWithCookie pages=$pagesLoaded fetches=$fetchRounds")
             val payload = HashMap<String, String>()
             headers?.let { payload.putAll(it) }
             payload["__probeRequests"] = seenRequests.toString()
             payload["__probeWithCookie"] = reqsWithCookie.toString()
             payload["__probePages"] = pagesLoaded.toString()
+            payload["__probeFetches"] = fetchRounds.toString()
             if (!errorText.isNullOrEmpty()) payload["__probeError"] = errorText!!
             try {
                 webView?.let { wv ->
@@ -200,17 +204,38 @@ class MainActivity : FlutterActivity() {
             result.success(payload)
         }
 
-        fun startFetch(wv: WebView) {
-            if (fetched) return
-            fetched = true
-            // 主框架导航拿不到完整请求头（Cookie 常被略去），
-            // 用页面内 fetch 触发一次**子资源**请求，那里才有 Cookie。
+        /**
+         * 发一次页面内 fetch。
+         *
+         * 主框架导航拿不到完整请求头（Cookie 常被略去），子资源请求才有；
+         * 另一点是**要允许重复发**：人机验证常常是「页面先显示挑战、几秒后
+         * 自动跳回」，只在 onPageFinished 那一刻发一次，正好撞在挑战页上。
+         */
+        fun startFetch(wv: WebView, round: Int) {
+            fetchRounds = round
             val quoted = org.json.JSONObject.quote(url)
             val js = "fetch($quoted,{credentials:'include',cache:'no-store'})" +
                 ".then(function(r){return 'ok:'+r.status})" +
                 ".catch(function(e){return 'err:'+e})"
-            log("startFetch")
-            wv.evaluateJavascript(js) { value -> log("fetchResult=$value") }
+            log("fetch #$round")
+            wv.evaluateJavascript(js) { value -> log("fetch#$round -> $value") }
+        }
+
+        /** 每 2 秒重试一次 fetch，给挑战页留出自动通过的时间窗。 */
+        val fetchLoop = object : Runnable {
+            override fun run() {
+                if (finished) return
+                if (fetchRounds >= 6) return
+                val wvm = webView ?: return
+                startFetch(wvm, fetchRounds + 1)
+                main.postDelayed(this, 2_000)
+            }
+        }
+
+        fun kickLoop() {
+            if (loopStarted) return
+            loopStarted = true
+            main.postDelayed(fetchLoop, 2_000)
         }
 
         try {
@@ -249,20 +274,22 @@ class MainActivity : FlutterActivity() {
                     super.onPageFinished(view, pageUrl)
                     pagesLoaded++
                     log("onPageFinished #$pagesLoaded")
-                    if (view != null) startFetch(view)
+                    // 先来一轮，之后交给轮询
+                    if (view != null && fetchRounds == 0) startFetch(view, 1)
+                    kickLoop()
                 }
             }
             val root = findViewById<ViewGroup>(android.R.id.content)
             root.addView(wv, ViewGroup.LayoutParams(1, 1))
             log("load $originRoot")
             wv.loadUrl(originRoot)
-            Handler(Looper.getMainLooper()).postDelayed({
+            main.postDelayed({
                 if (!finished && reqsWithCookie == 0) {
                     log("fallback load target")
                     webView?.loadUrl(url)
                 }
             }, 5_000)
-            Handler(Looper.getMainLooper()).postDelayed({ finish(null) }, 12_000)
+            main.postDelayed({ finish(null) }, 14_000)
         } catch (e: Exception) {
             errorText = e.message ?: e.javaClass.simpleName
             finish(null)

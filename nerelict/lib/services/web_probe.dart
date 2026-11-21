@@ -38,6 +38,7 @@ class WebProbe {
       var requests = 0;
       var withCookie = 0;
       var pages = 0;
+      var fetches = 0;
       String? error;
       raw.forEach((k, v) {
         if (k is! String || v == null) return;
@@ -53,6 +54,9 @@ class WebProbe {
           case '__probePages':
             pages = int.tryParse(value) ?? 0;
             break;
+          case '__probeFetches':
+            fetches = int.tryParse(value) ?? 0;
+            break;
           case '__probeError':
             error = value;
             break;
@@ -66,10 +70,12 @@ class WebProbe {
         requests: requests,
         withCookie: withCookie,
         pages: pages,
+        fetches: fetches,
         error: error,
       );
       logD('WebProbe',
-          'req=$requests cookie=$withCookie pages=$pages has=${result.cookie != null}');
+          'req=$requests cookie=$withCookie pages=$pages fetches=$fetches '
+          'has=${result.cookie != null}');
       return result;
     } on MissingPluginException {
       // 主机端脚本 / 旧原生层没有这个通道
