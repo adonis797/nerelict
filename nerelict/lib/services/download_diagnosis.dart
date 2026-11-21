@@ -83,6 +83,7 @@ AuthFailureReport describeAuthFailure({
   bool captureTried = false,
   bool captureGotCookie = false,
   String captureNote = '',
+  bool minimalTried = false,
   bool crossHost = false,
 }) {
   if (cookieSent) {
@@ -115,7 +116,13 @@ AuthFailureReport describeAuthFailure({
         '通行证已带上仍被判为自动化：属于 TLS / HTTP2 指纹差异，换 Cookie 或加头都无效',
       );
     }
-    return AuthFailureReport(label, '仍被拒，多半是来源页校验或链接签名已过期');
+    return AuthFailureReport(
+      label,
+      minimalTried
+          ? '已改用与播放器相同的精简请求头（仅 UA + Referer）重试仍被拒：'
+              '多半是签名已过期，或该地址不接受下载请求'
+          : '仍被拒，多半是来源页校验或链接签名已过期',
+    );
   }
 
   if (crossHost) {

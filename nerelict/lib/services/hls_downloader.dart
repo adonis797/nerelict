@@ -64,11 +64,10 @@ class HlsDownloader {
   /// 只存布尔：判断「缺凭证」还是「有凭证仍被拒」，是两条完全不同的修法。
   bool? _lastClearanceSent;
 
-  /// 最近一次响应的 `server` 与 `cf-mitigated`。
+  /// 最近一次响应是否带 `cf-mitigated`。
   ///
-  /// 单看 403 分不出「来源页校验」和「人机验证」，这两个响应头是最直接的线索：
-  /// Cloudflare 挑战会带 `cf-mitigated: challenge`，普通防盗链不会。
-  String _lastServer = '';
+  /// 只认这个头：`server: cloudflare` 太宽——任何挂在 Cloudflare 后面的站点
+  /// 普通防盗链 403 都会带它，据此判定「人机验证」会误导排查方向。
   bool _lastCfMitigated = false;
 
   /// 最近一次出站请求的地址。
@@ -110,6 +109,17 @@ class HlsDownloader {
   /// HttpOnly，唯一的办法是让 WebView 自己发一次请求，读它的真实出站头。
   /// 由调用方注入，主机端验证脚本可传 null。
   final Future<WebProbeResult?> Function(String url)? captureProbe;
+
+  /// 该 host 改用「与播放器相同的最小请求头」重试。
+  ///
+  /// 实测依据：浮层播放器只发 `User-Agent` + `Referer` 就能 200 播，
+  /// 而下载带 Cookie / `Sec-Fetch-*` / `Accept-Language` 却 403。
+  /// 签名直链的 WAF 常把「带 Cookie 的下载」当成非播放器行为拒掉，
+  /// 所以 403 先降级到播放器那套头试一次，比去猜凭证便宜得多。
+  final Set<String> _minimalHosts = <String>{};
+
+  /// 已经降级过头的 host：提示里要说明「这招试过了」。
+  final Set<String> _minimalTriedHosts = <String>{};
 
   /// 代取失败的说明（按 host 存）：直接进错误提示。
   ///
@@ -777,6 +787,21 @@ class HlsDownloader {
     Map<String, String>? extra,
   ]) async {
     final headers = <String, dynamic>{};
+    final reqHost = Uri.tryParse(url)?.host.toLowerCase() ?? '';
+    // 精简模式：对齐播放器（只有 UA + Referer），不写 Cookie、不写浏览器特征头。
+    // 一旦代取到通行证就退出精简模式——那时凭证才是缺的那一环。
+    final minimal = _minimalHosts.contains(reqHost) &&
+        !_clearanceOverrides.containsKey(reqHost);
+    if (minimal) {
+      headers['User-Agent'] = UserAgent.current;
+      if (referer != null && referer.isNotEmpty) headers['Referer'] = referer;
+      if (extra != null && extra.isNotEmpty) headers.addAll(extra);
+      _lastCookiePresent = false;
+      _lastCookieCount = 0;
+      _lastClearanceSent = null;
+      _minimalTriedHosts.add(reqHost);
+      return headers;
+    }
     // 每次都显式带上当前 UA：BaseOptions 里的是构造时的兜底值，
     // WebView 建好后会换成真实 UA，下载器必须跟着变
     headers['User-Agent'] = UserAgent.current;
@@ -1019,19 +1044,21 @@ class HlsDownloader {
   void _onRequestRejected(Object error, String url) {
     if (error is! DioException) return;
     // 先把能说明「为什么被拒」的响应特征留下来，错误文案要用
-    final headers = error.response?.headers;
-    _lastServer = headers?.value('server') ?? '';
-    _lastCfMitigated = headers?.value('cf-mitigated') != null;
+    _lastCfMitigated = error.response?.headers.value('cf-mitigated') != null;
     if (error.response?.statusCode != 403) return;
     invalidateCookie?.call(url);
-    // 带了一堆 Cookie 却没带通行证：值得去 WebView 那边代取一次
+    final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
+    if (host.isEmpty) return;
+    // 第一步先降级到播放器那套最小请求头：这一步最便宜，也最可能直接解决
+    if (!_minimalHosts.contains(host)) {
+      _minimalHosts.add(host);
+      return;
+    }
+    // 已经是精简头还被拒：这才轮到「缺凭证」的假设，去 WebView 代取一次
     final missingClearance = _lastCookiePresent && (_lastClearanceSent == false);
     final noCookieAtAll = !_lastCookiePresent;
     if ((missingClearance || noCookieAtAll) && captureProbe != null) {
-      final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
-      if (host.isNotEmpty && !_clearanceOverrides.containsKey(host)) {
-        _captureTarget = url;
-      }
+      if (!_clearanceOverrides.containsKey(host)) _captureTarget = url;
     }
   }
 
@@ -1101,13 +1128,13 @@ class HlsDownloader {
     // 先用 _onRequestRejected 留下的响应特征：正文可能被截断或换成二进制，
     // 头里的 `cf-mitigated` 是更早、更可靠的证据
     if (_lastCfMitigated) return true;
-    if (_lastServer.toLowerCase().contains('cloudflare')) return true;
     final response = e.response;
     final headers = response?.headers;
     if (headers != null) {
+      // 只看明确的挑战信号。以前「server 含 cloudflare 就算被挑战」是误判：
+      // 任何挂在 Cloudflare 后面的站点，普通防盗链 403 都会带这个头，
+      // 结果把「多带了 Cookie 被拒」误诊成「人机验证」。
       if (headers.value('cf-mitigated') != null) return true;
-      final server = headers.value('server')?.toLowerCase() ?? '';
-      if (server.contains('cloudflare')) return true;
     }
     final snippet = _responseSnippet(response?.data) ?? '';
     if (snippet.contains('Attention Required') ||
@@ -1153,6 +1180,7 @@ class HlsDownloader {
               clearanceSent: _lastClearanceSent,
               captureTried: _captureTriedHosts.contains(host.toLowerCase()),
               captureNote: _captureNotes[host.toLowerCase()] ?? '',
+              minimalTried: _minimalTriedHosts.contains(host.toLowerCase()),
               captureGotCookie:
                   _captureGotCookieHosts.contains(host.toLowerCase()),
               crossHost: crossHost,

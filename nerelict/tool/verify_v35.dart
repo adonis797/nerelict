@@ -1059,6 +1059,16 @@ void main() {
       '记录这次带的 Cookie 里有没有通行证');
   check(read('lib/services/download_diagnosis.dart').contains('kClearanceCookieNames'),
       '通行证名字表集中在诊断模块');
+  // 播放器只发 UA + Referer 就能 200，下载多带 Cookie / Sec-Fetch 却 403：
+  // 403 的第一步应该是「退回播放器那套头」，而不是去猜凭证。
+  check(hd34.contains('_minimalHosts') && hd34.contains('_minimalTriedHosts'),
+      '403 先降级到播放器的最小请求头');
+  check(hd34.contains('_minimalTriedHosts.add(reqHost)'),
+      '精简模式只给 UA + Referer，不写 Cookie');
+  // 「server 含 cloudflare 就算被挑战」是误判来源：普通防盗链 403 也会带这个头
+  check(!hd34.contains("server.contains('cloudflare')"),
+      '不再把 server: cloudflare 当成被挑战');
+  check(hd34.contains("value('cf-mitigated')"), '只认 cf-mitigated 这个明确信号');
   check(read('lib/services/streaming_proxy.dart')
           .contains('browserMediaHeaders(url'),
       '播放代理与下载器共用同一份头');

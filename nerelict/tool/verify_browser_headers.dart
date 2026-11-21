@@ -167,6 +167,15 @@ void main() {
   );
   check(withNote.hint.contains('隐藏页面 5 个请求都没带 Cookie'),
       '代取诊断原样进提示（不用翻日志）');
+  final minimalTried = describeAuthFailure(
+    cookieSent: true,
+    cookieCount: 0,
+    pageCookieLength: 0,
+    challenged: false,
+    minimalTried: true,
+  );
+  check(minimalTried.hint.contains('精简请求头'),
+      '降级到播放器请求头仍被拒时说明「这招试过了」');
   final withPass = describeAuthFailure(
     cookieSent: true,
     cookieCount: 9,
