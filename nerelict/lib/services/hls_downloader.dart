@@ -11,6 +11,7 @@ import 'browser_headers.dart';
 import 'download_diagnosis.dart';
 import 'hls_parser.dart';
 import 'page_cookie_probe.dart';
+import 'web_probe_result.dart';
 import 'user_agent.dart';
 import 'app_paths.dart';
 
@@ -28,7 +29,7 @@ class HlsDownloader {
     this.resolveTempDir,
     this.resolveCookie,
     this.invalidateCookie,
-    this.captureCookie,
+    this.captureProbe,
   })  : dio = dio ??
             Dio(BaseOptions(
               connectTimeout: const Duration(seconds: 20),
@@ -108,7 +109,13 @@ class HlsDownloader {
   /// 只在「403 + 命中人机验证 + 这次没带上通行证」时调用：`CookieManager` 看不到
   /// HttpOnly，唯一的办法是让 WebView 自己发一次请求，读它的真实出站头。
   /// 由调用方注入，主机端验证脚本可传 null。
-  final Future<String?> Function(String url)? captureCookie;
+  final Future<WebProbeResult?> Function(String url)? captureProbe;
+
+  /// 代取失败的说明（按 host 存）：直接进错误提示。
+  ///
+  /// 这台 ROM 会过滤第三方应用的 `Log.d`，靠日志问用户「卡在哪」不现实，
+  /// 所以把诊断写进用户能看到的那句话里。
+  final Map<String, String> _captureNotes = <String, String>{};
 
   /// 代取到的 Cookie，按 host 存，仅本次下载器实例内存活（不落盘、不进任务 JSON）。
   final Map<String, String> _clearanceOverrides = <String, String>{};
@@ -957,14 +964,22 @@ class HlsDownloader {
   Future<void> _captureBeforeRetry() async {
     final target = _captureTarget;
     _captureTarget = null;
-    final capture = captureCookie;
+    final capture = captureProbe;
     if (target == null || capture == null) return;
     final host = Uri.tryParse(target)?.host.toLowerCase() ?? '';
     if (host.isEmpty || _clearanceOverrides.containsKey(host)) return;
     try {
       _captureTriedHosts.add(host);
-      final cookie = await capture(target);
-      if (cookie == null || cookie.trim().isEmpty) return;
+      final probe = await capture(target);
+      if (probe == null) {
+        _captureNotes[host] = '代取通道不可用';
+        return;
+      }
+      final cookie = probe.cookie;
+      if (cookie == null || cookie.trim().isEmpty) {
+        _captureNotes[host] = probe.note;
+        return;
+      }
       _clearanceOverrides[host] = cookie.trim();
       _captureGotCookieHosts.add(host);
     } catch (_) {
@@ -1012,7 +1027,7 @@ class HlsDownloader {
     // 带了一堆 Cookie 却没带通行证：值得去 WebView 那边代取一次
     final missingClearance = _lastCookiePresent && (_lastClearanceSent == false);
     final noCookieAtAll = !_lastCookiePresent;
-    if ((missingClearance || noCookieAtAll) && captureCookie != null) {
+    if ((missingClearance || noCookieAtAll) && captureProbe != null) {
       final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
       if (host.isNotEmpty && !_clearanceOverrides.containsKey(host)) {
         _captureTarget = url;
@@ -1137,6 +1152,7 @@ class HlsDownloader {
               challenged: challenged,
               clearanceSent: _lastClearanceSent,
               captureTried: _captureTriedHosts.contains(host.toLowerCase()),
+              captureNote: _captureNotes[host.toLowerCase()] ?? '',
               captureGotCookie:
                   _captureGotCookieHosts.contains(host.toLowerCase()),
               crossHost: crossHost,

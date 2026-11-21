@@ -51,8 +51,8 @@ class AppState extends ChangeNotifier {
           CookieStore.instance.invalidate(Uri.tryParse(url)?.host),
       // 通行证是 HttpOnly，CookieManager 读不到：让 WebView 自己发一次请求，
       // 从真实出站头里把它取回来（仅本次任务内存里用，不落盘）
-      captureCookie: (url) =>
-          WebProbe.captureCookie(url, userAgent: UserAgent.current),
+      captureProbe: (url) =>
+          WebProbe.capture(url, userAgent: UserAgent.current),
     );
     // 切后台 / 被系统回收前再落盘一次，尽量不丢最后几秒的进度
     _lifecycle = AppLifecycleListener(

@@ -167,17 +167,27 @@ class MainActivity : FlutterActivity() {
         var finished = false
         var webView: WebView? = null
         var seenRequests = 0
-        var sawCookie = false
+        var reqsWithCookie = 0
+        var pagesLoaded = 0
         var fetched = false
+        var errorText: String? = null
 
+        // 用 Log.i 而不是 Log.d：部分 ROM（含实测这台）会过滤第三方应用的 debug 日志
         fun log(msg: String) {
-            Log.d("NerelictProbe", msg)
+            Log.i("NerelictProbe", msg)
         }
 
-        fun finish(payload: Map<String, String>?) {
+        /** 永远回传诊断字段，哪怕没抓到 Cookie——否则 Dart 侧只能看到 null，无从判断。 */
+        fun finish(headers: Map<String, String>?) {
             if (finished) return
             finished = true
-            log("finish requests=$seenRequests cookie=$sawCookie payload=${payload != null}")
+            log("finish req=$seenRequests withCookie=$reqsWithCookie pages=$pagesLoaded")
+            val payload = HashMap<String, String>()
+            headers?.let { payload.putAll(it) }
+            payload["__probeRequests"] = seenRequests.toString()
+            payload["__probeWithCookie"] = reqsWithCookie.toString()
+            payload["__probePages"] = pagesLoaded.toString()
+            if (!errorText.isNullOrEmpty()) payload["__probeError"] = errorText!!
             try {
                 webView?.let { wv ->
                     wv.stopLoading()
@@ -197,10 +207,9 @@ class MainActivity : FlutterActivity() {
             // 用页面内 fetch 触发一次**子资源**请求，那里才有 Cookie。
             val quoted = org.json.JSONObject.quote(url)
             val js = "fetch($quoted,{credentials:'include',cache:'no-store'})" +
-                ".then(function(r){return r.text()})" +
-                ".then(function(t){return 'ok:'+t.length})" +
+                ".then(function(r){return 'ok:'+r.status})" +
                 ".catch(function(e){return 'err:'+e})"
-            log("startFetch $url")
+            log("startFetch")
             wv.evaluateJavascript(js) { value -> log("fetchResult=$value") }
         }
 
@@ -211,7 +220,6 @@ class MainActivity : FlutterActivity() {
             val wv = WebView(this)
             webView = wv
             wv.settings.javaScriptEnabled = true
-            // 不要图片：我们要的是请求头，不是页面内容
             wv.settings.blockNetworkImage = true
             wv.settings.cacheMode = WebSettings.LOAD_NO_CACHE
             if (!ua.isNullOrEmpty()) wv.settings.userAgentString = ua
@@ -222,19 +230,16 @@ class MainActivity : FlutterActivity() {
                 ): WebResourceResponse? {
                     val req = request ?: return null
                     val reqUrl = req.url ?: return null
-                    // 只认目标主机：跳转到登录页之类的不参与
                     if (host.isNotEmpty() && reqUrl.host != host) return null
                     seenRequests++
                     val headers = req.requestHeaders ?: emptyMap()
                     val cookieKey = headers.keys.firstOrNull {
                         it.equals("Cookie", ignoreCase = true)
                     }
+                    if (cookieKey != null) reqsWithCookie++
                     log("req #$seenRequests ${reqUrl.path} headers=${headers.size} cookie=${cookieKey != null}")
                     if (cookieKey != null) {
-                        sawCookie = true
-                        val payload = HashMap(headers)
-                        payload["__probeRequests"] = seenRequests.toString()
-                        finish(payload)
+                        finish(HashMap(headers))
                         return null
                     }
                     return null
@@ -242,24 +247,24 @@ class MainActivity : FlutterActivity() {
 
                 override fun onPageFinished(view: WebView?, pageUrl: String?) {
                     super.onPageFinished(view, pageUrl)
-                    log("onPageFinished $pageUrl")
+                    pagesLoaded++
+                    log("onPageFinished #$pagesLoaded")
                     if (view != null) startFetch(view)
                 }
             }
-            // 必须挂到窗口里才会真正发请求：1x1、不可见、不占布局
             val root = findViewById<ViewGroup>(android.R.id.content)
             root.addView(wv, ViewGroup.LayoutParams(1, 1))
             log("load $originRoot")
             wv.loadUrl(originRoot)
-            // 根页若是挑战页、脚本跑不起来，退一步直接加载目标地址再试
             Handler(Looper.getMainLooper()).postDelayed({
-                if (!finished && !sawCookie) {
+                if (!finished && reqsWithCookie == 0) {
                     log("fallback load target")
                     webView?.loadUrl(url)
                 }
             }, 5_000)
             Handler(Looper.getMainLooper()).postDelayed({ finish(null) }, 12_000)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            errorText = e.message ?: e.javaClass.simpleName
             finish(null)
         }
     }

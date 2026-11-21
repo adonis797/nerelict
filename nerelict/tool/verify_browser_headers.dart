@@ -156,6 +156,17 @@ void main() {
   );
   check(triedEmpty.hint.contains('没拿到'), '代取没拿到 → 指向「先过验证」');
   check(triedEmpty.hint != triedPass.hint, '没拿到 ≠ 拿到仍被拒');
+  final withNote = describeAuthFailure(
+    cookieSent: true,
+    cookieCount: 7,
+    pageCookieLength: 120,
+    challenged: true,
+    clearanceSent: false,
+    captureTried: true,
+    captureNote: '隐藏页面 5 个请求都没带 Cookie',
+  );
+  check(withNote.hint.contains('隐藏页面 5 个请求都没带 Cookie'),
+      '代取诊断原样进提示（不用翻日志）');
   final withPass = describeAuthFailure(
     cookieSent: true,
     cookieCount: 9,

@@ -82,6 +82,7 @@ AuthFailureReport describeAuthFailure({
   bool? clearanceSent,
   bool captureTried = false,
   bool captureGotCookie = false,
+  String captureNote = '',
   bool crossHost = false,
 }) {
   if (cookieSent) {
@@ -97,9 +98,11 @@ AuthFailureReport describeAuthFailure({
           );
         }
         if (!captureGotCookie) {
+          final detail = captureNote.isEmpty ? '' : '（$captureNote）';
           return AuthFailureReport(
             label,
-            '代取没拿到 Cookie：先在页面里把该视频播放十几秒，确认人机验证已过再回来重试',
+            '代取没拿到 Cookie$detail：先在页面里把该视频播放十几秒，'
+                '确认人机验证已过再回来重试',
           );
         }
         return AuthFailureReport(

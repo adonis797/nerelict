@@ -995,11 +995,22 @@ void main() {
       '从真实出站请求头里取 Cookie');
   check(activity37.contains('wv.destroy()'), '抓到或超时都销毁 WebView');
   check(activity37.contains('12_000'), '代取有 12 秒超时，不死等');
+  // 这台 ROM 会过滤第三方应用的 Log.d——用 Log.i，并且**诊断必须回传给界面**，
+  // 否则「为什么没抓到」只能靠用户描述。
+  check(!activity37.contains('Log.d("NerelictProbe"'),
+      '探针不用 Log.d（部分 ROM 会过滤第三方 debug 日志）');
+  check(activity37.contains('Log.i("NerelictProbe"'), '探针用 Log.i');
+  check(activity37.contains('__probeRequests') &&
+          activity37.contains('__probeWithCookie') &&
+          activity37.contains('__probePages'),
+      '没抓到 Cookie 也要回传诊断字段，不能只回 null');
+  check(read('lib/services/web_probe_result.dart').contains('隐藏页面'),
+      '诊断能说清卡在「页面没开 / 没发请求 / 没带 Cookie」哪一步');
   final probe38 = read('lib/services/web_probe.dart');
   check(probe38.contains("'com.nerelict/webprobe'"), '两端通道名一致');
   check(probe38.contains('captureCookie'), '只对外暴露 Cookie 串');
   final hd38 = read('lib/services/hls_downloader.dart');
-  check(hd38.contains('captureCookie') && hd38.contains('_clearanceOverrides'),
+  check(hd38.contains('captureProbe') && hd38.contains('_clearanceOverrides'),
       '下载器接受代取结果并按 host 复用');
   final capIdx = hd38.indexOf('await _captureBeforeRetry();');
   final delayIdx = hd38.indexOf('await Future<void>.delayed(Duration(milliseconds: 400');
@@ -1007,7 +1018,7 @@ void main() {
       '先补凭证再退避重试（顺序反了就白跑一次）');
   check(hd38.contains('missingClearance') || hd38.contains('_lastClearanceSent == false'),
       '只在「缺通行证」时触发代取，不无脑抓');
-  check(read('lib/state/app_state.dart').contains('WebProbe.captureCookie'),
+  check(read('lib/state/app_state.dart').contains('WebProbe.capture('),
       '状态层把代取接到下载器');
   // 代取到的 Cookie 只有「重试时重新算头」才用得上：
   // 头在闭包外算一次的话，三次重试发的都是同一份旧头，代取等于白做。
