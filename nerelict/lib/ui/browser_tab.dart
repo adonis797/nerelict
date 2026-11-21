@@ -25,6 +25,7 @@ import '../state/history_state.dart';
 import '../state/settings_state.dart';
 import '../state/web_favorites_state.dart';
 import '../ui/app_theme.dart';
+import '../ui/browser_windows_page.dart';
 import '../ui/history_page.dart';
 import '../ui/neon_progress_bar.dart';
 import '../ui/site_icon.dart';
@@ -40,6 +41,7 @@ enum _UrlMenuAction {
   clickHelp,
   resetClick,
   favorites,
+  windows,
 }
 
 class BrowserTab extends StatefulWidget {
@@ -99,6 +101,9 @@ class _BrowserTabState extends State<BrowserTab> {
   int _shieldedLayers = 0;
 
   Color? _appliedWebBg;
+
+  /// 多窗口入口防抖：连续点两次不该 push 出两个多窗口页
+  bool _openingWindows = false;
 
   @override
   void initState() {
@@ -1000,6 +1005,11 @@ class _BrowserTabState extends State<BrowserTab> {
                       label: '全部网页收藏',
                       icon: Icons.bookmarks_outlined,
                     ),
+                    AppMenuItem<_UrlMenuAction>(
+                      value: _UrlMenuAction.windows,
+                      label: '多窗口浏览',
+                      icon: Icons.tab,
+                    ),
                   ],
                 );
                 if (action != null) await _onUrlMenu(action);
@@ -1035,6 +1045,25 @@ class _BrowserTabState extends State<BrowserTab> {
         );
         if (url != null && mounted) _open(url);
         break;
+      case _UrlMenuAction.windows:
+        await _openWindows();
+        break;
+    }
+  }
+
+  /// 打开多窗口页：把当前地址带过去作为第一个窗口，同时防止重复 push。
+  Future<void> _openWindows() async {
+    if (_openingWindows) return;
+    _openingWindows = true;
+    try {
+      if (!mounted) return;
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute<void>(
+          builder: (_) => BrowserWindowsPage(initialUrl: _currentUrl),
+        ),
+      );
+    } finally {
+      _openingWindows = false;
     }
   }
 }

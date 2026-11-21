@@ -59,6 +59,7 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 | `verify_p0.dart` | 重定向 base、直播标记、续传不串片、直链 `If-Range` |
 | `verify_p1.dart` | `ss_*` 残留清理、直链背压写盘、中途暂停状态收敛 |
 | `verify_v042.dart` | 本地 HTTP 服务跑「选流 / Cookie 鉴权 / 字节区间 / 断点」真实下载（不依赖公网） |
+| `verify_windows.dart` | 多窗口：地址归一化、去重键、状态隔离、去重与上限、生命周期与资源释放护栏（纯 Dart） |
 | `verify_mp4_timeline.dart` | 转封装时间轴算法：B 帧重排识别、等间隔网格重建、缺段缺口（纯算法，不依赖设备） |
 | `verify_download.dart` | 真实公开测试流跑“解析 → 分片 → 解密 → 合并”（依赖公网，可能超时） |
 | `smoke_device.dart` | 真机冒烟：冷启动、三页切换、截图、崩溃日志（需要 adb + 设备，**不进常规回归链**） |
@@ -104,6 +105,12 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 - **MP4 转换只做无重编码转封装**（`MediaExtractor` + `MediaMuxer`，`Mp4Converter.kt`），不引入 FFmpeg；只搬 H.264/HEVC + AAC 样本，其它编码明确报不支持。
 - **播放器分层不要打穿**：`media_source` → `player_core`（抽象接口，UI 只依赖它）→ `player_ui`；`download_cache`（本地代理）与 `media_session`（原生通知/音频焦点）是两条可独立关闭的旁路。
 - 网络用 `dio`，AES-128 解密用 `pointycastle`，播放用 `video_player`（Android 底层 media3/ExoPlayer）。**新增依赖前先确认能否用现有依赖实现。**
+- **多窗口是轻量浏览上下文**：`lib/ui/browser_windows_page.dart` 每个窗口独立 `WebViewController`，
+  不注入 `SniffChannel` / `PlayerChannel` / `FloatChannel` / `ClickChannel`（这些依赖按「单一当前页」
+  设计的全局单例）；嗅探与下载只在主界面 `browser_tab.dart` 里做。窗口状态走
+  `window_registry.dart`（纯 Dart，可用 `dart run` 测）+ `windows_state.dart`（ChangeNotifier），
+  窗口上限 5 个；关闭时先换掉 `NavigationDelegate` 再卸载 `about:blank`，
+  **不要调用 `clearCache()`**（Android 缓存是应用级共享的）。
 - 注释与文档用简体中文，全角标点，引号用“”，不用直角引号；代码标识符用反引号。
 - 换行符按 `.gitattributes`：文本 LF，`*.bat` CRLF。`gradlew` 必须保持 LF，否则 Linux/CI 无法执行。
 
