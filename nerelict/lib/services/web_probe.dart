@@ -39,6 +39,8 @@ class WebProbe {
       var withCookie = 0;
       var pages = 0;
       var fetches = 0;
+      var domainCookies = -1;
+      var fetchResult = '';
       String? error;
       raw.forEach((k, v) {
         if (k is! String || v == null) return;
@@ -57,6 +59,12 @@ class WebProbe {
           case '__probeFetches':
             fetches = int.tryParse(value) ?? 0;
             break;
+          case '__probeDomainCookies':
+            domainCookies = int.tryParse(value) ?? -1;
+            break;
+          case '__probeFetchResult':
+            fetchResult = value;
+            break;
           case '__probeError':
             error = value;
             break;
@@ -71,10 +79,13 @@ class WebProbe {
         withCookie: withCookie,
         pages: pages,
         fetches: fetches,
+        domainCookies: domainCookies,
+        fetchResult: fetchResult,
         error: error,
       );
       logD('WebProbe',
           'req=$requests cookie=$withCookie pages=$pages fetches=$fetches '
+          'domainCookies=$domainCookies fetch=$fetchResult '
           'has=${result.cookie != null}');
       return result;
     } on MissingPluginException {

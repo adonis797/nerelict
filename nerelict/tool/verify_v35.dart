@@ -208,13 +208,13 @@ void main() {
 
   stdout.writeln('=== 9. 版本号与二级设置 ===');
   final pubspec = read('pubspec.yaml');
-  check(pubspec.contains('version: 0.4.9+29'), 'pubspec 基础版本为 0.4.9 / code 29');
+  check(pubspec.contains('version: 0.4.10+30'), 'pubspec 基础版本为 0.4.10 / code 30');
   final gradle = read('android/app/build.gradle.kts');
   check(gradle.contains('versionName = flutter.versionName'),
       '展示版本统一取 pubspec 三段版本');
   check(!gradle.contains('versionName = "0.3.9.0"'), '不再覆盖第四段展示版本');
   final settingsFile = read('lib/ui/settings_tab.dart');
-  check(settingsFile.contains("appVersion = '0.4.9'"), '设置页版本为 0.4.9');
+  check(settingsFile.contains("appVersion = '0.4.10'"), '设置页版本为 0.4.10');
   check(read('README.md').contains('v0.4.4'), 'README 版本号已同步');
   check(settingsFile.contains('_CategoryTile'), '设置改为分类入口');
   check(settingsFile.contains('_SettingsPage'), '存在二级设置页');
@@ -491,7 +491,7 @@ void main() {
       .firstMatch(pubspecText);
   final semver = versionLine?.group(1) ?? '';
   final currentCode = int.tryParse(versionLine?.group(2) ?? '') ?? 0;
-  check(semver == '0.4.9', '当前展示版本为 0.4.9');
+  check(semver == '0.4.10', '当前展示版本为 0.4.10');
   check(currentCode > publishedVersionCode,
       'versionCode $currentCode 严格大于已发布最高值 $publishedVersionCode');
   check(settingsText.contains("appVersion = '$semver'"),
@@ -994,7 +994,14 @@ void main() {
           activity37.contains('requestHeaders'),
       '从真实出站请求头里取 Cookie');
   check(activity37.contains('wv.destroy()'), '抓到或超时都销毁 WebView');
-  check(activity37.contains('14_000'), '代取有整体超时，不死等');
+  check(activity37.contains('18_000'), '代取有整体超时，不死等');
+  // 光有状态码分不出「防盗链 403」和「人机验证 403」，正文才是判据。
+  check(activity37.contains('__probeFetchResult'), '回传 fetch 的状态码与正文开头');
+  check(activity37.contains('__probeDomainCookies'), '回传该域一共几份 Cookie');
+  final res38 = read('lib/services/web_probe_result.dart');
+  check(res38.contains('Cloudflare 挑战页'), '能认出正文是挑战页');
+  check(res38.contains('该域一份 Cookie 都没下发'),
+      '区分「该域没给 cookie」与「给了但没带上」');
   // 人机验证常是「先给挑战页、几秒后自动跳回」：只 fetch 一次正好撞在挑战页上，
   // 所以要一轮轮重试。
   check(activity37.contains('fetchLoop') && activity37.contains('postDelayed(this'),

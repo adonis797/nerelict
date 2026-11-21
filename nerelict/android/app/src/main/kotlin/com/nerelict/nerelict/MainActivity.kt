@@ -172,6 +172,7 @@ class MainActivity : FlutterActivity() {
         var fetchRounds = 0
         var loopStarted = false
         var errorText: String? = null
+        var lastFetchResult = ""
 
         val main = Handler(Looper.getMainLooper())
 
@@ -191,6 +192,20 @@ class MainActivity : FlutterActivity() {
             payload["__probeWithCookie"] = reqsWithCookie.toString()
             payload["__probePages"] = pagesLoaded.toString()
             payload["__probeFetches"] = fetchRounds.toString()
+            // fetch 的真实返回：`ok:403` 说明请求发出去了但被拒，
+            // `err:...` 说明连发都没发出去（CSP / 混合内容）。这两种修法完全不同。
+            if (lastFetchResult.isNotEmpty()) payload["__probeFetchResult"] = lastFetchResult
+            // 该域在 WebView 里到底有没有 cookie：0 表示挑战根本没走完，
+            // 大于 0 却仍没带上是另一回事（头被裁）。两者不能混。
+            try {
+                val parsed = Uri.parse(url)
+                val cookieUrl = parsed.scheme + "://" + parsed.host + "/"
+                val raw = CookieManager.getInstance().getCookie(cookieUrl) ?: ""
+                val count = raw.split(";").count { it.trim().contains("=") }
+                payload["__probeDomainCookies"] = count.toString()
+            } catch (_: Exception) {
+                payload["__probeDomainCookies"] = "-1"
+            }
             if (!errorText.isNullOrEmpty()) payload["__probeError"] = errorText!!
             try {
                 webView?.let { wv ->
@@ -204,6 +219,16 @@ class MainActivity : FlutterActivity() {
             result.success(payload)
         }
 
+        /** evaluateJavascript 回传的是 JSON 字面量，去掉外层引号与转义。 */
+        fun decodeJsString(raw: String?): String {
+            if (raw.isNullOrEmpty() || raw == "null") return ""
+            return try {
+                org.json.JSONTokener(raw).nextValue() as? String ?: raw
+            } catch (_: Exception) {
+                raw
+            }
+        }
+
         /**
          * 发一次页面内 fetch。
          *
@@ -214,11 +239,17 @@ class MainActivity : FlutterActivity() {
         fun startFetch(wv: WebView, round: Int) {
             fetchRounds = round
             val quoted = org.json.JSONObject.quote(url)
+            // 带上响应体开头：被 Cloudflare 拦下时正文是挑战页，
+            // 只看状态码分不出「403 防盗链」和「403 人机验证」。
             val js = "fetch($quoted,{credentials:'include',cache:'no-store'})" +
-                ".then(function(r){return 'ok:'+r.status})" +
+                ".then(function(r){return r.text().then(function(t){" +
+                "return 'ok:'+r.status+':'+t.replace(/\\s+/g,' ').slice(0,120)})})" +
                 ".catch(function(e){return 'err:'+e})"
             log("fetch #$round")
-            wv.evaluateJavascript(js) { value -> log("fetch#$round -> $value") }
+            wv.evaluateJavascript(js) { value ->
+                lastFetchResult = decodeJsString(value)
+                log("fetch#$round -> $value")
+            }
         }
 
         /** 每 2 秒重试一次 fetch，给挑战页留出自动通过的时间窗。 */
@@ -289,7 +320,7 @@ class MainActivity : FlutterActivity() {
                     webView?.loadUrl(url)
                 }
             }, 5_000)
-            main.postDelayed({ finish(null) }, 14_000)
+            main.postDelayed({ finish(null) }, 18_000)
         } catch (e: Exception) {
             errorText = e.message ?: e.javaClass.simpleName
             finish(null)
