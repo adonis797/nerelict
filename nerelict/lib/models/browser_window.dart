@@ -157,17 +157,23 @@ class BrowserWindow {
   /// 主框架加载失败时的人话提示；非空即显示错误页。
   final String? error;
 
-  /// 窗口条与标题栏用的显示名：优先页面标题，其次域名，最后「新窗口」。
+  /// 是不是停在首页（新窗口，或点了「首页」）。
+  ///
+  /// 首页由 UI 层画，不加载任何远端页面：地址为空即首页。
+  bool get isHome => url == null || url!.isEmpty;
+
+  /// 窗口条与标题栏用的显示名：优先页面标题，其次域名，最后「新标签页」。
   String get displayTitle {
     final t = title?.trim();
     if (t != null && t.isNotEmpty) return t;
+    if (isHome) return '新标签页';
     final u = url;
     if (u != null && u.isNotEmpty) {
       final host = Uri.tryParse(u)?.host;
       if (host != null && host.isNotEmpty) return host;
       return u;
     }
-    return '新窗口';
+    return '新标签页';
   }
 
   BrowserWindow copyWith({

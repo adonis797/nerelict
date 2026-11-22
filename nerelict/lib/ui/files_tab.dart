@@ -9,6 +9,7 @@ import '../services/media_meta.dart';
 import '../services/media_probe.dart';
 import '../services/playback_memory.dart';
 import '../services/storage_access.dart';
+import '../services/storage_scanner.dart';
 import '../state/app_state.dart';
 import 'app_theme.dart';
 import 'download_tasks_page.dart';
@@ -18,13 +19,21 @@ import 'mp4_convert_sheet.dart';
 /// 排序维度。`duration` 只对已探测过元数据的视频有意义，拿不到的排末尾。
 enum _SortBy { modified, name, size, duration }
 
-/// 「文件」标签页：下载目录的整体文件管理。
+/// 「文件」标签页的当前视图。
+enum _FilesView { storage, downloads }
+
+/// 「文件」标签页：默认递归扫描整个内部存储，统一分类管理所有文件；
+/// 下载目录的文件管理收进「更多」菜单里。
 ///
 /// 结构对齐系统文件管理器：分类宫格 → 最近播放 → 全部文件。
 /// 两条刻意的简化：
 ///
 /// - **视频不做独立页面**：点行直接进 Nerelict 播放器，播放失败由播放器自己报；
 /// - **列表行不放操作按钮**：所有管理动作收进行尾 `⋮`，避免一行四个图标。
+///
+/// 安全边界：只有「下载目录」视图允许重命名 / 删除（那是本应用自己的产物目录）；
+/// 全盘视图只做浏览、播放与查看信息，不放写操作——在系统任意目录放开 delete/rename，
+/// 一次误触就是别人的照片没了。
 class FilesTab extends StatefulWidget {
   const FilesTab({super.key});
 
@@ -35,6 +44,9 @@ class FilesTab extends StatefulWidget {
 class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
   late final AppState _app;
   PlaybackRecord? _resume;
+
+  /// 当前视图：默认全盘扫描，下载目录是菜单里的一个入口
+  _FilesView _view = _FilesView.storage;
 
   /// 当前分类筛选；null 表示「全部」
   LocalFileKind? _filter;
@@ -48,20 +60,18 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
   bool _selecting = false;
   final Set<String> _selected = <String>{};
 
-  /// 当前浏览的目录；null 表示「下载目录」（由 AppState 统一维护）
-  String? _dir;
+  // ---- 全盘扫描状态 ----
+  List<LocalFile> _storageFiles = const <LocalFile>[];
+  bool _storageScanning = false;
+  bool _storageTruncated = false;
+  bool _storageIncomplete = false;
+  int _storageErrors = 0;
 
-  /// 外部目录的条目（下载目录走 AppState.localFiles）
-  List<LocalFile> _entries = const <LocalFile>[];
-  bool _scanning = false;
+  /// 扫描取消标记：新一轮扫描或页面销毁时置 true，旧扫描尽快退出
+  bool _scanCancelled = false;
+
   String? _externalRoot;
   bool _allFilesOk = false;
-
-  /// 是否允许增删改：只有自家下载目录可以，别处只做浏览与播放。
-  ///
-  /// 这不是偷懒——在系统任意目录上放开 delete/rename，一次误触就是别人的照片没了；
-  /// 先把「看得见、播得了」做扎实，写操作等有明确需求再放开。
-  bool get _canManage => _dir == null;
 
   @override
   void initState() {
@@ -72,13 +82,13 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
     _refreshAccess();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      _app.refreshLocalFiles();
       _loadResume();
     });
   }
 
   @override
   void dispose() {
+    _scanCancelled = true;
     _app.removeBackInterceptor(_handleSystemBack);
     WidgetsBinding.instance.removeObserver(this);
     _searchCtrl.dispose();
@@ -86,7 +96,7 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
     super.dispose();
   }
 
-  /// 系统返回的优先级：退多选 → 退搜索 → 退筛选 → 交给 HomeScreen。
+  /// 系统返回的优先级：退多选 → 退搜索 → 退筛选 → 退下载目录视图 → 交给 HomeScreen。
   Future<bool> _handleSystemBack() async {
     if (_app.tabIndex != 1) return false;
     if (_selecting) {
@@ -98,8 +108,8 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
       setState(() => _query = '');
       return true;
     }
-    if (_dir != null) {
-      _leaveDir();
+    if (_view == _FilesView.downloads) {
+      _switchToStorage();
       return true;
     }
     if (_filter == null) return false;
@@ -123,6 +133,10 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
         _externalRoot = root;
       });
     }
+    // 默认视图是全盘；拿到权限且还没扫过时，自动开始第一次扫描
+    if (ok && _view == _FilesView.storage && _storageFiles.isEmpty) {
+      _startStorageScan();
+    }
   }
 
   Future<void> _requestAccess() async {
@@ -135,56 +149,50 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
     // 设置页回来后由 didChangeAppLifecycleState 重新检查
   }
 
-  Future<void> _enterDir(String path) async {
+  /// 切换到全盘视图并（重新）开始扫描。
+  void _switchToStorage() {
+    _scanCancelled = true;
     setState(() {
-      _dir = path;
-      _entries = const <LocalFile>[];
-      _scanning = true;
+      _view = _FilesView.storage;
       _filter = null;
       _clearSelection();
     });
-    final scan = await scanDirectory(path);
-    if (!mounted || _dir != path) return;
+    _startStorageScan();
+  }
+
+  /// 切换到下载目录视图（菜单入口）。
+  void _switchToDownloads() {
+    _scanCancelled = true;
     setState(() {
-      _entries = scan.files;
-      _scanning = false;
+      _view = _FilesView.downloads;
+      _filter = null;
+      _clearSelection();
     });
+    _app.refreshLocalFiles();
   }
 
-  /// 菜单里的「浏览内部存储」：没授权就先引导，有授权就进根目录。
-  Future<void> _browseStorage() async {
-    if (!_allFilesOk) {
-      await _requestAccess();
-      return;
-    }
-    final root = _externalRoot ?? await StorageAccess.externalRoot();
-    if (!mounted) return;
-    if (root == null) {
-      _app.showHint('拿不到内部存储目录，请重新授权');
-      return;
-    }
-    await _enterDir(root);
-  }
-
-  /// 上一级；已经到内部存储根就退回下载目录。
-  void _leaveDir() {
-    final current = _dir;
-    if (current == null) return;
+  /// 启动一次全盘扫描：旧扫描通过取消标记尽快退出，只有最新一轮写结果。
+  Future<void> _startStorageScan() async {
     final root = _externalRoot;
-    final parent = current.substring(0, current.lastIndexOf(Platform.pathSeparator));
-    if (root == null ||
-        current == root ||
-        parent.isEmpty ||
-        parent.length < root.length) {
-      setState(() {
-        _dir = null;
-        _entries = const <LocalFile>[];
-        _scanning = false;
-      });
-      _app.refreshLocalFiles();
-      return;
-    }
-    _enterDir(parent);
+    if (root == null) return;
+    _scanCancelled = false;
+    setState(() {
+      _storageScanning = true;
+      _storageTruncated = false;
+      _storageIncomplete = false;
+    });
+    final result = await scanAllStorage(
+      root: root,
+      cancel: () => _scanCancelled,
+    );
+    if (!mounted || _scanCancelled) return;
+    setState(() {
+      _storageFiles = result.files;
+      _storageScanning = false;
+      _storageTruncated = result.truncated;
+      _storageIncomplete = !result.complete;
+      _storageErrors = result.errors;
+    });
   }
 
   Future<void> _loadResume() async {
@@ -196,6 +204,31 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
     if (!mounted) return;
     setState(() {});
     _loadResume();
+  }
+
+  /// 面板里改名 / 删除后，就地更新全盘列表里的那一条。
+  ///
+  /// 不重扫整个存储：真机上一次全盘扫描要几秒，改个文件名不该等它；
+  /// 更早的条目已经不可信时，菜单里的「重新扫描」随时可以拉一次准确的。
+  void _applyMoved(String from, String? to) {
+    if (_view != _FilesView.storage) return;
+    final index = _storageFiles.indexWhere((f) => f.path == from);
+    if (index < 0) return;
+    final next = _storageFiles.toList();
+    if (to == null) {
+      next.removeAt(index);
+    } else {
+      final old = next[index];
+      final name = to.split(Platform.pathSeparator).last;
+      next[index] = LocalFile(
+        path: to,
+        name: name,
+        size: old.size,
+        modifiedAt: old.modifiedAt,
+        kind: LocalFile.kindOf(name),
+      );
+    }
+    setState(() => _storageFiles = next);
   }
 
   void _clearSelection() {
@@ -225,24 +258,29 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
     );
   }
 
-  /// 点行的默认动作：视频直接播放，其它交给文件管理面板。
+  /// 点行的默认动作：视频直接播放，其它文件进文件管理面板。
+  ///
+  /// 全盘视图与下载目录共用同一套写操作：重命名与删除走 `AppState` 的统一方法，
+  /// 删除先落回收站（并记下原目录），误删仍可撤销。
   void _openFile(LocalFile file) {
     if (_selecting) {
       _toggleSelect(file.path);
-      return;
-    }
-    if (file.isDir) {
-      _enterDir(file.path);
       return;
     }
     if (file.isPlayable) {
       _app.openPlayer(url: file.path, title: file.title, local: true);
       return;
     }
+    _manageFiles(<String>[file.path]);
+  }
+
+  /// 打开文件管理面板，并把面板里的改名 / 删除回写到当前列表。
+  void _manageFiles(List<String> paths) {
     showFileManagerSheet(
       context,
-      paths: <String>[file.path],
+      paths: paths,
       onChanged: _onFilesChanged,
+      onMoved: _applyMoved,
     );
   }
 
@@ -289,7 +327,8 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
     );
     if (!mounted || value == null || value.trim().isEmpty) return;
     try {
-      await _app.renameDownloadedFile(file.path, value);
+      final next = await _app.renameDownloadedFile(file.path, value);
+      _applyMoved(file.path, next);
       _onFilesChanged();
     } catch (e) {
       if (!mounted) return;
@@ -326,6 +365,9 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
     );
     if (ok != true || !mounted) return;
     final trashed = await _app.deleteDownloadedFiles(files.map((f) => f.path));
+    for (final f in files) {
+      _applyMoved(f.path, null);
+    }
     _clearSelection();
     _onFilesChanged();
     if (!mounted) return;
@@ -360,9 +402,12 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
             ListTile(
-              leading: const Icon(Icons.play_circle_outline, size: 20),
+              leading: Icon(
+                file.isPlayable ? Icons.play_circle_outline : Icons.info_outline,
+                size: 20,
+              ),
               title: Text(
-                file.isPlayable ? '用 Nerelict 播放' : '用系统应用打开',
+                file.isPlayable ? '用 Nerelict 播放' : '文件信息',
                 style: const TextStyle(fontSize: 13.5),
               ),
               onTap: () {
@@ -370,7 +415,7 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
                 _openFile(file);
               },
             ),
-            if (canConvert && _canManage)
+            if (canConvert)
               ListTile(
                 leading: const Icon(Icons.movie_creation_outlined, size: 20),
                 title: const Text('转成 MP4', style: TextStyle(fontSize: 13.5)),
@@ -379,54 +424,32 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
                   showMp4ConvertSheet(context);
                 },
               ),
-            if (!_canManage)
-              ListTile(
-                leading: const Icon(Icons.lock_outline, size: 20),
-                title: Text(
-                  '此目录只读：重命名与删除仅对下载目录开放',
-                  style: TextStyle(fontSize: 12, color: p.textFaint),
-                ),
-              ),
             ListTile(
-              leading: const Icon(Icons.info_outline, size: 20),
-              title: const Text('文件信息', style: TextStyle(fontSize: 13.5)),
+              leading: const Icon(Icons.drive_file_rename_outline, size: 20),
+              title: const Text('重命名', style: TextStyle(fontSize: 13.5)),
               onTap: () {
                 Navigator.of(ctx).pop();
-                showFileManagerSheet(
-                  context,
-                  paths: <String>[file.path],
-                  onChanged: _onFilesChanged,
-                );
+                _renameFile(file);
               },
             ),
-            if (_canManage) ...<Widget>[
-              ListTile(
-                leading: const Icon(Icons.drive_file_rename_outline, size: 20),
-                title: const Text('重命名', style: TextStyle(fontSize: 13.5)),
-                onTap: () {
-                  Navigator.of(ctx).pop();
-                  _renameFile(file);
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.checklist, size: 20),
-                title: const Text('选择', style: TextStyle(fontSize: 13.5)),
-                onTap: () {
-                  Navigator.of(ctx).pop();
-                  _enterSelection(file.path);
-                },
-              ),
-              ListTile(
-                leading:
-                    const Icon(Icons.delete_outline, size: 20, color: kDanger),
-                title: const Text('删除',
-                    style: TextStyle(fontSize: 13.5, color: kDanger)),
-                onTap: () {
-                  Navigator.of(ctx).pop();
-                  _deleteFiles(<LocalFile>[file]);
-                },
-              ),
-            ],
+            ListTile(
+              leading: const Icon(Icons.checklist, size: 20),
+              title: const Text('选择', style: TextStyle(fontSize: 13.5)),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                _enterSelection(file.path);
+              },
+            ),
+            ListTile(
+              leading:
+                  const Icon(Icons.delete_outline, size: 20, color: kDanger),
+              title: const Text('删除',
+                  style: TextStyle(fontSize: 13.5, color: kDanger)),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                _deleteFiles(<LocalFile>[file]);
+              },
+            ),
           ],
         ),
       ),
@@ -516,7 +539,8 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
     final p = paletteOf(context);
-    final files = _dir == null ? state.localFiles : _entries;
+    final isStorage = _view == _FilesView.storage;
+    final files = isStorage ? _storageFiles : state.localFiles;
     final visible = _visibleFiles(files);
 
     // 缓存只为仍然存在的文件保留，避免删改后越积越多
@@ -538,92 +562,112 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
               p: p,
               onOpen: _openDownloads,
             ),
-          if (state.lastScanIncomplete) _ScanIncompleteBanner(p: p),
+          if (!isStorage && state.lastScanIncomplete)
+            _ScanIncompleteBanner(p: p),
+          if (isStorage && _storageIncomplete)
+            _StorageIncompleteBanner(p: p, errors: _storageErrors),
+          if (isStorage && _storageTruncated)
+            _StorageTruncatedBanner(p: p),
           _SearchField(
             controller: _searchCtrl,
             focusNode: _searchFocus,
             onChanged: (v) => setState(() => _query = v),
             p: p,
           ),
-          if (_dir != null)
-            _Breadcrumb(dir: _dir!, root: _externalRoot, onUp: _leaveDir, p: p)
-          else if (!_allFilesOk)
-            _AccessCard(p: p, onGrant: _requestAccess),
-          _KindGrid(
-            counts: counts,
-            total: files.length,
-            selected: _filter,
-            onSelect: (kind) => setState(() {
-              _filter = _filter == kind ? null : kind;
-            }),
-            p: p,
-          ),
+          if (isStorage && !_allFilesOk)
+            _AccessCard(p: p, onGrant: _requestAccess)
+          else
+            _KindGrid(
+              counts: counts,
+              total: files.length,
+              selected: _filter,
+              onSelect: (kind) => setState(() {
+                _filter = _filter == kind ? null : kind;
+              }),
+              p: p,
+            ),
           if (!_selecting &&
-              _dir == null &&
+              !isStorage &&
               _filter == null &&
               _query.isEmpty &&
               _resume != null)
             _RecentSection(record: _resume!, p: p, onOpen: _openResume),
           _ListHeader(
-            title: _dir == null ? '全部文件' : '当前文件夹',
+            title: isStorage ? '全部文件' : '下载目录',
             count: visible.length,
             sortLabel: _sortLabel,
             onSort: () => _showSortSheet(p),
             p: p,
           ),
           Expanded(
-            child: _scanning
+            child: isStorage && _storageScanning
                 ? Center(
-                    child: SizedBox(
-                      width: 22,
-                      height: 22,
-                      child: CircularProgressIndicator(
-                          strokeWidth: 2, color: p.accent),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 2, color: p.accent),
+                        ),
+                        const SizedBox(height: 10),
+                        Text(
+                          '正在扫描整个存储…',
+                          style:
+                              TextStyle(fontSize: 12.5, color: p.textFaint),
+                        ),
+                      ],
                     ),
                   )
-                : files.isEmpty && _dir != null
+                : isStorage && !_allFilesOk
                     ? Center(
                         child: Column(
                           mainAxisSize: MainAxisSize.min,
                           children: <Widget>[
-                            Icon(Icons.folder_open_outlined,
+                            Icon(Icons.lock_outline,
                                 size: 44, color: p.textDisabled),
                             const SizedBox(height: 10),
-                            Text('这个文件夹是空的',
+                            Text('需要「所有文件访问权限」才能扫描整个存储',
                                 style: TextStyle(
                                     fontSize: 12.5, color: p.textFaint)),
                           ],
                         ),
                       )
-                : files.isEmpty
-                ? _EmptyState(
-                    p: p,
-                    hasTasks: state.tasks.isNotEmpty,
-                    onBrowse: () => state.setTab(0),
-                    onOpenDownloads: _openDownloads,
-                  )
-                : visible.isEmpty
-                    ? _FilterEmpty(p: p, kind: _filter, query: _query)
-                    : ListView.builder(
-                        padding: const EdgeInsets.fromLTRB(8, 0, 8, 24),
-                        itemCount: visible.length,
-                        itemBuilder: (context, i) {
-                          final file = visible[i];
-                          return _FileRow(
-                            key: ValueKey(file.path),
-                            file: file,
-                            selecting: _selecting,
-                            selected: _selected.contains(file.path),
-                            onTap: () => _openFile(file),
-                            onLongPress: () => _enterSelection(file.path),
-                            onMenu: () => _showRowMenu(file),
-                          );
-                        },
-                      ),
+                    : files.isEmpty
+                        ? _EmptyState(
+                            p: p,
+                            hasTasks: state.tasks.isNotEmpty,
+                            isStorage: isStorage,
+                            onBrowse: () => state.setTab(0),
+                            onOpenDownloads: _openDownloads,
+                          )
+                        : visible.isEmpty
+                            ? _FilterEmpty(
+                                p: p, kind: _filter, query: _query)
+                            : ListView.builder(
+                                padding:
+                                    const EdgeInsets.fromLTRB(8, 0, 8, 24),
+                                itemCount: visible.length,
+                                itemBuilder: (context, i) {
+                                  final file = visible[i];
+                                  return _FileRow(
+                                    key: ValueKey(file.path),
+                                    file: file,
+                                    selecting: _selecting,
+                                    selected:
+                                        _selected.contains(file.path),
+                                    onTap: () => _openFile(file),
+                                    onLongPress: () =>
+                                        _enterSelection(file.path),
+                                    onMenu: () => _showRowMenu(file),
+                                  );
+                                },
+                              ),
           ),
         ],
       ),
-      bottomNavigationBar: _selecting && _canManage
+      bottomNavigationBar: _selecting
           ? _BatchBar(
               count: _selected.length,
               onDelete: () => _deleteFiles(
@@ -637,8 +681,12 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
   }
 
   AppBar _normalAppBar(AppState state, List<LocalFile> visible) {
+    final isStorage = _view == _FilesView.storage;
     return AppBar(
-      title: const Text('文件管理', style: TextStyle(fontSize: 17)),
+      title: Text(
+        isStorage ? '文件管理' : '下载目录',
+        style: const TextStyle(fontSize: 17),
+      ),
       actions: <Widget>[
         IconButton(
           tooltip: '搜索',
@@ -658,8 +706,12 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
                 if (first != null) _enterSelection(first.path);
                 break;
               case 'scan':
-                state.refreshLocalFiles();
-                _loadResume();
+                if (isStorage) {
+                  _startStorageScan();
+                } else {
+                  state.refreshLocalFiles();
+                  _loadResume();
+                }
                 break;
               case 'convert':
                 showMp4ConvertSheet(context);
@@ -667,32 +719,33 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
               case 'downloads':
                 _openDownloads();
                 break;
-              case 'browse':
-                _browseStorage();
+              case 'view_storage':
+                _switchToStorage();
                 break;
-              case 'home':
-                setState(() {
-                  _dir = null;
-                  _entries = const <LocalFile>[];
-                });
-                state.refreshLocalFiles();
+              case 'view_downloads':
+                _switchToDownloads();
                 break;
             }
           },
           itemBuilder: (_) => <PopupMenuEntry<String>>[
             const PopupMenuItem<String>(value: 'sort', child: Text('排序方式')),
-            if (_canManage)
-              const PopupMenuItem<String>(value: 'select', child: Text('批量选择')),
-            const PopupMenuItem<String>(value: 'scan', child: Text('重新扫描')),
+            const PopupMenuItem<String>(value: 'select', child: Text('批量选择')),
+            PopupMenuItem<String>(
+              value: 'scan',
+              child: Text(isStorage ? '重新扫描整个存储' : '重新扫描下载目录'),
+            ),
             const PopupMenuItem<String>(value: 'convert', child: Text('MP4 转换')),
             const PopupMenuItem<String>(value: 'downloads', child: Text('下载管理')),
-            if (_dir == null)
-              PopupMenuItem<String>(
-                value: 'browse',
-                child: Text(_allFilesOk ? '浏览内部存储' : '浏览内部存储（需授权）'),
+            if (isStorage)
+              const PopupMenuItem<String>(
+                value: 'view_downloads',
+                child: Text('下载目录'),
               )
             else
-              const PopupMenuItem<String>(value: 'home', child: Text('回到下载目录')),
+              const PopupMenuItem<String>(
+                value: 'view_storage',
+                child: Text('整个存储'),
+              ),
           ],
         ),
       ],
@@ -757,60 +810,6 @@ String _relativeDate(DateTime t) {
       '${t.day.toString().padLeft(2, '0')}';
 }
 
-/// 面包屑：只在浏览外部目录时出现，用来知道「我在哪」并能一级级退回。
-class _Breadcrumb extends StatelessWidget {
-  const _Breadcrumb({
-    required this.dir,
-    required this.root,
-    required this.onUp,
-    required this.p,
-  });
-
-  final String dir;
-  final String? root;
-  final VoidCallback onUp;
-  final AppPalette p;
-
-  @override
-  Widget build(BuildContext context) {
-    final base = root ?? '';
-    var tail = dir;
-    if (base.isNotEmpty && dir.startsWith(base)) {
-      tail = dir.substring(base.length);
-    }
-    final parts = tail
-        .split(Platform.pathSeparator)
-        .where((e) => e.isNotEmpty)
-        .toList();
-    final label = parts.isEmpty ? '内部存储' : '内部存储 / ${parts.join(' / ')}';
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(10, 2, 10, 6),
-      child: Row(
-        children: <Widget>[
-          InkWell(
-            onTap: onUp,
-            borderRadius: BorderRadius.circular(8),
-            child: Padding(
-              padding: const EdgeInsets.all(4),
-              child: Icon(Icons.arrow_upward, size: 16, color: p.textSub),
-            ),
-          ),
-          const SizedBox(width: 2),
-          Expanded(
-            child: Text(
-              label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 11.5, color: p.textFaint),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 /// 未授权时的引导卡：说清楚「为什么需要」和「开了能得到什么」，而不是只弹一个按钮。
 class _AccessCard extends StatelessWidget {
   const _AccessCard({required this.p, required this.onGrant});
@@ -837,12 +836,12 @@ class _AccessCard extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
                 Text(
-                  '浏览整个手机存储',
+                  '管理整个手机存储',
                   style: TextStyle(fontSize: 12.5, color: p.text),
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  '需要「所有文件访问权限」，开启后可查看、播放任意目录里的文件',
+                  '需要「所有文件访问权限」，开启后可自动识别、浏览与播放整个存储里的文件',
                   style: TextStyle(fontSize: 11, color: p.textFaint),
                 ),
               ],
@@ -1552,6 +1551,7 @@ class _EmptyState extends StatelessWidget {
   const _EmptyState({
     required this.p,
     required this.hasTasks,
+    required this.isStorage,
     required this.onBrowse,
     required this.onOpenDownloads,
   });
@@ -1560,11 +1560,22 @@ class _EmptyState extends StatelessWidget {
 
   /// 有下载任务但还没产出文件：说明文件会在完成后出现
   final bool hasTasks;
+
+  /// 是否全盘视图：空态文案不同（存储扫不出文件 vs 下载目录还没有文件）
+  final bool isStorage;
   final VoidCallback onBrowse;
   final VoidCallback onOpenDownloads;
 
   @override
   Widget build(BuildContext context) {
+    final title = isStorage
+        ? '没有扫描到文件'
+        : (hasTasks ? '下载完成后文件会显示在这里' : '还没有文件');
+    final hint = isStorage
+        ? '内部存储里没有可识别的文件，\n或权限尚未生效，可到「更多」里重新扫描'
+        : (hasTasks
+            ? '任务还在进行，去「下载」查看进度；完成后无需手动刷新'
+            : '在「浏览器」里打开视频页面，\n用 Nerelict 播放后点「下载当前视频」即可');
     return Center(
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 28),
@@ -1573,15 +1584,10 @@ class _EmptyState extends StatelessWidget {
           children: <Widget>[
             Icon(Icons.folder_open_outlined, size: 54, color: p.textDisabled),
             const SizedBox(height: 14),
-            Text(
-              hasTasks ? '下载完成后文件会显示在这里' : '还没有文件',
-              style: TextStyle(color: p.textFaint),
-            ),
+            Text(title, style: TextStyle(color: p.textFaint)),
             const SizedBox(height: 6),
             Text(
-              hasTasks
-                  ? '任务还在进行，去「下载」查看进度；完成后无需手动刷新'
-                  : '在「浏览器」里打开视频页面，\n用 Nerelict 播放后点「下载当前视频」即可',
+              hint,
               textAlign: TextAlign.center,
               style: TextStyle(color: p.textFaint, fontSize: 12, height: 1.5),
             ),
@@ -1591,17 +1597,18 @@ class _EmptyState extends StatelessWidget {
               runSpacing: 8,
               alignment: WrapAlignment.center,
               children: <Widget>[
-                FilledButton.tonalIcon(
-                  onPressed: onBrowse,
-                  icon: const Icon(Icons.travel_explore, size: 17),
-                  label: const Text('去浏览器嗅探'),
-                  style: FilledButton.styleFrom(
-                    visualDensity: VisualDensity.compact,
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+                if (!isStorage)
+                  FilledButton.tonalIcon(
+                    onPressed: onBrowse,
+                    icon: const Icon(Icons.travel_explore, size: 17),
+                    label: const Text('去浏览器嗅探'),
+                    style: FilledButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 9),
+                    ),
                   ),
-                ),
-                if (hasTasks)
+                if (hasTasks && !isStorage)
                   TextButton.icon(
                     onPressed: onOpenDownloads,
                     icon: const Icon(Icons.download_outlined, size: 17),
@@ -1651,3 +1658,70 @@ class _FilterEmpty extends StatelessWidget {
     );
   }
 }
+
+/// 全盘扫描遇到读不出的条目：结果可能不完整，提示但不打断使用。
+class _StorageIncompleteBanner extends StatelessWidget {
+  const _StorageIncompleteBanner({required this.p, required this.errors});
+
+  final AppPalette p;
+  final int errors;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(12, 6, 12, 0),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFF3A2A12),
+        borderRadius: BorderRadius.circular(9),
+      ),
+      child: Row(
+        children: <Widget>[
+          const Icon(Icons.warning_amber_outlined,
+              size: 15, color: Color(0xFFF0B24A)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '有 $errors 个条目无法读取，结果可能不完整',
+              style: TextStyle(fontSize: 11.5, color: p.textSub),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 全盘扫描达到文件数上限：明确告知「只列了前 N 个」，而不是让用户以为漏扫。
+class _StorageTruncatedBanner extends StatelessWidget {
+  const _StorageTruncatedBanner({required this.p});
+
+  final AppPalette p;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(12, 6, 12, 0),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F2A3A),
+        borderRadius: BorderRadius.circular(9),
+      ),
+      child: Row(
+        children: <Widget>[
+          Icon(Icons.info_outline, size: 15, color: p.accent),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '文件太多，只显示了前 $kStorageScanMaxFiles 个，可用搜索缩小范围',
+              style: TextStyle(fontSize: 11.5, color: p.textSub),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+

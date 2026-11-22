@@ -32,6 +32,7 @@ import '../ui/site_icon.dart';
 import '../ui/variant_picker.dart';
 import '../ui/web_favorites_page.dart';
 import '../ui/widgets/app_menu.dart';
+import '../ui/widgets/home_search_box.dart';
 
 /// 地址栏右上角三点菜单的动作
 enum _UrlMenuAction {
@@ -1068,7 +1069,10 @@ class _BrowserTabState extends State<BrowserTab> {
   }
 }
 
-/// 原生起始页：不加载任何远端首页，避免被 App 深链劫持
+/// 原生起始页：不加载任何远端首页，避免被 App 深链劫持。
+///
+/// 只保留能用的东西：搜索框、常用站点、快速访问、收藏与历史。
+/// 刻意不写「怎么用」的引导文案——第一次打开就该直接能搜。
 class _StartPage extends StatelessWidget {
   const _StartPage({required this.onOpen});
 
@@ -1079,69 +1083,12 @@ class _StartPage extends StatelessWidget {
     final p = paletteOf(context);
 
     return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(24, 44, 24, 24),
+      padding: const EdgeInsets.fromLTRB(24, 40, 24, 24),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              Container(
-                width: 44,
-                height: 44,
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [p.accent, p.accentAlt],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: const Icon(Icons.bolt, color: Colors.white, size: 26),
-              ),
-              const SizedBox(width: 12),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Nerelict',
-                    style: TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.w700,
-                      color: p.text,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    '浏览网页 · 视频接管 · 嗅探下载',
-                    style: TextStyle(fontSize: 12, color: p.textFaint),
-                  ),
-                ],
-              ),
-            ],
-          ),
-          const SizedBox(height: 22),
-          // 首页居中搜索框：输入即用设置里的搜索引擎，也可直接输入网址
-          _HomeSearchBox(onSubmit: onOpen),
+          HomeSearchBox(onSubmit: onOpen),
           const SizedBox(height: 26),
-          _Step(
-            p: p,
-            index: '1',
-            title: '打开视频页面',
-            desc: '在上方地址栏输入网址，或点下面的快速访问',
-          ),
-          _Step(
-            p: p,
-            index: '2',
-            title: '自动接管播放',
-            desc: '检测到可播放视频时在当前页打开 Nerelict，支持 HLS / MP4',
-          ),
-          _Step(
-            p: p,
-            index: '3',
-            title: '下载与 MP4',
-            desc: '播放器内一键下载（不跳页）；完成后自动转 MP4 并清理原 TS，也可在「文件」页手动批量转换',
-          ),
-          const SizedBox(height: 20),
           Text(
             '常用站点',
             style: TextStyle(fontSize: 13, color: p.textFaint),
@@ -1180,165 +1127,7 @@ class _StartPage extends StatelessWidget {
           _WebFavoritesSection(onOpen: onOpen),
           const SizedBox(height: 24),
           _HistorySection(onOpen: onOpen),
-          const SizedBox(height: 24),
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: p.surface,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: p.border),
-            ),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Icon(Icons.info_outline, size: 15, color: p.textFaint),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    '自动接管、浅色主题、MP4 转换都可以在「设置」里开关。'
-                    '下载位置也可在「设置」中自由选择。',
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: p.textFaint,
-                      height: 1.5,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
         ],
-      ),
-    );
-  }
-}
-
-/// 首页居中搜索框：霓虹渐变描边 + 聚焦光晕，提交后走与地址栏同一条打开逻辑。
-class _HomeSearchBox extends StatefulWidget {
-  const _HomeSearchBox({required this.onSubmit});
-
-  final void Function(String) onSubmit;
-
-  @override
-  State<_HomeSearchBox> createState() => _HomeSearchBoxState();
-}
-
-class _HomeSearchBoxState extends State<_HomeSearchBox> {
-  final TextEditingController _ctrl = TextEditingController();
-  final FocusNode _focus = FocusNode();
-  bool _focused = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _focus.addListener(() {
-      if (!mounted) return;
-      setState(() => _focused = _focus.hasFocus);
-    });
-  }
-
-  @override
-  void dispose() {
-    _focus.dispose();
-    _ctrl.dispose();
-    super.dispose();
-  }
-
-  void _submit() {
-    final text = _ctrl.text.trim();
-    if (text.isEmpty) return;
-    _focus.unfocus();
-    widget.onSubmit(text);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final p = paletteOf(context);
-    final engine = context.watch<SettingsState>().searchEngine;
-
-    return Center(
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 560),
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 200),
-          curve: Curves.easeOut,
-          padding: const EdgeInsets.all(1.2),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(28),
-            gradient: LinearGradient(
-              begin: Alignment.centerLeft,
-              end: Alignment.centerRight,
-              colors: _focused
-                  ? const <Color>[kNeonCyan, Color(0xFF7C5CFF), kNeonMagenta]
-                  : <Color>[
-                      p.border,
-                      p.border,
-                    ],
-            ),
-            boxShadow: _focused
-                ? <BoxShadow>[
-                    BoxShadow(
-                      color: kNeonCyan.withValues(alpha: 0.30),
-                      blurRadius: 18,
-                      spreadRadius: 1,
-                    ),
-                  ]
-                : null,
-          ),
-          child: Container(
-            height: 48,
-            padding: const EdgeInsets.only(left: 15, right: 7),
-            decoration: BoxDecoration(
-              color: p.surface,
-              borderRadius: BorderRadius.circular(27),
-            ),
-            child: Row(
-              children: [
-                Icon(
-                  Icons.search,
-                  size: 18,
-                  color: _focused ? kNeonCyan : p.textFaint,
-                ),
-                const SizedBox(width: 9),
-                Expanded(
-                  child: TextField(
-                    controller: _ctrl,
-                    focusNode: _focus,
-                    textInputAction: TextInputAction.search,
-                    textAlignVertical: TextAlignVertical.center,
-                    autocorrect: false,
-                    style: TextStyle(fontSize: 13.5, color: p.text),
-                    decoration: InputDecoration(
-                      isDense: true,
-                      border: InputBorder.none,
-                      hintText: '搜索或输入网址 · ${engine.label}',
-                      hintStyle: TextStyle(fontSize: 13, color: p.textFaint),
-                    ),
-                    onSubmitted: (_) => _submit(),
-                  ),
-                ),
-                InkWell(
-                  onTap: _submit,
-                  borderRadius: BorderRadius.circular(18),
-                  child: Container(
-                    width: 32,
-                    height: 32,
-                    decoration: const BoxDecoration(
-                      shape: BoxShape.circle,
-                      gradient: LinearGradient(
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
-                        colors: <Color>[kNeonCyan, kNeonMagenta],
-                      ),
-                    ),
-                    child: const Icon(Icons.arrow_forward,
-                        size: 17, color: Colors.white),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
       ),
     );
   }
@@ -1822,74 +1611,6 @@ class _VideoFloatEntry extends StatelessWidget {
             ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-class _Step extends StatelessWidget {
-  const _Step({
-    required this.p,
-    required this.index,
-    required this.title,
-    required this.desc,
-  });
-
-  final AppPalette p;
-  final String index;
-  final String title;
-  final String desc;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 18),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            width: 22,
-            height: 22,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              color: p.accent.withValues(alpha: 0.16),
-              shape: BoxShape.circle,
-            ),
-            child: Text(
-              index,
-              style: TextStyle(
-                fontSize: 11,
-                color: p.accent,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                    color: p.text,
-                  ),
-                ),
-                const SizedBox(height: 3),
-                Text(
-                  desc,
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: p.textFaint,
-                    height: 1.4,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
       ),
     );
   }

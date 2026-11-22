@@ -2,13 +2,18 @@
 ///
 /// 设计取舍（与单窗口主界面刻意分开）：
 /// - 每个窗口一个 `WebViewController` + 一份 `BrowserWindow` 快照，用 `IndexedStack`
-///   保活，窗口条切换只换 index，不重建别人的 State；
+///   保活，切换窗口只换 index，不重建别人的 State；
 /// - 多窗口是**轻量浏览上下文**：不注入嗅探 / 点击捕获 / 浮层播放脚本。那些脚本
 ///   依赖 `AppState` 聚合器与 `PageCookieProbe` 等「单一当前页」的全局单例，
 ///   同时挂到多个 WebView 上会互相串扰；下载与嗅探仍以主界面单窗口为准；
 /// - 窗口元数据留在 `WindowsState`，`WebViewController` 由 `BrowserWindowView` 持有，
 ///   关闭窗口或退出页面时统一走 `_releaseController()`：先换掉导航回调，
 ///   再卸载到 `about:blank`，让页面里的媒体、定时器和请求停下来。
+///
+/// 交互按主流手机浏览器的习惯摆：顶部一条地址栏、底部一条工具条
+/// （后退 / 前进 / 首页 / 窗口 / 关闭），窗口列表收进「窗口」里以卡片总览，
+/// 不再常驻一条标签条——常驻标签条在窄屏上会挤掉地址栏，切窗口也不直观。
+/// 新建窗口直接落在首页（搜索框 + 常用站点），而不是先弹一个要网址的对话框。
 library;
 
 import 'dart:async';
@@ -27,11 +32,12 @@ import '../state/window_registry.dart';
 import '../state/windows_state.dart';
 import 'app_theme.dart';
 import 'neon_progress_bar.dart';
+import 'widgets/home_search_box.dart';
 
 /// 多窗口会话的入口。
 ///
-/// [initialUrl] 由主界面传入当前地址，进入后作为第一个窗口打开；为空则显示空状态，
-/// 由用户点「新建窗口」。每次 push 都是一份新的 `WindowsState`，退出页面不会留下
+/// [initialUrl] 由主界面传入当前地址，进入后作为第一个窗口打开；为空则直接开一个
+/// 落在首页的空白窗口。每次 push 都是一份新的 `WindowsState`，退出页面不会留下
 /// 后台常驻的 WebView，也不会有跨会话的重复实例。
 class BrowserWindowsPage extends StatelessWidget {
   const BrowserWindowsPage({super.key, this.initialUrl});
@@ -59,7 +65,7 @@ class _BrowserWindowsView extends StatefulWidget {
 class _BrowserWindowsViewState extends State<_BrowserWindowsView> {
   late final WindowsState _windows;
 
-  /// 窗口 id → controller。控制栏的前进 / 后退 / 刷新按活动窗口从这里取。
+  /// 窗口 id → controller。控制条的前进 / 后退 / 刷新按活动窗口从这里取。
   final Map<String, WebViewController> _controllers =
       <String, WebViewController>{};
 
@@ -77,16 +83,20 @@ class _BrowserWindowsViewState extends State<_BrowserWindowsView> {
   void initState() {
     super.initState();
     _windows = context.read<WindowsState>();
-    final url = widget.initialUrl;
-    if (url != null && url.startsWith('http')) {
-      // 放在首帧之后：`open()` 会 notifyListeners，不能在 build 阶段改状态
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted || _initialOpened) return;
-        _initialOpened = true;
+    // 放在首帧之后：`open()` / `openBlank()` 会 notifyListeners，
+    // 不能在 build 阶段改状态
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _initialOpened) return;
+      _initialOpened = true;
+      final url = widget.initialUrl;
+      if (url != null && url.startsWith('http')) {
         final op = _windows.open(url);
         if (!op.ok) _toast(op.message ?? '无法打开窗口');
-      });
-    }
+      } else {
+        // 没有可接管的地址就开一个首页窗口，用户进来就有地方输入
+        _newWindow();
+      }
+    });
   }
 
   @override
@@ -165,156 +175,89 @@ class _BrowserWindowsViewState extends State<_BrowserWindowsView> {
     final stackIndex = index < 0
         ? 0
         : (index < children.length ? index : children.length - 1);
+    final showHome = active != null && active.isHome;
 
     return Scaffold(
       backgroundColor: p.bg,
-      appBar: AppBar(
-        backgroundColor: p.navBg,
-        foregroundColor: p.text,
-        title: Text(
-          active?.displayTitle ?? '多窗口浏览',
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
-        actions: <Widget>[
-          IconButton(
-            tooltip: '新建窗口',
-            icon: const Icon(Icons.add),
-            onPressed: _showNewWindowDialog,
-          ),
-          if (windows.isNotEmpty)
-            IconButton(
-              tooltip: '关闭全部窗口',
-              icon: const Icon(Icons.clear_all),
-              onPressed: _confirmCloseAll,
-            ),
-        ],
-      ),
-      body: Column(
-        children: <Widget>[
-          _buildWindowStrip(p, state, windows),
-          _buildUrlBar(p, active),
-          _buildToolbar(p, active),
-          Expanded(
-            child: Stack(
-              children: <Widget>[
-                if (children.isEmpty)
-                  _EmptyWindowsView(onNew: _showNewWindowDialog)
-                else
-                  IndexedStack(index: stackIndex, children: children),
-                if (active?.error != null)
-                  Positioned.fill(
-                    child: _WindowErrorView(
-                      message: active!.error!,
-                      onRetry: _retryActive,
-                      onNewUrl: () => _urlFocus.requestFocus(),
-                    ),
-                  ),
-                Positioned(
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  child: IgnorePointer(
-                    child: NeonProgressBar(
-                      value: active?.loading == true
-                          ? (active!.progress <= 0 ? null : active.progress)
-                          : 1.0,
-                      visible: active?.loading == true,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildWindowStrip(
-    AppPalette p,
-    WindowsState state,
-    List<BrowserWindow> windows,
-  ) {
-    return Container(
-      height: 46,
-      color: p.navBg,
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-        itemCount: windows.length + 1,
-        separatorBuilder: (_, __) => const SizedBox(width: 6),
-        itemBuilder: (context, i) {
-          if (i == windows.length) {
-            return ActionChip(
-              avatar: Icon(Icons.add, size: 15, color: p.textSub),
-              label: Text('新建', style: TextStyle(fontSize: 12, color: p.textSub)),
-              backgroundColor: p.surfaceAlt,
-              onPressed: _showNewWindowDialog,
-            );
-          }
-          final w = windows[i];
-          final selected = w.id == state.activeId;
-          return GestureDetector(
-            onTap: () => _windows.activate(w.id),
-            child: Container(
-              constraints: const BoxConstraints(maxWidth: 168),
-              padding: const EdgeInsets.only(left: 12, right: 3),
-              decoration: BoxDecoration(
-                color: selected
-                    ? p.accent.withValues(alpha: 0.18)
-                    : p.surfaceAlt,
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: selected ? p.accent : p.border),
+      body: SafeArea(
+        bottom: false,
+        child: Column(
+          children: <Widget>[
+            _buildAddressBar(p, active),
+            SizedBox(
+              height: 1.6,
+              child: NeonProgressBar(
+                value: active?.loading == true
+                    ? (active!.progress <= 0 ? null : active.progress)
+                    : 1.0,
+                visible: active?.loading == true,
               ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
+            ),
+            Expanded(
+              child: Stack(
                 children: <Widget>[
-                  Flexible(
-                    child: Text(
-                      w.displayTitle,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 12, color: p.text),
+                  if (children.isEmpty)
+                    _EmptyWindowsView(onNew: _newWindow)
+                  else
+                    IndexedStack(index: stackIndex, children: children),
+                  // 首页盖在 WebView 上而不是替换它：切换窗口时不必重建页面，
+                  // 空白窗口的 WebView 也就停在 about:blank 上等着被导航
+                  if (showHome)
+                    Positioned.fill(
+                      child: _WindowHomeView(
+                        key: ValueKey<String>('window-home-${active.id}'),
+                        onOpen: (text) => _loadInWindow(active.id, text),
+                      ),
                     ),
-                  ),
-                  InkWell(
-                    customBorder: const CircleBorder(),
-                    onTap: () => _closeWindow(w.id),
-                    child: Padding(
-                      padding: const EdgeInsets.all(5),
-                      child: Icon(Icons.close, size: 14, color: p.textFaint),
+                  if (active?.error != null && !showHome)
+                    Positioned.fill(
+                      child: _WindowErrorView(
+                        message: active!.error!,
+                        onRetry: _retryActive,
+                        onNewUrl: _goHomeActive,
+                      ),
                     ),
-                  ),
                 ],
               ),
             ),
-          );
-        },
+            if (windows.isNotEmpty) _buildBottomBar(p, state, active),
+          ],
+        ),
       ),
     );
   }
 
-  Widget _buildUrlBar(AppPalette p, BrowserWindow? active) {
+  /// 顶部地址栏：返回主界面 + 地址输入 + 新建 + 更多。
+  Widget _buildAddressBar(AppPalette p, BrowserWindow? active) {
     return Container(
-      padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
-      color: p.bg,
+      color: p.navBg,
+      padding: const EdgeInsets.fromLTRB(2, 6, 2, 6),
       child: Row(
         children: <Widget>[
+          IconButton(
+            tooltip: '返回主界面',
+            constraints: const BoxConstraints.tightFor(width: 38, height: 38),
+            padding: EdgeInsets.zero,
+            icon: Icon(Icons.arrow_back, size: 20, color: p.textSub),
+            onPressed: () => Navigator.of(context).maybePop(),
+          ),
           Expanded(
             child: Container(
-              height: 40,
+              height: 38,
               decoration: BoxDecoration(
                 color: p.surfaceAlt,
-                borderRadius: BorderRadius.circular(20),
+                borderRadius: BorderRadius.circular(19),
                 border: Border.all(color: p.border),
               ),
-              padding: const EdgeInsets.only(left: 13, right: 4),
-              alignment: Alignment.center,
+              padding: const EdgeInsets.only(left: 12, right: 2),
               child: Row(
                 children: <Widget>[
-                  Icon(Icons.public, size: 16, color: p.textFaint),
-                  const SizedBox(width: 8),
+                  Icon(
+                    active?.isHome == true ? Icons.search : Icons.lock_outline,
+                    size: 15,
+                    color: p.textFaint,
+                  ),
+                  const SizedBox(width: 7),
                   Expanded(
                     child: TextField(
                       controller: _urlCtrl,
@@ -328,7 +271,7 @@ class _BrowserWindowsViewState extends State<_BrowserWindowsView> {
                         isDense: true,
                         isCollapsed: true,
                         border: InputBorder.none,
-                        hintText: '输入网址或搜索',
+                        hintText: '搜索或输入网址',
                         hintStyle:
                             TextStyle(color: p.textFaint, fontSize: 13),
                       ),
@@ -355,81 +298,145 @@ class _BrowserWindowsViewState extends State<_BrowserWindowsView> {
             ),
           ),
           IconButton(
-            tooltip: '前往',
+            tooltip: '新建窗口',
             constraints: const BoxConstraints.tightFor(width: 38, height: 38),
             padding: EdgeInsets.zero,
-            icon: const Icon(Icons.arrow_forward, size: 19),
-            color: active != null ? p.accent : p.textDisabled,
-            onPressed:
-                active != null ? () => _loadInActive(_urlCtrl.text) : null,
+            icon: Icon(Icons.add, size: 22, color: p.textSub),
+            onPressed: _newWindow,
+          ),
+          PopupMenuButton<String>(
+            tooltip: '更多',
+            icon: Icon(Icons.more_vert, size: 20, color: p.textSub),
+            onSelected: (value) {
+              switch (value) {
+                case 'refresh':
+                  final id = active?.id;
+                  if (id != null) _act(id, (c) => c.reload());
+                  break;
+                case 'home':
+                  _goHomeActive();
+                  break;
+                case 'close':
+                  if (active != null) _closeWindow(active.id);
+                  break;
+                case 'close_all':
+                  _confirmCloseAll();
+                  break;
+              }
+            },
+            itemBuilder: (_) => <PopupMenuEntry<String>>[
+              const PopupMenuItem<String>(value: 'refresh', child: Text('刷新')),
+              const PopupMenuItem<String>(value: 'home', child: Text('回到首页')),
+              const PopupMenuItem<String>(
+                  value: 'close', child: Text('关闭当前窗口')),
+              const PopupMenuItem<String>(
+                  value: 'close_all', child: Text('关闭全部窗口')),
+            ],
           ),
         ],
       ),
     );
   }
 
-  Widget _toolButton(
+  Widget _bottomButton(
     AppPalette p, {
     required IconData icon,
-    required String tooltip,
+    required String label,
     required bool enabled,
     required VoidCallback onTap,
   }) {
-    return IconButton(
-      tooltip: tooltip,
-      constraints: const BoxConstraints.tightFor(width: 40, height: 40),
-      padding: EdgeInsets.zero,
-      icon: Icon(icon, size: 18, color: enabled ? p.textSub : p.textDisabled),
-      onPressed: enabled ? onTap : null,
+    final color = enabled ? p.textSub : p.textDisabled;
+    return Expanded(
+      child: InkWell(
+        onTap: enabled ? onTap : null,
+        child: SizedBox(
+          height: 48,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: <Widget>[
+              Icon(icon, size: 20, color: color),
+              const SizedBox(height: 2),
+              Text(label,
+                  style: TextStyle(fontSize: 9.5, color: color),
+                  maxLines: 1),
+            ],
+          ),
+        ),
+      ),
     );
   }
 
-  Widget _buildToolbar(AppPalette p, BrowserWindow? active) {
+  /// 底部工具条：后退 / 前进 / 首页 / 窗口 / 关闭。
+  Widget _buildBottomBar(
+    AppPalette p,
+    WindowsState state,
+    BrowserWindow? active,
+  ) {
     final id = active?.id;
     final hasController = id != null && _controllers.containsKey(id);
     return Container(
-      height: 44,
-      color: p.bg,
-      padding: const EdgeInsets.symmetric(horizontal: 8),
-      child: Row(
-        children: <Widget>[
-          _toolButton(
-            p,
-            icon: Icons.arrow_back,
-            tooltip: '后退',
-            enabled: active?.canGoBack == true && hasController,
-            onTap: () => _act(id, (c) => c.goBack()),
-          ),
-          _toolButton(
-            p,
-            icon: Icons.arrow_forward,
-            tooltip: '前进',
-            enabled: active?.canGoForward == true && hasController,
-            onTap: () => _act(id, (c) => c.goForward()),
-          ),
-          _toolButton(
-            p,
-            icon: Icons.refresh,
-            tooltip: '刷新',
-            enabled: hasController,
-            onTap: () => _act(id, (c) => c.reload()),
-          ),
-          const Spacer(),
-          Text(
-            '${_windows.count} / ${WindowRegistry.maxWindows}',
-            style: TextStyle(fontSize: 11, color: p.textFaint),
-          ),
-          const Spacer(),
-          _toolButton(
-            p,
-            icon: Icons.close,
-            tooltip: '关闭当前窗口',
-            enabled: active != null,
-            onTap: () {
-              if (active != null) _closeWindow(active.id);
-            },
-          ),
-        ],
+      decoration: BoxDecoration(
+        color: p.navBg,
+        border: Border(top: BorderSide(color: p.border)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Row(
+          children: <Widget>[
+            _bottomButton(
+              p,
+              icon: Icons.arrow_back,
+              label: '后退',
+              enabled: active?.canGoBack == true && hasController,
+              onTap: () => _act(id, (c) => c.goBack()),
+            ),
+            _bottomButton(
+              p,
+              icon: Icons.arrow_forward,
+              label: '前进',
+              enabled: active?.canGoForward == true && hasController,
+              onTap: () => _act(id, (c) => c.goForward()),
+            ),
+            _bottomButton(
+              p,
+              icon: Icons.home_outlined,
+              label: '首页',
+              enabled: active != null && !active.isHome,
+              onTap: _goHomeActive,
+            ),
+            Expanded(
+              child: InkWell(
+                onTap: _showWindowManager,
+                child: SizedBox(
+                  height: 48,
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: <Widget>[
+                      _WindowCountIcon(
+                        count: state.count,
+                        color: p.textSub,
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        '窗口 ${state.count}',
+                        style: TextStyle(fontSize: 9.5, color: p.textSub),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            _bottomButton(
+              p,
+              icon: Icons.close,
+              label: '关闭',
+              enabled: active != null,
+              onTap: () {
+                if (active != null) _closeWindow(active.id);
+              },
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -484,13 +491,8 @@ class _BrowserWindowsViewState extends State<_BrowserWindowsView> {
     }
   }
 
-  void _loadInActive(String raw) {
-    final id = _windows.activeId;
-    if (id == null) {
-      // 没有窗口时，地址栏输入等价于「用这个地址新建窗口」
-      _createWindow(raw);
-      return;
-    }
+  /// 把一段输入交给指定窗口：搜索词按当前搜索引擎转地址，网址直接加载。
+  void _loadInWindow(String id, String raw) {
     final parsed = normalizeWindowInput(raw);
     if (parsed.isEmpty || parsed.isInvalid) {
       _toast(parsed.message ?? '地址无效');
@@ -507,8 +509,19 @@ class _BrowserWindowsViewState extends State<_BrowserWindowsView> {
       _toast('地址无效');
       return;
     }
+    _windows.activate(id);
     _windows.markStarted(id, url);
     unawaited(_performLoad(id, controller, uri));
+  }
+
+  void _loadInActive(String raw) {
+    final id = _windows.activeId;
+    if (id == null) {
+      // 没有窗口时，地址栏输入等价于「开一个窗口并加载它」
+      _newWindow(url: raw);
+      return;
+    }
+    _loadInWindow(id, raw);
   }
 
   String _resolveInput(WindowInput parsed) {
@@ -521,13 +534,19 @@ class _BrowserWindowsViewState extends State<_BrowserWindowsView> {
     return parsed.url ?? '';
   }
 
-  void _createWindow(String raw) {
-    final parsed = normalizeWindowInput(raw);
-    if (parsed.isEmpty) {
+  /// 新建窗口：默认落在首页；[url] 非空时直接加载该地址。
+  void _newWindow({String? url}) {
+    final raw = url?.trim() ?? '';
+    if (raw.isEmpty) {
       final op = _windows.openBlank();
-      if (!op.ok) _toast(op.message ?? '无法新建窗口');
+      if (!op.ok) {
+        _toast(op.message ?? '无法新建窗口');
+        return;
+      }
+      _urlCtrl.clear();
       return;
     }
+    final parsed = normalizeWindowInput(raw);
     if (parsed.isInvalid) {
       _toast(parsed.message ?? '地址无效');
       return;
@@ -540,46 +559,26 @@ class _BrowserWindowsViewState extends State<_BrowserWindowsView> {
     }
   }
 
-  Future<void> _showNewWindowDialog() async {
-    if (_windows.isFull) {
-      _toast('最多同时打开 ${WindowRegistry.maxWindows} 个窗口，请先关闭一个');
-      return;
+  /// 当前窗口回到首页：清掉地址与标题，WebView 停到 about:blank 等着下一次导航。
+  void _goHomeActive() {
+    final id = _windows.activeId;
+    if (id == null) return;
+    _windows.goHome(id);
+    final controller = _controllers[id];
+    if (controller != null) {
+      unawaited(_reloadOnly(controller, Uri.parse('about:blank')));
     }
-    final ctrl = TextEditingController();
-    final input = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: paletteOf(ctx).surface,
-        title: const Text('新建窗口'),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          textInputAction: TextInputAction.go,
-          keyboardType: TextInputType.url,
-          autocorrect: false,
-          decoration: const InputDecoration(
-            hintText: '输入网址，留空则新建空白窗口',
-          ),
-          onSubmitted: (v) => Navigator.of(ctx).pop(v),
-        ),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(ctx).pop(ctrl.text),
-            child: const Text('打开'),
-          ),
-        ],
-      ),
-    );
-    ctrl.dispose();
-    if (!mounted || input == null) return;
-    _createWindow(input);
+    _urlCtrl.clear();
   }
 
-  void _closeWindow(String id) => _windows.close(id);
+  /// 关闭一个窗口；关掉最后一个就退出多窗口页，而不是留一个空壳。
+  void _closeWindow(String id) {
+    if (_windows.count <= 1) {
+      Navigator.of(context).maybePop();
+      return;
+    }
+    _windows.close(id);
+  }
 
   Future<void> _confirmCloseAll() async {
     final ok = await showDialog<bool>(
@@ -600,7 +599,7 @@ class _BrowserWindowsViewState extends State<_BrowserWindowsView> {
       ),
     );
     if (ok != true || !mounted) return;
-    _windows.closeAll();
+    Navigator.of(context).maybePop();
   }
 
   void _retryActive() {
@@ -618,10 +617,280 @@ class _BrowserWindowsViewState extends State<_BrowserWindowsView> {
     }
   }
 
-  Future<void> _reloadOnly(WebViewController controller) async {
+  Future<void> _reloadOnly(
+    WebViewController controller, [
+    Uri? target,
+  ]) async {
     try {
-      await controller.reload();
+      if (target != null) {
+        await controller.loadRequest(target);
+      } else {
+        await controller.reload();
+      }
     } catch (_) {}
+  }
+
+  /// 窗口总览：卡片网格，点卡片切换、点 × 关闭，底部可继续新建。
+  Future<void> _showWindowManager() async {
+    final p = paletteOf(context);
+    final state = context.read<WindowsState>();
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: p.surface,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.of(ctx).size.height * 0.66,
+          ),
+          child: AnimatedBuilder(
+            animation: state,
+            builder: (context, _) {
+              final windows = state.windows;
+              return Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 12, 8),
+                    child: Row(
+                      children: <Widget>[
+                        Text(
+                          '窗口 ${windows.length} / ${WindowRegistry.maxWindows}',
+                          style: TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
+                            color: p.text,
+                          ),
+                        ),
+                        const Spacer(),
+                        TextButton.icon(
+                          onPressed: () {
+                            Navigator.of(ctx).pop();
+                            _newWindow();
+                          },
+                          icon: const Icon(Icons.add, size: 17),
+                          label: const Text('新建窗口',
+                              style: TextStyle(fontSize: 12.5)),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Flexible(
+                    child: GridView.builder(
+                      padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
+                      gridDelegate:
+                          const SliverGridDelegateWithFixedCrossAxisCount(
+                        crossAxisCount: 2,
+                        mainAxisSpacing: 10,
+                        crossAxisSpacing: 10,
+                        childAspectRatio: 1.45,
+                      ),
+                      itemCount: windows.length,
+                      itemBuilder: (context, i) {
+                        final w = windows[i];
+                        return _WindowCard(
+                          window: w,
+                          selected: w.id == state.activeId,
+                          onTap: () {
+                            state.activate(w.id);
+                            Navigator.of(ctx).pop();
+                          },
+                          onClose: () {
+                            if (windows.length <= 1) {
+                              Navigator.of(ctx).pop();
+                              Navigator.of(context).maybePop();
+                              return;
+                            }
+                            state.close(w.id);
+                          },
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 底部「窗口」按钮上的角标：数字直接告诉用户现在开了几个。
+class _WindowCountIcon extends StatelessWidget {
+  const _WindowCountIcon({required this.count, required this.color});
+
+  final int count;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 26,
+      height: 20,
+      child: Stack(
+        clipBehavior: Clip.none,
+        alignment: Alignment.center,
+        children: <Widget>[
+          Icon(Icons.crop_square, size: 19, color: color),
+          Positioned(
+            right: -4,
+            top: -4,
+            child: Container(
+              constraints: const BoxConstraints(minWidth: 13, minHeight: 13),
+              padding: const EdgeInsets.symmetric(horizontal: 3),
+              alignment: Alignment.center,
+              decoration: const BoxDecoration(
+                color: kAccent,
+                borderRadius: BorderRadius.all(Radius.circular(7)),
+              ),
+              child: Text(
+                '$count',
+                style: const TextStyle(
+                  fontSize: 8.5,
+                  height: 1.1,
+                  color: Colors.black,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 窗口总览里的一张卡片。
+class _WindowCard extends StatelessWidget {
+  const _WindowCard({
+    required this.window,
+    required this.selected,
+    required this.onTap,
+    required this.onClose,
+  });
+
+  final BrowserWindow window;
+  final bool selected;
+  final VoidCallback onTap;
+  final VoidCallback onClose;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = paletteOf(context);
+    final host = window.url == null ? '' : (Uri.tryParse(window.url!)?.host ?? '');
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(11, 9, 6, 8),
+        decoration: BoxDecoration(
+          color: p.surfaceAlt,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: selected ? kAccent : p.border,
+            width: selected ? 1.4 : 1,
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Row(
+              children: <Widget>[
+                Expanded(
+                  child: Text(
+                    window.displayTitle,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      height: 1.3,
+                      color: p.text,
+                      fontWeight:
+                          selected ? FontWeight.w600 : FontWeight.w400,
+                    ),
+                  ),
+                ),
+                InkWell(
+                  customBorder: const CircleBorder(),
+                  onTap: onClose,
+                  child: Padding(
+                    padding: const EdgeInsets.all(4),
+                    child: Icon(Icons.close, size: 14, color: p.textFaint),
+                  ),
+                ),
+              ],
+            ),
+            const Spacer(),
+            Text(
+              host.isEmpty ? '首页' : host,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 10.5, color: p.textFaint),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 空白窗口里的首页：搜索框 + 常用站点。不加载远端页面，也不做嗅探。
+class _WindowHomeView extends StatelessWidget {
+  const _WindowHomeView({super.key, required this.onOpen});
+
+  final void Function(String) onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = paletteOf(context);
+    return Container(
+      color: p.bg,
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(22, 46, 22, 24),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            HomeSearchBox(onSubmit: onOpen),
+            const SizedBox(height: 24),
+            Text('常用站点',
+                style: TextStyle(fontSize: 12.5, color: p.textFaint)),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: <Widget>[
+                for (final site in const <(String, String)>[
+                  ('hls.js 演示页', 'https://hlsjs.video-dev.org/demo/'),
+                  ('Bing', 'https://www.bing.com'),
+                  ('百度', 'https://m.baidu.com'),
+                  ('谷歌', 'https://www.google.com'),
+                ])
+                  InkWell(
+                    onTap: () => onOpen(site.$2),
+                    borderRadius: BorderRadius.circular(9),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: p.surface,
+                        borderRadius: BorderRadius.circular(9),
+                        border: Border.all(color: p.border),
+                      ),
+                      child: Text(
+                        site.$1,
+                        style: TextStyle(fontSize: 12, color: p.textSub),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 
@@ -694,8 +963,8 @@ class _BrowserWindowViewState extends State<BrowserWindowView> {
           onNavigationRequest: (request) {
             if (_disposed) return NavigationDecision.prevent;
             final url = request.url;
-            // about:blank 是关闭窗口时卸载页面用的，必须放行
-            if (url == 'about:blank' ||
+            // about:blank 是关闭窗口 / 回首页时卸载页面用的，必须放行
+            if (url == _kBlank ||
                 url.startsWith('http://') ||
                 url.startsWith('https://')) {
               return NavigationDecision.navigate;
@@ -704,6 +973,7 @@ class _BrowserWindowViewState extends State<BrowserWindowView> {
             return NavigationDecision.prevent;
           },
           onPageStarted: (url) {
+            if (_isBlank(url)) return;
             if (_alive) _windows.markStarted(widget.windowId, url);
           },
           onProgress: (progress) {
@@ -715,7 +985,8 @@ class _BrowserWindowViewState extends State<BrowserWindowView> {
             _windows.setProgress(widget.windowId, next);
           },
           onPageFinished: (url) async {
-            if (!_alive) return;
+            // 回首页时会把窗口载到 about:blank：不能拿它覆盖「首页」状态
+            if (_isBlank(url) || !_alive) return;
             String? title;
             try {
               title = await _controller.getTitle();
@@ -727,7 +998,7 @@ class _BrowserWindowViewState extends State<BrowserWindowView> {
           },
           onUrlChange: (change) {
             final url = change.url;
-            if (url == null || !_alive) return;
+            if (url == null || _isBlank(url) || !_alive) return;
             _windows.setUrl(widget.windowId, url);
             // SPA 用 pushState 换地址时不触发 onPageFinished，补读一次标题
             unawaited(_syncTitleFromJs());
@@ -751,6 +1022,10 @@ class _BrowserWindowViewState extends State<BrowserWindowView> {
     }
     return controller;
   }
+
+  static const String _kBlank = 'about:blank';
+
+  bool _isBlank(String? url) => url == null || url.isEmpty || url == _kBlank;
 
   Future<void> _load(Uri? uri) async {
     if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
@@ -878,7 +1153,7 @@ class _WindowErrorView extends StatelessWidget {
               FilledButton(onPressed: onRetry, child: const Text('重试')),
               const SizedBox(width: 10),
               OutlinedButton(
-                  onPressed: onNewUrl, child: const Text('换个网址')),
+                  onPressed: onNewUrl, child: const Text('回到首页')),
             ],
           ),
         ],

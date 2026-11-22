@@ -60,6 +60,7 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 | `verify_p1.dart` | `ss_*` 残留清理、直链背压写盘、中途暂停状态收敛 |
 | `verify_v042.dart` | 本地 HTTP 服务跑「选流 / Cookie 鉴权 / 字节区间 / 断点」真实下载（不依赖公网） |
 | `verify_windows.dart` | 多窗口：地址归一化、去重键、状态隔离、去重与上限、生命周期与资源释放护栏（纯 Dart） |
+| `verify_storage_scan.dart` | 文件类型 MIME 嗅探（魔数）与全盘递归扫描：深度/系统目录/隐藏项/半成品/缓存与分片过滤、`includeNoise` 开关、用户目录优先、取消、上限截断（纯 Dart） |
 | `verify_mp4_timeline.dart` | 转封装时间轴算法：B 帧重排识别、等间隔网格重建、缺段缺口（纯算法，不依赖设备） |
 | `verify_download.dart` | 真实公开测试流跑“解析 → 分片 → 解密 → 合并”（依赖公网，可能超时） |
 | `smoke_device.dart` | 真机冒烟：冷启动、三页切换、截图、崩溃日志（需要 adb + 设备，**不进常规回归链**） |
@@ -111,6 +112,31 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
   `window_registry.dart`（纯 Dart，可用 `dart run` 测）+ `windows_state.dart`（ChangeNotifier），
   窗口上限 5 个；关闭时先换掉 `NavigationDelegate` 再卸载 `about:blank`，
   **不要调用 `clearCache()`**（Android 缓存是应用级共享的）。
+- **多窗口交互**（对齐主流手机浏览器）：顶部一条地址栏 + 底部一条工具条
+  （后退 / 前进 / 首页 / 窗口 / 关闭），窗口列表是卡片总览弹窗，**不要再加常驻标签条**；
+  **新建窗口直接 `openBlank()` 落到窗口首页**（`_WindowHomeView`：搜索框 + 常用站点），
+  不要退回「弹对话框要网址」的老做法。首页由 UI 层画，`BrowserWindow.isHome` 即 `url == null`；
+  回首页 / 关闭窗口都会载 `about:blank`，导航回调必须对 `about:blank` 短路
+  （`_isBlank`），否则窗口会被写成「正在加载 about:blank」，首页状态被覆盖。
+- **文件页默认全盘、下载目录进菜单**：`lib/ui/files_tab.dart` 默认递归扫描整个内部存储
+  （`_view == _FilesView.storage`，走 `lib/services/storage_scanner.dart`），下载目录是「更多」
+  菜单里的入口（`_view == _FilesView.downloads` → `AppState.localFiles`）。
+  **全盘与下载目录都可以重命名 / 删除**：两者共用 `showFileManagerSheet`（`onMoved` 把结果回写
+  全盘快照，避免改个名字就重扫整个存储）；删除先进回收站，`FileTrash` 用 `.origin` 旁注记下原路径，
+  撤销时回到删除前的目录。类型识别分两级：扩展名映射 `kExtKinds` 优先，无/未知扩展名
+  读文件头魔数 `sniffKind` 兜底；`file_kinds.dart` 与 `storage_scanner.dart` 都保持纯 Dart
+  （`LocalFile` 已挪进 `file_kinds.dart`），能被 `dart run` 直接断言。全盘扫描需
+  `MANAGE_EXTERNAL_STORAGE`（「所有文件访问权限」），未授权显示引导卡。
+- **全盘扫描必须过滤缓存与分片**（对齐系统 MediaStore，也是夸克 / 迅雷文件管理「识别正常」的原因）：
+  - 任意层级跳过 `kStorageSkipDirs`（`Android`、`LOST.DIR` 等）与 `kNoiseDirNames`
+    （`cache` / `thumbnails` / `tmp` / `logs` / `trash` 等），带 `.nomedia` 标记的目录整体跳过；
+  - 同一目录内「纯数字段号 + 媒体扩展名」（`253.ts`、`0012.m4s`）达到 `kSegmentGroupMin = 3`
+    个，才整组判为 HLS 缓存分片；**不要改成单文件判定**，否则 `2024.mp4` 这类正常命名会被误杀；
+  - `seg_<hash>.bin` / `*.part` / `*.tmp` 是下载半成品，任何情况都不列；
+  - 用户目录（`kStoragePriorityDirs`：Download / DCIM / Movies / Pictures / Music …）优先扫描，
+    避免文件数上限（`kStorageScanMaxFiles`）先被冷门目录吃光；
+  - 过滤是固定策略：**界面上不再有「显示缓存与视频分片」开关，也不弹「忽略了 N 个」横幅**；
+    `scanAllStorage` 的 `includeNoise` 只留给回归脚本验证过滤本身。
 - 注释与文档用简体中文，全角标点，引号用“”，不用直角引号；代码标识符用反引号。
 - 换行符按 `.gitattributes`：文本 LF，`*.bat` CRLF。`gradlew` 必须保持 LF，否则 Linux/CI 无法执行。
 

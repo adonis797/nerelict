@@ -345,8 +345,8 @@ void main() {
       projectFile('lib/ui/files_tab.dart').existsSync() &&
           !projectFile('lib/ui/downloads_tab.dart').existsSync(),
       '下载页拆分为文件页 + 下载分支');
-  check(filesTab.contains('_dir == null ? state.localFiles : _entries'),
-      '文件页按当前目录取数据源（下载目录 / 外部目录）');
+  check(filesTab.contains('_view == _FilesView.storage'),
+      '文件页默认全盘视图，下载目录是菜单入口');
   check(!filesTab.contains('knownPaths'), '不再排除已完成任务引用的文件（修复文件不显示）');
   check(filesTab.contains('DownloadTasksPage'), '顶部菜单可进入下载分支');
   check(!filesTab.contains('cleaning_services_outlined'), '文件页顶部不再放清理扫把');
@@ -968,16 +968,25 @@ void main() {
       '扫描支持任意目录与目录条目');
   check(scanner37.contains('isDir'), '目录是单独的条目类型');
   final files37 = read('lib/ui/files_tab.dart');
-  check(files37.contains('_enterDir') && files37.contains('_leaveDir'),
-      '能进子目录并能退回上级');
-  check(files37.contains('_Breadcrumb'), '面包屑说明当前位置');
+  check(files37.contains('_switchToStorage') && files37.contains('_switchToDownloads'),
+      '全盘视图与下载目录视图之间可切换');
+  check(files37.contains('scanAllStorage'), '全盘视图走递归扫描器');
   check(files37.contains('_AccessCard') && files37.contains('_requestAccess'),
       '未授权时给出引导卡');
   check(files37.contains('didChangeAppLifecycleState'),
       '回到前台重新检查授权（系统设置里开完即生效）');
-  check(files37.contains('bool get _canManage => _dir == null'),
-      '下载目录之外只读：别处不开放删除与重命名');
-  check(files37.contains('此目录只读'), '只读目录在菜单里说明原因');
+  check(files37.contains('_manageFiles') &&
+          files37.contains('onMoved: _applyMoved'),
+      '全盘视图的重命名与删除走统一管理面板，并把结果就地回写列表');
+  check(files37.contains('_StorageNoiseBanner') == false,
+      '不再显示分片 / 缓存过滤横幅：按固定策略过滤，不做开关');
+  // 全盘可删之后，回收站必须记住原目录，否则撤销会把系统目录里的文件搬进下载目录
+  final trash37 = read('lib/services/file_trash.dart');
+  check(trash37.contains('originSuffix') && trash37.contains('_readOrigin'),
+      '回收站记录原路径，撤销回到删除前的目录');
+  check(trash37.contains('_moveFile') && trash37.contains('from.copy(target)'),
+      '跨挂载点时 rename 失败退回「复制 + 删源」（Android 11+ 公共目录与私有目录不同挂载点）');
+  check(files37.contains('_applyMoved'), '改名 / 删除后就地回写全盘列表');
   // 返回键必须先把「页面自己的子状态」问一遍，再切标签：
   // 以前 main.dart 先无条件 setTab(0)，文件页的退多选/退目录永远轮不到。
   final main37 = read('lib/main.dart');

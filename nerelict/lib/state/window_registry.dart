@@ -203,6 +203,14 @@ class WindowRegistry {
     );
   }
 
+  /// 回到首页：清掉地址、标题与导航状态，但保留窗口本身（WebView 不销毁）。
+  bool goHome(String id) {
+    return update(
+      id,
+      (w) => BrowserWindow(id: w.id, createdAt: w.createdAt),
+    );
+  }
+
   bool setNavigation(
     String id, {
     required bool canGoBack,

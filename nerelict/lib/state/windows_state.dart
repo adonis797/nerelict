@@ -99,6 +99,13 @@ class WindowsState extends ChangeNotifier {
     return changed;
   }
 
+  /// 回到首页：地址、标题、前进后退都清空，窗口保留。
+  bool goHome(String id) {
+    final changed = _registry.goHome(id);
+    if (changed) _changed();
+    return changed;
+  }
+
   bool setNavigation(
     String id, {
     required bool canGoBack,

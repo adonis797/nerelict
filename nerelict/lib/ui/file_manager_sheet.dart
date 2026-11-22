@@ -10,10 +10,14 @@ import 'app_theme.dart';
 ///
 /// 所有写操作都走 AppState 的统一方法，保证任务引用、播放进度、收藏与
 /// 本地视频列表一起更新；面板自身也在操作后重新读取磁盘元信息。
+///
+/// [onMoved] 用于把「改名 / 删除」的结果告诉调用方：全盘视图拿到的是扫描结果
+/// 快照，不重新扫一遍也要能立刻反映这次改动（`to` 为 null 表示删除）。
 Future<void> showFileManagerSheet(
   BuildContext context, {
   required List<String> paths,
   required VoidCallback onChanged,
+  void Function(String from, String? to)? onMoved,
 }) async {
   final state = context.read<AppState>();
   final p = paletteOf(context);
@@ -31,6 +35,7 @@ Future<void> showFileManagerSheet(
     builder: (ctx) => _FileManagerSheet(
       paths: paths.toSet().toList(),
       onChanged: onChanged,
+      onMoved: onMoved,
     ),
   );
 
@@ -40,10 +45,15 @@ Future<void> showFileManagerSheet(
 }
 
 class _FileManagerSheet extends StatefulWidget {
-  const _FileManagerSheet({required this.paths, required this.onChanged});
+  const _FileManagerSheet({
+    required this.paths,
+    required this.onChanged,
+    this.onMoved,
+  });
 
   final List<String> paths;
   final VoidCallback onChanged;
+  final void Function(String from, String? to)? onMoved;
 
   @override
   State<_FileManagerSheet> createState() => _FileManagerSheetState();
@@ -144,6 +154,9 @@ class _FileManagerSheetState extends State<_FileManagerSheet> {
     final targets = _selected.toList();
     try {
       await _state.deleteDownloadedFiles(targets);
+      for (final t in targets) {
+        widget.onMoved?.call(t, null);
+      }
       _paths.removeWhere(targets.contains);
       widget.onChanged();
       _selected.clear();
@@ -241,6 +254,7 @@ class _FileManagerSheetState extends State<_FileManagerSheet> {
       final next = await _state.renameDownloadedFile(file.path, value);
       final index = _paths.indexOf(file.path);
       if (index >= 0) _paths[index] = next;
+      widget.onMoved?.call(file.path, next);
       widget.onChanged();
       await _reload();
       _flash('已重命名，任务与列表状态已同步');
@@ -281,6 +295,7 @@ class _FileManagerSheetState extends State<_FileManagerSheet> {
     try {
       await _state.deleteDownloadedFile(file.path);
       _paths.remove(file.path);
+      widget.onMoved?.call(file.path, null);
       widget.onChanged();
       await _reload();
       _flash('已删除，列表与任务状态已同步');

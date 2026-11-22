@@ -150,8 +150,25 @@ void main() {
   check(BrowserWindow(id: 'x', createdAt: t, url: 'https://a.example/p')
           .displayTitle ==
       'a.example', '无标题时显示域名');
-  check(BrowserWindow(id: 'x', createdAt: t).displayTitle == '新窗口',
-      '空白窗口显示「新窗口」');
+  check(BrowserWindow(id: 'x', createdAt: t).displayTitle == '新标签页',
+      '空白窗口显示「新标签页」');
+  check(BrowserWindow(id: 'x', createdAt: t).isHome, '地址为空即首页');
+  check(!BrowserWindow(id: 'x', createdAt: t, url: 'https://a.example').isHome,
+      '有地址就不是首页');
+
+  stdout.writeln('=== 7b. 回首页 ===');
+  final home = WindowRegistry();
+  final homeOp = home.open('https://a.example/p');
+  home.setTitle(homeOp.id!, '页面标题');
+  home.markFinished(homeOp.id!, '页面标题');
+  home.setNavigation(homeOp.id!, canGoBack: true, canGoForward: true);
+  check(home.goHome(homeOp.id!), '可以把窗口退回首页');
+  final homeWindow = home.byId(homeOp.id!)!;
+  check(homeWindow.isHome && homeWindow.url == null, '回首页后地址清空');
+  check(homeWindow.title == null && !homeWindow.canGoBack && !homeWindow.canGoForward,
+      '回首页后标题与前进后退状态一起清空');
+  check(homeWindow.displayTitle == '新标签页', '回首页后显示名回到新标签页');
+  check(!home.goHome('不存在'), '对不存在的窗口回首页不抛异常');
   check(BrowserWindow(id: 'x', createdAt: t, title: '  页面  ')
           .displayTitle ==
       '页面', '标题优先且去空白');
@@ -199,6 +216,15 @@ void main() {
   check(page.contains('_released.add(controller)'), 'controller 释放按身份去重');
   check(!page.contains('SniffChannel') && !page.contains('kSniffJs'),
       '多窗口不注入嗅探脚本，避免全局单例串扰');
+  check(page.contains('_windows.openBlank()') && !page.contains('_showNewWindowDialog'),
+      '新建窗口直接落在首页，不再先弹「输入网址」对话框');
+  check(page.contains('_WindowHomeView'), '空白窗口显示原生首页（搜索框 + 常用站点）');
+  check(page.contains('_showWindowManager'), '窗口列表以卡片总览呈现');
+  check(page.contains("case 'home':") || page.contains('_goHomeActive'),
+      '能把窗口退回首页');
+  check(page.contains('_isBlank'), 'about:blank 不写回窗口地址，首页状态不被覆盖');
+  check(page.contains('_buildBottomBar') && page.contains("label: '后退'"),
+      '底部工具条提供后退 / 前进 / 首页 / 窗口 / 关闭');
   check(tab.contains('BrowserWindowsPage(initialUrl: _currentUrl)'),
       '主界面把当前地址带进多窗口页');
   check(tab.contains('_openingWindows'), '多窗口入口有重复 push 防抖');
