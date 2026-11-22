@@ -112,6 +112,8 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
   `window_registry.dart`（纯 Dart，可用 `dart run` 测）+ `windows_state.dart`（ChangeNotifier），
   窗口上限 5 个；关闭时先换掉 `NavigationDelegate` 再卸载 `about:blank`，
   **不要调用 `clearCache()`**（Android 缓存是应用级共享的）。
+- **多窗口入口必须留在首页第一屏**：起始页搜索框下方常驻 `_WindowsEntryCard`（`browser_tab.dart`），
+  和三点菜单里的同名项并存；上限文案取 `WindowRegistry.maxWindows`，不要写死数字。
 - **多窗口交互**（对齐主流手机浏览器）：顶部一条地址栏 + 底部一条工具条
   （后退 / 前进 / 首页 / 窗口 / 关闭），窗口列表是卡片总览弹窗，**不要再加常驻标签条**；
   **新建窗口直接 `openBlank()` 落到窗口首页**（`_WindowHomeView`：搜索框 + 常用站点），

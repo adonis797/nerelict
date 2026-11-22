@@ -24,6 +24,7 @@ import '../state/app_state.dart';
 import '../state/history_state.dart';
 import '../state/settings_state.dart';
 import '../state/web_favorites_state.dart';
+import '../state/window_registry.dart' show WindowRegistry;
 import '../ui/app_theme.dart';
 import '../ui/browser_windows_page.dart';
 import '../ui/history_page.dart';
@@ -824,7 +825,7 @@ class _BrowserTabState extends State<BrowserTab> {
                   ],
                 )
               else
-                _StartPage(onOpen: _open),
+                _StartPage(onOpen: _open, onWindows: _openWindows),
               // 赛博朋克霓虹加载进度：浮在内容顶部，不占布局高度
               Positioned(
                 top: -2,
@@ -1071,24 +1072,29 @@ class _BrowserTabState extends State<BrowserTab> {
 
 /// 原生起始页：不加载任何远端首页，避免被 App 深链劫持。
 ///
-/// 只保留能用的东西：搜索框、常用站点、快速访问、收藏与历史。
+/// 只保留能用的东西：搜索框、多窗口入口、常用站点、快速访问、收藏与历史。
 /// 刻意不写「怎么用」的引导文案——第一次打开就该直接能搜。
 class _StartPage extends StatelessWidget {
-  const _StartPage({required this.onOpen});
+  const _StartPage({required this.onOpen, required this.onWindows});
 
   final void Function(String) onOpen;
+
+  /// 进入多窗口页：首页是「一眼能看到」的入口，不再只藏在三点菜单里
+  final VoidCallback onWindows;
 
   @override
   Widget build(BuildContext context) {
     final p = paletteOf(context);
 
     return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(24, 40, 24, 24),
+      padding: const EdgeInsets.fromLTRB(24, 32, 24, 24),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           HomeSearchBox(onSubmit: onOpen),
-          const SizedBox(height: 26),
+          const SizedBox(height: 14),
+          _WindowsEntryCard(onTap: onWindows),
+          const SizedBox(height: 24),
           Text(
             '常用站点',
             style: TextStyle(fontSize: 13, color: p.textFaint),
@@ -1128,6 +1134,71 @@ class _StartPage extends StatelessWidget {
           const SizedBox(height: 24),
           _HistorySection(onOpen: onOpen),
         ],
+      ),
+    );
+  }
+}
+
+/// 首页的多窗口入口：卡片紧贴搜索框下方，进浏览器第一屏就能看到。
+///
+/// 主界面只维护一个浏览上下文，多窗口是另一套独立的 WebView 集合；
+/// 把它做成首页常驻入口，比只放在右上角三点菜单里更容易被发现。
+class _WindowsEntryCard extends StatelessWidget {
+  const _WindowsEntryCard({required this.onTap});
+
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = paletteOf(context);
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+        decoration: BoxDecoration(
+          color: p.surface,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: p.isCyber ? p.accent.withValues(alpha: 0.32) : p.border,
+          ),
+        ),
+        child: Row(
+          children: <Widget>[
+            Container(
+              width: 32,
+              height: 32,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: p.accent.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(9),
+              ),
+              child: Icon(Icons.filter_none, size: 17, color: p.accent),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Text(
+                    '多窗口浏览',
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: p.text,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    '同时开多个网页，最多 ${WindowRegistry.maxWindows} 个',
+                    style: TextStyle(fontSize: 10.5, color: p.textFaint),
+                  ),
+                ],
+              ),
+            ),
+            Icon(Icons.chevron_right, size: 18, color: p.textFaint),
+          ],
+        ),
       ),
     );
   }
