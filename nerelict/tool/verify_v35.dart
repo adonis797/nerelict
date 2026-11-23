@@ -1272,6 +1272,26 @@ void main() {
   check(enterAt >= 0 && showAt > enterAt,
       '每次弹窗前现查权限，用户收回权限后不会再弹');
 
+  // ---- 悬浮小窗的形状与缩放 ----
+  final stageKt = read(
+      'android/app/src/main/kotlin/com/nerelict/nerelict/FloatingStageLayout.kt');
+  check(stageKt.contains('const val ASPECT = 16f / 9f'),
+      '小窗台面固定 16:9 横屏，竖屏视频不再把窗口挤成细长竖条');
+  check(stageKt.contains('override fun onLayout(') &&
+          stageKt.contains('videoAspect'),
+      '画面按视频自身比例等比缩放后居中，两侧补黑边而不是拉伸变形');
+  check(floatKt.contains('FloatingStageLayout(appContext)') &&
+          floatKt.contains('onVideoSizeChanged('),
+      '小窗用台面承载画面，并按解码器回报的真实比例重新适配');
+  check(floatKt.contains('ACTION_POINTER_DOWN') &&
+          floatKt.contains('private fun applyWidth('),
+      '双指可以拉伸缩放小窗，缩放只改窗口宽高、不重建视图');
+  check(floatKt.contains('putFloat("scale"') &&
+          floatKt.contains('getFloat("scale"'),
+      '缩放倍率记在本地，下次弹窗沿用用户挑的大小');
+  check(!floatKt.contains('maxVideoHeight'),
+      '窗口尺寸不再跟着视频比例走，宽度只由屏幕与缩放倍率决定');
+
   stdout.writeln();
   if (failures.isEmpty) {
     stdout.writeln('全部通过：$passed 项断言');

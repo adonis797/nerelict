@@ -143,6 +143,13 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
   不许缓存结果；没授权就当后台出声，不要弹任何提示。悬浮窗期间 Dart 侧的
   `updateSession` 由原生丢弃（`_publishSession` 里 `if (_floating) return`），媒体按键走
   `PlayerPlatform.route()` 分流到正在播的那一侧，**不要再直连 `emit()`**。
+- **悬浮窗外框恒 16:9 横屏**（`FloatingStageLayout.kt`）：窗口宽度只由屏幕与缩放倍率决定，
+  **不要再按视频比例算窗口高**——竖屏视频按自身比例开窗会变成一条细长竖条，和横屏视频
+  在同一个角落出现时尺寸来回跳。画面在台面里 `onLayout` 等比居中补黑边（不裁切、不拉伸），
+  真实比例来自 `onVideoSizeChanged`（`unappliedRotationDegrees` 为 90/270 时先换宽高）。
+  双指缩放只改窗口宽高（`applyWidth`，0.5×～2.6×），孩子靠台面自己重排、**不要重建视图**；
+  抬起一根手指必须把 `downX/downY` 重新按剩下那根手指起算，否则窗口会被甩出去；
+  倍率与位置存 `nerelict_floating` 的 `scale` / `x` / `y`。
 - **多窗口交互**（对齐主流手机浏览器）：顶部一条地址栏 + 底部一条工具条
   （后退 / 前进 / 首页 / 窗口 / 关闭），窗口列表是卡片总览弹窗，**不要再加常驻标签条**；
   **新建窗口直接 `openBlank()` 落到窗口首页**（`_WindowHomeView`：搜索框 + 常用站点），

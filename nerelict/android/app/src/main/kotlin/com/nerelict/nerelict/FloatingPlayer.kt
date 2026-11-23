@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.util.DisplayMetrics
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
@@ -23,11 +24,13 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import kotlin.math.abs
+import kotlin.math.hypot
 
 /**
  * 系统悬浮窗播放器（`TYPE_APPLICATION_OVERLAY`）。
@@ -61,7 +64,8 @@ class FloatingPlayer(
     private val prefs =
         appContext.getSharedPreferences("nerelict_floating", Context.MODE_PRIVATE)
 
-    private var root: FrameLayout? = null
+    private var root: View? = null
+    private var stage: FloatingStageLayout? = null
     private var video: TextureView? = null
     private var playPause: ImageButton? = null
     private var timeText: TextView? = null
@@ -69,6 +73,9 @@ class FloatingPlayer(
     private var params: WindowManager.LayoutParams? = null
     private var player: ExoPlayer? = null
     private var ticker: Runnable? = null
+
+    /** 双指缩放后的倍率（相对默认宽度），记在本地，下次弹窗还是这个大小。 */
+    private var scale = 1f
 
     var showing = false
         private set
@@ -149,6 +156,7 @@ class FloatingPlayer(
             }
         }
         root = null
+        stage = null
         video = null
         playPause = null
         timeText = null
@@ -186,33 +194,40 @@ class FloatingPlayer(
         (value * appContext.resources.displayMetrics.density).toInt()
 
     private fun buildViews(aspect: Float) {
+        // 上次双指缩放到多大，这次还是多大
+        scale = prefs.getFloat("scale", 1f).coerceIn(MIN_SCALE, MAX_SCALE)
+
         val metrics = appContext.resources.displayMetrics
-        // 宽度按屏幕比例取，再按视频比例算高；窄到撑不下控制条时保底 150dp
-        var width = (metrics.widthPixels * 0.46f).toInt().coerceIn(dp(150), dp(300))
-        val safeAspect = aspect.coerceIn(0.42f, 2.4f)
         val barHeight = dp(30)
-        var videoHeight = (width / safeAspect).toInt()
-        // 竖屏视频别把高度顶到屏幕上三分之一以上
-        val maxVideoHeight = (metrics.heightPixels * 0.34f).toInt()
-        if (videoHeight > maxVideoHeight) {
-            videoHeight = maxVideoHeight
-            width = (videoHeight * safeAspect).toInt().coerceAtLeast(dp(120))
-        }
-        val height = videoHeight + barHeight
+        val width = windowWidth(metrics)
+        val height = windowHeight(width, barHeight)
 
-        val frame = FrameLayout(appContext)
-        frame.background = GradientDrawable().apply {
-            setColor(Color.parseColor("#0B0E12"))
-            cornerRadius = dp(12).toFloat()
+        // 根用竖直排列：台面高度由宽度推出、控制条固定高，窗口被缩放后自动重排，
+        // 不用重建视图也不会留下空隙
+        val frame = LinearLayout(appContext).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#0B0E12"))
+                cornerRadius = dp(12).toFloat()
+            }
+            clipToOutline = true
         }
-        frame.clipToOutline = true
 
+        // 台面恒 16:9 横屏：竖屏视频在这里被等比缩到中间、两侧补黑边，
+        // 而不是把整个小窗挤成一条细长竖条
+        val stageView = FloatingStageLayout(appContext).apply {
+            videoAspect = if (aspect.isFinite() && aspect > 0f) aspect else 0f
+        }
         val texture = TextureView(appContext)
-        frame.addView(
+        stageView.addView(
             texture,
-            FrameLayout.LayoutParams(width, videoHeight).apply { gravity = Gravity.TOP }
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
         )
         video = texture
+        stage = stageView
 
         // 进度条：2dp 轨道 + 自己算宽的填充，随 tick 更新
         val track = FrameLayout(appContext)
@@ -224,14 +239,19 @@ class FloatingPlayer(
             setBackgroundColor(Color.parseColor("#4C8DFF"))
         }
         track.addView(fill, FrameLayout.LayoutParams(0, -1))
-        frame.addView(
+        stageView.addView(
             track,
-            FrameLayout.LayoutParams(width, dp(2)).apply {
-                topMargin = videoHeight - dp(2)
-                gravity = Gravity.TOP
-            }
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, dp(2))
         )
         progressFill = fill
+
+        frame.addView(
+            stageView,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
 
         val bar = LinearLayout(appContext).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -241,10 +261,7 @@ class FloatingPlayer(
         }
         frame.addView(
             bar,
-            FrameLayout.LayoutParams(width, barHeight).apply {
-                topMargin = videoHeight
-                gravity = Gravity.TOP
-            }
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, barHeight)
         )
 
         val toggle = ImageButton(appContext).apply {
@@ -321,19 +338,25 @@ class FloatingPlayer(
     }
 
     /**
-     * 拖动 / 点按。
+     * 单指拖动 / 双指缩放 / 点击回应用。
      *
-     * 只挂在画面区域：控制条上的按钮要能被正常点中，抢了触摸就点不动了。
-     * 没拖动就算一次点击，直接回应用——这是从其它应用回到全屏播放器最短的路径。
+     * 只挂在根视图上：控制条上的按钮是子 View，会先拿到事件，抢了触摸就点不动了。
+     * 单指没拖动算一次点击，直接回应用——这是从其它应用回到全屏播放器最短的路径。
+     * 两指起手就切成缩放，此时不再拖动窗口，否则窗口会一边放大一边乱跑。
      */
-    private fun attachDrag(frame: FrameLayout) {
+    private fun attachDrag(frame: View) {
         val slop = dp(6)
         var downX = 0f
         var downY = 0f
         var startX = 0
         var startY = 0
         var dragging = false
-        // 只处理没被子控件吃掉的那部分触摸：控制条上的按钮是子 View，会先拿到事件
+        // 双指缩放：记下起手时的指间距与窗口宽度，按比值改宽高
+        var pinchStartSpan = 0f
+        var pinchStartWidth = 0
+        var pinching = false
+        var pinchDone = false
+
         frame.setOnTouchListener { view, event ->
             val lp = params ?: return@setOnTouchListener false
             when (event.actionMasked) {
@@ -343,36 +366,153 @@ class FloatingPlayer(
                     startX = lp.x
                     startY = lp.y
                     dragging = false
+                    pinching = false
+                    pinchDone = false
+                    true
+                }
+
+                MotionEvent.ACTION_POINTER_DOWN -> {
+                    if (event.pointerCount >= 2) {
+                        pinching = true
+                        dragging = false
+                        pinchStartSpan = span(event)
+                        pinchStartWidth = lp.width
+                    }
                     true
                 }
 
                 MotionEvent.ACTION_MOVE -> {
-                    val dx = event.rawX - downX
-                    val dy = event.rawY - downY
-                    if (!dragging && (abs(dx) > slop || abs(dy) > slop)) {
-                        dragging = true
-                    }
-                    if (dragging) {
-                        val metrics = appContext.resources.displayMetrics
-                        lp.x = (startX + dx).toInt().coerceIn(-lp.width / 2, metrics.widthPixels - lp.width / 2)
-                        lp.y = (startY + dy).toInt().coerceIn(0, metrics.heightPixels - lp.height)
-                        try {
-                            windowManager.updateViewLayout(view, lp)
-                        } catch (_: Exception) {
+                    if (pinching && event.pointerCount >= 2) {
+                        if (pinchStartSpan > 0f) {
+                            val ratio = span(event) / pinchStartSpan
+                            if (abs(ratio - 1f) > 0.02f) pinchDone = true
+                            applyWidth((pinchStartWidth * ratio).toInt(), view, lp)
+                        }
+                    } else {
+                        val dx = event.rawX - downX
+                        val dy = event.rawY - downY
+                        if (!dragging && (abs(dx) > slop || abs(dy) > slop)) {
+                            dragging = true
+                        }
+                        if (dragging) {
+                            val metrics = appContext.resources.displayMetrics
+                            lp.x = (startX + dx).toInt().coerceIn(
+                                -lp.width / 2,
+                                metrics.widthPixels - lp.width / 2
+                            )
+                            lp.y = (startY + dy).toInt()
+                                .coerceIn(0, metrics.heightPixels - lp.height)
+                            try {
+                                windowManager.updateViewLayout(view, lp)
+                            } catch (_: Exception) {
+                            }
                         }
                     }
                     true
                 }
 
-                MotionEvent.ACTION_UP -> {
-                    if (!dragging) onBackToApp() else snapToEdge(lp)
+                // 抬起一根手指：从双指回单指。剩下那根重新起算，
+                // 否则接着一划会按上一根手指的位移把窗口甩出去
+                MotionEvent.ACTION_POINTER_UP -> {
+                    if (event.pointerCount - 1 < 2 && pinching) {
+                        pinching = false
+                        rememberScale(lp)
+                        val lifting = event.actionIndex
+                        val remain = if (lifting == 0) 1 else 0
+                        val offsetX = event.rawX - event.getX(lifting)
+                        val offsetY = event.rawY - event.getY(lifting)
+                        downX = event.getX(remain) + offsetX
+                        downY = event.getY(remain) + offsetY
+                        startX = lp.x
+                        startY = lp.y
+                        dragging = false
+                    }
                     true
                 }
 
-                MotionEvent.ACTION_CANCEL -> true
+                MotionEvent.ACTION_UP -> {
+                    if (pinching) {
+                        pinching = false
+                        pinchDone = true
+                        rememberScale(lp)
+                    }
+                    if (!pinchDone && !dragging) onBackToApp()
+                    if (!pinchDone && dragging) snapToEdge(lp)
+                    true
+                }
+
+                MotionEvent.ACTION_CANCEL -> {
+                    pinching = false
+                    true
+                }
                 else -> false
             }
         }
+    }
+
+    /** 两指间距；少于两指记为 0，缩放逻辑据此跳过。 */
+    private fun span(event: MotionEvent): Float {
+        if (event.pointerCount < 2) return 0f
+        val dx = event.getX(0) - event.getX(1)
+        val dy = event.getY(0) - event.getY(1)
+        return hypot(dx, dy)
+    }
+
+    // ---- 尺寸 ----
+
+    /** 默认宽度取屏幕的 46%，夹在 150~320dp：太窄放不下控制条，太宽就不像小窗了。 */
+    private fun defaultWidth(metrics: DisplayMetrics): Int =
+        (metrics.widthPixels * 0.46f).toInt().coerceIn(dp(150), dp(320))
+
+    private fun minWindowWidth(): Int = dp(150)
+
+    /** 上限：横向别糊满屏幕，竖向也要留出余量。 */
+    private fun maxWindowWidth(metrics: DisplayMetrics): Int {
+        val byScreen = (metrics.widthPixels * 0.92f).toInt()
+        val byHeight =
+            (((metrics.heightPixels * 0.8f) - dp(30)) * FloatingStageLayout.ASPECT).toInt()
+        return maxOf(minWindowWidth(), minOf(byScreen, byHeight))
+    }
+
+    private fun windowWidth(metrics: DisplayMetrics): Int =
+        (defaultWidth(metrics) * scale).toInt()
+            .coerceIn(minWindowWidth(), maxWindowWidth(metrics))
+
+    /** 窗口高度 = 16:9 台面 + 控制条；缩放时两者一起变，比例不变。 */
+    private fun windowHeight(width: Int, barHeight: Int): Int =
+        (width / FloatingStageLayout.ASPECT).toInt() + barHeight
+
+    /**
+     * 把窗口改到指定宽度并立刻生效。
+     *
+     * 只改窗口宽高、不碰子 View：台面按宽度自己重排画面、控制条固定高，
+     * 所以缩放过程不用重建视图，也不会在中间留下黑缝。
+     */
+    private fun applyWidth(widthPx: Int, view: View, lp: WindowManager.LayoutParams) {
+        val metrics = appContext.resources.displayMetrics
+        val target = widthPx.coerceIn(minWindowWidth(), maxWindowWidth(metrics))
+        if (target == lp.width) return
+        lp.width = target
+        lp.height = windowHeight(target, dp(30))
+        // 变大之后可能顶出屏幕，顺手夹回来
+        lp.x = lp.x.coerceIn(0, (metrics.widthPixels - lp.width).coerceAtLeast(0))
+        lp.y = lp.y.coerceIn(0, (metrics.heightPixels - lp.height).coerceAtLeast(0))
+        try {
+            windowManager.updateViewLayout(view, lp)
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 记住缩放倍率与位置：下次切后台弹窗还是这个大小，不用每次重新调。 */
+    private fun rememberScale(lp: WindowManager.LayoutParams) {
+        val metrics = appContext.resources.displayMetrics
+        val base = defaultWidth(metrics).coerceAtLeast(1)
+        scale = (lp.width.toFloat() / base).coerceIn(MIN_SCALE, MAX_SCALE)
+        prefs.edit()
+            .putFloat("scale", scale)
+            .putInt("x", lp.x)
+            .putInt("y", lp.y)
+            .apply()
     }
 
     /** 松手贴边：停在屏幕中间会挡住别人，贴左右两侧更好放。 */
@@ -418,6 +558,23 @@ class FloatingPlayer(
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 lastPlaying = isPlaying
                 refreshButton()
+            }
+
+            /** 拿到真实画面比例：竖屏视频按它在 16:9 台面里居中补黑边，不拉伸变形。 */
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (videoSize.height <= 0 || videoSize.width <= 0) return
+                var width = videoSize.width.toFloat()
+                var height = videoSize.height.toFloat()
+                // 旋转信息还没被解码器吃进去时宽高是反的，先换回来
+                if (videoSize.unappliedRotationDegrees == 90 ||
+                    videoSize.unappliedRotationDegrees == 270
+                ) {
+                    val swap = width
+                    width = height
+                    height = swap
+                }
+                val ratio = width * videoSize.pixelWidthHeightRatio / height
+                if (ratio.isFinite() && ratio > 0f) stage?.videoAspect = ratio
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -500,6 +657,10 @@ class FloatingPlayer(
     }
 
     companion object {
+        /** 双指缩放的倍率范围：再小就点不中控制条，再大就遮掉半个屏幕。 */
+        private const val MIN_SCALE = 0.5f
+        private const val MAX_SCALE = 2.6f
+
         /** 把 MIME 交给 media3：HLS / DASH 不能靠后缀猜（地址常带查询串）。 */
         fun mimeFor(kind: String?): String? = when (kind) {
             "hls" -> MimeTypes.APPLICATION_M3U8

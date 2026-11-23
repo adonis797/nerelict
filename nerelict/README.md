@@ -398,6 +398,8 @@ android/app/src/main/kotlin/.../
   PlaybackService.kt          mediaPlayback 前台服务：切后台保活，通知与 PlayerPlatform 共用
   FloatingPlayer.kt           后台悬浮窗：TYPE_APPLICATION_OVERLAY 窗口 + 独立 ExoPlayer，
                               切后台时按同一地址与进度接手画面，回来再交接回去
+  FloatingStageLayout.kt      悬浮窗台面：外框恒 16:9，画面按视频比例等比居中补黑边，
+                              双指缩放窗口时自动重排
   PlayerPlatform.kt           MediaSession/通知栏媒体控制、音频焦点、亮度/音量、
                               屏幕方向与常亮、系统画中画（手动）、后台悬浮窗、
                               投屏设置、本地截帧、分享
@@ -551,6 +553,8 @@ m3u8 命中 fetch/XHR/performance/video/页面地址任一即可；mp4 等直链
   同一份请求头），交接时按当前位置对齐，所以画质、解码与前台一致。
   未授权时不会弹窗，仍按后台出声处理。`SYSTEM_ALERT_WINDOW` 只能用户手动授予，
   部分 ROM 会在「权限管理 → 特殊权限」里单独列出；系统画中画仍是播放器菜单里的手动选项。
+- 小窗外框**恒定 16:9 横屏**：竖屏视频等比缩到中间、两侧补黑边，不会把窗口挤成一条细长竖条；
+  双指可拉伸缩放小窗（0.5×～2.6×，只改窗口宽高、画面自动重排），松手记住倍率与位置。
 - 网页加载失败有兜底：主框架报错或 25 秒无响应会在应用内弹「网页打不开」卡片（重试 / 改用 HTTP / 回到首页），
   不再停在 WebView 自带的错误页。地址栏里不带 scheme 的输入默认补 `https://`，
   该站只支持 HTTP 时会自动退回 `http://` 再试一次（每个 host 只回退一次）。
