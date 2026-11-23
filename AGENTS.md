@@ -124,12 +124,16 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 - **补 scheme 的规则**：地址栏输入不带 scheme 时补 `https://` 并记 `_autoScheme`；
   该站只支持 HTTP 导致失败时自动回退 `http://` 再试一次，同一 host 只回退一次
   （`_httpRetried`），不要做成两个 scheme 互跳。
-- **后台小窗 = 系统画中画**：唯一触发点是 `MainActivity.onUserLeaveHint`（配
-  `PlayerPlatform.shouldEnterPip()`），许可位由 Flutter 侧「有播放器」时用 `setAutoPip(true)`
-  打开、`PlayerPanel.dispose()` 里必须关掉，否则普通切后台也会弹空小窗。
-  PiP 里 `_PlayerLayer` 用 `Offstage` 收起页面（**保留 State**，WebView 与进度不能重建）、
-  `PlayerPanel(pip: true)` 只画画面；**不要给 PiP 加标题栏或控制条**。
-  `AppState.pipActive` 由 `onPictureInPictureModeChanged` 回报，`closePlayer()` 里要复位。
+- **后台播放 = `mediaPlayback` 前台服务，不是画中画**：只要播放器活着就开
+  `PlaybackService`（`PlayerPlatform.setKeepAlive` ← Dart 侧 `keepAlive(true)` 在
+  `_preparePlatform`、`dispose` 里 `keepAlive(false)`）。切后台不改变界面形态，
+  回来时小窗与进度原样接上；后台看不到画面是系统限制。
+  **不要在 `onUserLeaveHint` 里进 PiP**：那会让「去登录 / 去安装」这类切走动作被锁成小窗。
+  PiP 只保留播放器菜单里的手动入口，`AppState.pipActive` 仍由 `onPictureInPictureModeChanged`
+  回报并在 `closePlayer()` 复位；PiP 里 `_PlayerLayer` 用 `Offstage` 收起页面（**保留 State**）、
+  `PlayerPanel(pip: true)` 只画画面，**不要加标题栏或控制条**。
+  通知 ID 必须与 `PlaybackService.NOTIFICATION_ID` 一致（8801），`publishState()` 里
+  `if (!sessionEnabled) return` 不能去掉，否则关闭播放器会留下一条滑不掉的残影通知。
 - **多窗口交互**（对齐主流手机浏览器）：顶部一条地址栏 + 底部一条工具条
   （后退 / 前进 / 首页 / 窗口 / 关闭），窗口列表是卡片总览弹窗，**不要再加常驻标签条**；
   **新建窗口直接 `openBlank()` 落到窗口首页**（`_WindowHomeView`：搜索框 + 常用站点），
@@ -195,4 +199,4 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 - `adb reverse` 不跨命令持久，需与设备操作放在同一条命令里；PC 侧访问 `adb forward` 端口要加 `--noproxy '*'`。
 - Git Bash 会把设备侧 `/sdcard/...` 转成 Windows 路径，涉及设备路径的操作改用 PowerShell。
 - Gradle wrapper 可能因 hash 目录只有 `.part` 而卡住；**不要改仓库里的 `distributionUrl`**，改为补齐本机缓存。
-- 直播流（无 `#EXT-X-ENDLIST`）只下载当前列表分片；应用未接入前台服务，长时间后台播放受厂商省电策略限制。
+- 直播流（无 `#EXT-X-ENDLIST`）只下载当前列表分片；后台播放靠 mediaPlayback 前台服务保活，长时间仍受厂商省电策略影响。

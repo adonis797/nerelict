@@ -394,8 +394,9 @@ lib/
 android/app/src/main/kotlin/.../
   MainActivity.kt             MethodChannel: convert / info / pickDirectory / exportFile / player
   Mp4Converter.kt             MediaExtractor + MediaMuxer 转封装
+  PlaybackService.kt          mediaPlayback 前台服务：切后台保活，通知与 PlayerPlatform 共用
   PlayerPlatform.kt           MediaSession/通知栏媒体控制、音频焦点、亮度/音量、
-                              屏幕方向与常亮、系统画中画、投屏设置、本地截帧、分享
+                              屏幕方向与常亮、系统画中画（手动）、投屏设置、本地截帧、分享
 ```
 
 ### 播放器分层与边界（v3.3）
@@ -535,10 +536,12 @@ m3u8 命中 fetch/XHR/performance/video/页面地址任一即可；mp4 等直链
   AV1、杜比视界、AC3/E-AC3 等编解码能力随设备而异；DASH 由系统解码器决定，未做专门适配。
 - 投屏只提供系统投屏设置入口，未接入设备发现 / DLNA / Cast 协议；网络流无法截取纹理画面，
   截图只对本地文件可用（系统 `MediaMetadataRetriever` 取帧）。
-- 后台播放走**系统画中画**：播放器开着时按首页键 / 切到最近任务，会自动缩成 PiP 小窗继续播，
-  小窗浮在其它应用之上，点小窗即回到应用。PiP 需 API 26+ 且设备支持（部分 ROM 商店版阉割）；
-  不支持时 `video_player` 仍会继续解码，但界面不可见、进程被系统冻结后可能中断。
-  未接入前台服务，长时间后台播放仍受厂商省电策略限制。
+- 后台播放走 **`mediaPlayback` 前台服务**：有播放器时挂一个前台服务，按首页键 / 锁屏后
+  解码与声音继续，回到应用时迷你小窗与播放进度原样接上，不会重头开始。
+  服务只在有播放器时运行，关掉播放器即撤掉通知与保活；即使关掉「媒体通知控制」，
+  保活与后台播放照旧，只是通知上没有播放按钮。
+  **后台看不到画面是系统限制**（要看得见只能用系统画中画，那是播放器菜单里的手动选项，不会自动触发）。
+  极端省电策略 / 手动「强制停止」仍可能中断，长视频建议插着电并允许后台运行。
 - 网页加载失败有兜底：主框架报错或 25 秒无响应会在应用内弹「网页打不开」卡片（重试 / 改用 HTTP / 回到首页），
   不再停在 WebView 自带的错误页。地址栏里不带 scheme 的输入默认补 `https://`，
   该站只支持 HTTP 时会自动退回 `http://` 再试一次（每个 host 只回退一次）。

@@ -64,12 +64,13 @@ class PlayerPlatform(
     private var sessionEnabled = false
 
     /**
-     * 切后台自动进画中画：只由 Flutter 侧「有播放器」时打开。
+     * 后台播放保活开关。
      *
-     * 这个开关不代表「现在就在 PiP 里」，只是一个许可位：真正的触发在
-     * `MainActivity.onUserLeaveHint`，免得和系统的首页键 / 最近任务抢事件。
+     * 打开后挂一个 `mediaPlayback` 前台服务：切到后台时进程仍是前台优先级，
+     * ExoPlayer 的解码与音频不会被系统冻住。只负责保活，不做画中画——
+     * 后台看不到画面是系统限制，但进度与声音必须继续。
      */
-    private var autoPipArmed = false
+    private var keepAlive = false
     private var pipAspect = 16f / 9f
 
     private var lastTitle = "Nerelict 播放器"
@@ -140,12 +141,8 @@ class PlayerPlatform(
                     val aspect = (call.argument<Number>("aspect"))?.toFloat() ?: pipAspect
                     result.success(enterPip(aspect))
                 }
-                "setAutoPip" -> {
-                    autoPipArmed = call.argument<Boolean>("enabled") ?: false
-                    val aspect = (call.argument<Number>("aspect"))?.toFloat()
-                    if (aspect != null && aspect.isFinite() && aspect > 0f) {
-                        pipAspect = aspect
-                    }
+                "keepAlive" -> {
+                    setKeepAlive(call.argument<Boolean>("enabled") ?: false)
                     result.success(null)
                 }
                 "captureFrame" -> captureFrame(call, result)
@@ -168,7 +165,9 @@ class PlayerPlatform(
         if (!enabled) {
             abandonFocus()
             mediaSession?.isActive = false
-            notificationManager.cancel(NOTIFICATION_ID)
+            // 后台保活还开着时不能撤掉通知：那是前台服务的通知，
+            // 撤了服务就变成「前台服务却没有通知」的非法状态。
+            if (!keepAlive) notificationManager.cancel(NOTIFICATION_ID)
             unregisterReceiver()
             return
         }
@@ -205,6 +204,25 @@ class PlayerPlatform(
         mediaSession?.isActive = true
         requestFocus()
         publishState()
+    }
+
+    // ---- 后台保活 ----
+
+    /**
+     * 打开 / 关闭后台播放保活。
+     *
+     * 只动服务、不动会话：通知内容仍由 [publishState] 更新（同一个通知 ID），
+     * 服务负责把它挂上通知栏并让进程保持前台优先级，切后台后解码与音频继续。
+     */
+    private fun setKeepAlive(enabled: Boolean) {
+        if (enabled == keepAlive) return
+        keepAlive = enabled
+        if (!enabled) {
+            PlaybackService.stop(activity)
+            return
+        }
+        ensureChannel()
+        PlaybackService.start(activity) { buildNotification() }
     }
 
     private fun emit(action: String, positionMs: Long = lastPositionMs) {
@@ -246,6 +264,9 @@ class PlayerPlatform(
                 .putLong(MediaMetadata.METADATA_KEY_DURATION, lastDurationMs)
                 .build()
         )
+        // 会话已经关掉就别再发通知：关闭播放器的顺序是「关会话 → 清会话状态」，
+        // 这里若再 notify 一次，通知栏会留下一条点了没反应、也滑不掉的残影。
+        if (!sessionEnabled) return
         try {
             notificationManager.notify(NOTIFICATION_ID, buildNotification())
         } catch (_: Exception) {
@@ -268,40 +289,50 @@ class PlayerPlatform(
         )
         builder.setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle(lastTitle)
-            .setContentText("Nerelict 播放器")
+            .setContentText(
+                when {
+                    lastPlaying -> "Nerelict 播放器 · 正在播放"
+                    keepAlive -> "Nerelict 播放器 · 后台保活中"
+                    else -> "Nerelict 播放器"
+                }
+            )
             .setContentIntent(open)
-            .setOngoing(lastPlaying)
+            // 前台服务的通知必须常驻，否则暂停一下就变成可滑掉的通知
+            .setOngoing(lastPlaying || keepAlive)
             .setOnlyAlertOnce(true)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
-        mediaSession?.let {
+        // 没有媒体会话时不要挂动作按钮：那几个按钮靠广播回到会话，
+        // 会话没开的话点了没有任何反应，比不给按钮更糟。
+        val session = mediaSession
+        if (session != null && sessionEnabled) {
             builder.setStyle(
                 Notification.MediaStyle()
-                    .setMediaSession(it.sessionToken)
+                    .setMediaSession(session.sessionToken)
                     .setShowActionsInCompactView(0, 1, 2)
             )
+            builder.addAction(
+                Notification.Action.Builder(
+                    android.R.drawable.ic_media_rew,
+                    "后退 10 秒",
+                    actionIntent("rewind")
+                ).build()
+            )
+            builder.addAction(
+                Notification.Action.Builder(
+                    if (lastPlaying) android.R.drawable.ic_media_pause
+                    else android.R.drawable.ic_media_play,
+                    if (lastPlaying) "暂停" else "播放",
+                    actionIntent("toggle")
+                ).build()
+            )
+            builder.addAction(
+                Notification.Action.Builder(
+                    android.R.drawable.ic_media_ff,
+                    "前进 10 秒",
+                    actionIntent("forward")
+                ).build()
+            )
         }
-        builder.addAction(
-            Notification.Action.Builder(
-                android.R.drawable.ic_media_rew,
-                "后退 10 秒",
-                actionIntent("rewind")
-            ).build()
-        )
-        builder.addAction(
-            Notification.Action.Builder(
-                if (lastPlaying) android.R.drawable.ic_media_pause
-                else android.R.drawable.ic_media_play,
-                if (lastPlaying) "暂停" else "播放",
-                actionIntent("toggle")
-            ).build()
-        )
-        builder.addAction(
-            Notification.Action.Builder(
-                android.R.drawable.ic_media_ff,
-                "前进 10 秒",
-                actionIntent("forward")
-            ).build()
-        )
         return builder.build()
     }
 
@@ -462,9 +493,7 @@ class PlayerPlatform(
             .build()
     }
 
-    /** 有播放器、且系统支持时才接管「用户按下首页键」。 */
-    fun shouldEnterPip(): Boolean = autoPipArmed && pipSupported()
-
+    /** 播放器菜单里的手动入口；不再接管首页键。 */
     fun enterPip(aspect: Float = pipAspect): Boolean {
         val params = pipParams(aspect) ?: return false
         return try {
@@ -548,6 +577,8 @@ class PlayerPlatform(
     }
 
     fun dispose() {
+        keepAlive = false
+        PlaybackService.stop(activity)
         abandonFocus()
         unregisterReceiver()
         try {

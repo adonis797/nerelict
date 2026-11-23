@@ -1189,23 +1189,37 @@ void main() {
       read('android/app/src/main/kotlin/com/nerelict/nerelict/PlayerPlatform.kt');
   final activityKt =
       read('android/app/src/main/kotlin/com/nerelict/nerelict/MainActivity.kt');
-  check(activityKt.contains('onUserLeaveHint') &&
-          activityKt.contains('shouldEnterPip'),
-      '原生侧在「即将离开界面」时进画中画，不抢系统的首页键');
   check(activityKt.contains('onPictureInPictureModeChanged') &&
           activityKt.contains('notifyPipChanged'),
       '画中画进出状态回报给 Flutter');
+  check(!activityKt.contains('onUserLeaveHint') &&
+          !platformKt.contains('shouldEnterPip'),
+      '不再接管首页键：切后台不等于进画中画');
   check(platformKt.contains('setAspectRatio(Rational(') &&
           platformKt.contains('coerceIn(0.418f, 2.39f)'),
-      'PiP 比例取视频自身宽高并夹到系统允许区间');
-  check(playerDart.contains('setAutoPip(') &&
-          playerDart.contains('onPipChanged'),
-      '有播放器时才打开自动画中画的许可位');
-  check(playerDart.contains('wasMini') &&
-          playerDart.contains('mode == PlayerMode.mini'),
-      '自动画中画只跟随迷你小窗形态，浮层 / 全屏切后台不抢占');
-  check(playerDart.contains("platform.setAutoPip(false)"),
-      '播放器关闭后不再接管首页键');
+      '画中画比例取视频自身宽高并夹到系统允许区间');
+  final serviceKt =
+      read('android/app/src/main/kotlin/com/nerelict/nerelict/PlaybackService.kt');
+  check(serviceKt.contains('FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK') &&
+          serviceKt.contains('startForeground('),
+      '后台播放靠 mediaPlayback 前台服务保活，而不是画中画');
+  check(manifest.contains('FOREGROUND_SERVICE_MEDIA_PLAYBACK') &&
+          manifest.contains('foregroundServiceType="mediaPlayback"'),
+      '清单里声明前台服务类型与权限，Android 14+ 才允许启动');
+  check(platformKt.contains('"keepAlive"') &&
+          platformKt.contains('PlaybackService.start(') &&
+          platformKt.contains('PlaybackService.stop('),
+      '保活服务随播放器生命周期开关，关掉播放器即停');
+  check(playerDart.contains('keepAlive(true)') &&
+          playerDart.contains('keepAlive(false)'),
+      '播放器打开时开保活，关闭时撤掉服务与常驻通知');
+  final keepAliveAt = playerDart.indexOf('platform.keepAlive(true)');
+  final mediaGateAt = playerDart.indexOf('if (_settings.playerMediaControls)');
+  check(keepAliveAt >= 0 && mediaGateAt > keepAliveAt,
+      '保活在「媒体控制」判断之前打开，关掉通知控制也照样后台播');
+  check(read('lib/services/player_core.dart')
+          .contains('allowBackgroundPlayback: true'),
+      '播放内核允许后台播放，不用默认的切后台暂停');
   check(playerDart.contains('Widget _buildPip()') &&
           !playerDart.contains('_buildPip() => _buildMini()'),
       'PiP 窗口只画画面，不复用带标题栏的小窗布局');

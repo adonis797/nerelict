@@ -102,7 +102,9 @@ class VideoPlayerCore implements PlayerCore {
             httpHeaders: headers,
             videoPlayerOptions: VideoPlayerOptions(
               mixWithOthers: false,
-              allowBackgroundPlayback: false,
+              // 切后台继续播：配合原生 mediaPlayback 前台服务，
+              // 音频与解码不被系统冻住；回到前台画面无缝接上。
+              allowBackgroundPlayback: true,
             ),
           );
 

@@ -147,19 +147,10 @@ class _PlayerPanelState extends State<PlayerPanel> {
     super.didChangeDependencies();
     final mode = context.read<AppState>().playerMode;
     if (mode == _lastMode) return;
-    final wasMini = _lastMode == PlayerMode.mini;
     _lastMode = mode;
     PlayerPlatform.instance.setOrientation(
       mode == PlayerMode.fullscreen ? 'landscape' : 'auto',
     );
-    // 只有迷你小窗才是「后台播放形态」：浮层 / 全屏时按首页键本该退到后台，
-    // 这时抢进画中画反而不对（也可能撞上「去登录 / 去安装」这类切走动作）。
-    if (mode == PlayerMode.mini || wasMini) {
-      unawaited(PlayerPlatform.instance.setAutoPip(
-        mode == PlayerMode.mini,
-        aspectRatio: _core?.aspectRatio ?? 16 / 9,
-      ));
-    }
     if (mode == PlayerMode.fullscreen) _showControls();
   }
 
@@ -257,16 +248,13 @@ class _PlayerPanelState extends State<PlayerPanel> {
     await platform.setOrientation(
       _lastMode == PlayerMode.fullscreen ? 'landscape' : 'auto',
     );
-    // 画中画：只挂回调 + 打开许可位，真正进 PiP 由原生 onUserLeaveHint 触发。
-    // 许可位只在迷你小窗形态下打开（didChangeDependencies 负责跟随形态切换）。
+    // 后台播放保活：挂一个 mediaPlayback 前台服务，切后台时解码与音频继续。
+    // 与「媒体控制」设置无关——关掉通知栏控制也照样要能后台播。
     platform.onPipChanged = (inPip) {
       if (!mounted) return;
       context.read<AppState>().setPipActive(inPip);
     };
-    await platform.setAutoPip(
-      _lastMode == PlayerMode.mini,
-      aspectRatio: _core?.aspectRatio ?? 16 / 9,
-    );
+    await platform.keepAlive(true);
     if (_settings.playerMediaControls) {
       platform.onMediaAction = _onMediaAction;
       await platform.enableMediaControls(true);
@@ -470,9 +458,9 @@ class _PlayerPanelState extends State<PlayerPanel> {
     _saveMemory();
     final platform = PlayerPlatform.instance;
     platform.onMediaAction = null;
-    // 播放器没了就别再接管首页键，否则普通切后台也会弹出一个空的小窗
     platform.onPipChanged = null;
-    platform.setAutoPip(false);
+    // 播放器没了就撤掉前台服务与常驻通知，别在后台留一个空转的保活
+    platform.keepAlive(false);
     platform.enableMediaControls(false);
     platform.clearSession();
     platform.keepScreenOn(false);

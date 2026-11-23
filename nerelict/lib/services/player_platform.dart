@@ -128,17 +128,13 @@ class PlayerPlatform {
         false;
   }
 
-  /// 开启「切到后台自动进画中画」。
+  /// 后台播放保活：有播放器时挂 `mediaPlayback` 前台服务。
   ///
-  /// 只是把开关和画面比例交给原生：真正触发在 `Activity.onUserLeaveHint`，
-  /// 这样不会和系统的「首页键 / 最近任务」抢事件。播放结束或关窗时关掉。
-  Future<void> setAutoPip(bool enabled, {double aspectRatio = 16 / 9}) async {
-    _ensureHandler();
-    await _void('setAutoPip', <String, dynamic>{
-      'enabled': enabled,
-      'aspect': aspectRatio,
-    });
-  }
+  /// 切到后台后进程仍是前台优先级，ExoPlayer 的解码与音频继续，不会被系统冻结。
+  /// 这不是画中画：后台看不到画面（系统限制），但进度与声音不断，回到应用后
+  /// 小窗与播放位置原样继续。关闭播放器时必须关掉，否则会留下常驻通知。
+  Future<void> keepAlive(bool enabled) =>
+      _void('keepAlive', <String, dynamic>{'enabled': enabled});
 
   /// 只对本地文件可用；网络流返回 null（边界限制里已说明）。
   Future<String?> captureFrame(String path, int positionMs) async =>
