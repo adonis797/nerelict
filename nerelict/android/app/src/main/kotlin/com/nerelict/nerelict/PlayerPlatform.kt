@@ -63,6 +63,15 @@ class PlayerPlatform(
     private var receiverRegistered = false
     private var sessionEnabled = false
 
+    /**
+     * 切后台自动进画中画：只由 Flutter 侧「有播放器」时打开。
+     *
+     * 这个开关不代表「现在就在 PiP 里」，只是一个许可位：真正的触发在
+     * `MainActivity.onUserLeaveHint`，免得和系统的首页键 / 最近任务抢事件。
+     */
+    private var autoPipArmed = false
+    private var pipAspect = 16f / 9f
+
     private var lastTitle = "Nerelict 播放器"
     private var lastPlaying = false
     private var lastPositionMs = 0L
@@ -127,7 +136,18 @@ class PlayerPlatform(
                     result.success(null)
                 }
                 "pipSupported" -> result.success(pipSupported())
-                "enterPip" -> result.success(enterPip())
+                "enterPip" -> {
+                    val aspect = (call.argument<Number>("aspect"))?.toFloat() ?: pipAspect
+                    result.success(enterPip(aspect))
+                }
+                "setAutoPip" -> {
+                    autoPipArmed = call.argument<Boolean>("enabled") ?: false
+                    val aspect = (call.argument<Number>("aspect"))?.toFloat()
+                    if (aspect != null && aspect.isFinite() && aspect > 0f) {
+                        pipAspect = aspect
+                    }
+                    result.success(null)
+                }
                 "captureFrame" -> captureFrame(call, result)
                 "shareText" -> {
                     result.success(shareText(call.argument<String>("text") ?: ""))
@@ -425,19 +445,42 @@ class PlayerPlatform(
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
             activity.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
 
-    private fun enterPip(): Boolean {
-        if (!pipSupported()) return false
+    /**
+     * 画中画参数。
+     *
+     * 系统只接受 0.418 ~ 2.39 的比例，越界 `setAspectRatio` 会抛异常；
+     * 竖屏短视频也想占满窗口，所以比例按视频自身的宽高来，夹到合法区间。
+     */
+    private fun pipParams(aspect: Float): PictureInPictureParams? {
+        if (!pipSupported()) return null
+        val ratio = aspect.coerceIn(0.418f, 2.39f)
+        // 用整数比表达，避免浮点比例被系统规整成奇怪的值
+        val height = 1000
+        val width = (height * ratio).roundToInt().coerceAtLeast(1)
+        return PictureInPictureParams.Builder()
+            .setAspectRatio(Rational(width, height))
+            .build()
+    }
+
+    /** 有播放器、且系统支持时才接管「用户按下首页键」。 */
+    fun shouldEnterPip(): Boolean = autoPipArmed && pipSupported()
+
+    fun enterPip(aspect: Float = pipAspect): Boolean {
+        val params = pipParams(aspect) ?: return false
         return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                val params = PictureInPictureParams.Builder()
-                    .setAspectRatio(Rational(16, 9))
-                    .build()
-                activity.enterPictureInPictureMode(params)
-            } else {
-                false
-            }
+            activity.enterPictureInPictureMode(params)
         } catch (_: Exception) {
             false
+        }
+    }
+
+    /** 把 PiP 状态回报给 Flutter：UI 据此决定只画播放画面。 */
+    fun notifyPipChanged(isInPip: Boolean) {
+        main.post {
+            try {
+                channel.invokeMethod("pipChanged", isInPip)
+            } catch (_: Exception) {
+            }
         }
     }
 

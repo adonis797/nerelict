@@ -1156,6 +1156,66 @@ void main() {
           read('lib/services/download_diagnosis.dart').contains('crossHost'),
       '跨域与 HttpOnly 分开判（分片的 Cookie 读数不通用）');
 
+  // ---- 网页加载失败与后台小窗（0.4.13 之前的问题） ----
+  //
+  // 两件事曾经长期存在：① 只支持 HTTP 的站点被强行补 https，直接停在 WebView
+  // 自带的「网页无法打开」页，既没有重试入口也没有超时兜底；② 切到后台后小窗
+  // 被系统冻住、退到桌面就彻底消失。
+  final tab35 = read('lib/ui/browser_tab.dart');
+  check(
+      !tab35.contains('err.isForMainFrame != true') &&
+          tab35.contains('err.isForMainFrame == false'),
+      '主框架加载错误只忽略「明确是子资源」的那些，不再静默吞掉');
+  check(tab35.contains('_armLoadWatchdog') && tab35.contains('25'),
+      '主框架加载有超时兜底，不会无限转圈');
+  check(tab35.contains('_autoScheme') &&
+          tab35.contains("uri.replace(scheme: 'http')"),
+      '只有 https 是补出来的时候才自动回退 http');
+  check(tab35.contains('_httpRetried'),
+      'http 回退按 host 只做一次，不会 https → http → https 来回跳');
+  check(tab35.contains('class _LoadErrorCard') &&
+          tab35.contains("'重试'") &&
+          tab35.contains("'改用 HTTP'") &&
+          tab35.contains("'回到首页'"),
+      '加载失败落在可重试的应用内卡片上，而不是只剩 WebView 错误页');
+  check(tab35.contains('网页无法打开') && tab35.contains('_reportErrorPage'),
+      'HTTP 状态错误（4xx/5xx）也按错误页兜底，且不写进浏览历史');
+  check(tab35.contains('_loadToken'),
+      '异步回调带加载令牌，旧页面的错误不会盖到新页面上');
+
+  final mainDart = read('lib/main.dart');
+  final playerDart = read('lib/ui/player_page.dart');
+  final platformKt =
+      read('android/app/src/main/kotlin/com/nerelict/nerelict/PlayerPlatform.kt');
+  final activityKt =
+      read('android/app/src/main/kotlin/com/nerelict/nerelict/MainActivity.kt');
+  check(activityKt.contains('onUserLeaveHint') &&
+          activityKt.contains('shouldEnterPip'),
+      '原生侧在「即将离开界面」时进画中画，不抢系统的首页键');
+  check(activityKt.contains('onPictureInPictureModeChanged') &&
+          activityKt.contains('notifyPipChanged'),
+      '画中画进出状态回报给 Flutter');
+  check(platformKt.contains('setAspectRatio(Rational(') &&
+          platformKt.contains('coerceIn(0.418f, 2.39f)'),
+      'PiP 比例取视频自身宽高并夹到系统允许区间');
+  check(playerDart.contains('setAutoPip(') &&
+          playerDart.contains('onPipChanged'),
+      '有播放器时才打开自动画中画的许可位');
+  check(playerDart.contains('wasMini') &&
+          playerDart.contains('mode == PlayerMode.mini'),
+      '自动画中画只跟随迷你小窗形态，浮层 / 全屏切后台不抢占');
+  check(playerDart.contains("platform.setAutoPip(false)"),
+      '播放器关闭后不再接管首页键');
+  check(playerDart.contains('Widget _buildPip()') &&
+          !playerDart.contains('_buildPip() => _buildMini()'),
+      'PiP 窗口只画画面，不复用带标题栏的小窗布局');
+  check(mainDart.contains('Offstage(offstage: true') &&
+          mainDart.contains('Positioned.fill(child: panel)'),
+      'PiP 时收起页面但保留 State，画面铺满系统小窗');
+  check(mainDart.contains('_PlayerLayer') &&
+          mainDart.contains('builder: (context, child)'),
+      '播放层挂在 MaterialApp.builder 上，是应用内最高层');
+
   stdout.writeln();
   if (failures.isEmpty) {
     stdout.writeln('全部通过：$passed 项断言');

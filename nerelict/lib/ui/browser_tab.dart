@@ -66,6 +66,30 @@ class _BrowserTabState extends State<BrowserTab> {
   /// 当前网页地址（用于网页收藏星标状态）
   String? _currentUrl;
 
+  /// 主框架加载失败的现场（null 表示当前没有错误）。
+  ///
+  /// 以前只在错误回调里弹一条 2 秒的 toast，用户错过之后就只剩 WebView
+  /// 自带的「网页无法打开」错误页，没有任何重试入口——看起来就是页面打不开。
+  String? _loadError;
+  String? _loadErrorUrl;
+
+  /// 本次地址是否由我们补的 `https://`：只支持 HTTP 的站点失败后据此自动回退。
+  bool _autoScheme = false;
+
+  /// 已经对哪些 host 试过 http 回退，避免 https → http → https 来回跳。
+  final Set<String> _httpRetried = <String>{};
+
+  /// 主框架加载超时兜底：WebView 会卡在「请求已发出但没有响应」，
+  /// 既不回调错误也不回调 `onPageFinished`，进度条就一直转。
+  Timer? _loadWatchdog;
+
+  /// 加载令牌：每次主框架导航自增。
+  ///
+  /// 回调是异步的，`onPageFinished` 里还要 `await getTitle()`；这期间用户可能
+  /// 已经发起新的加载（例如 https 失败后自动回退 http）。用令牌把「上一页的回调」
+  /// 丢掉，否则错误卡片会盖在正在加载的新页面上。
+  int _loadToken = 0;
+
   /// 当前页面里已经处理过的视频地址，避免关闭 Nerelict 后反复接管
   final Set<String> _handled = <String>{};
 
@@ -160,6 +184,7 @@ class _BrowserTabState extends State<BrowserTab> {
           },
           onPageStarted: (url) {
             if (!mounted) return;
+            _loadToken++;
             _handleAdNavigation(url);
             _handled.clear(); // 新页面重新开始自动接管
             _shieldNotified = false;
@@ -170,14 +195,21 @@ class _BrowserTabState extends State<BrowserTab> {
             // 离开上一页：清空该页的嗅探资源、选中项、播放浮层与临时数据
             _state.resetPageResources();
             _floatUrl = null;
+            _armLoadWatchdog();
             setState(() {
               _loading = true;
+              _loadError = null;
+              _loadErrorUrl = null;
               _syncUrl(url);
             });
             _inject();
           },
           onPageFinished: (url) async {
             if (!mounted) return;
+            // 这一页对应的令牌：等待 title 期间若又发起了新的加载，就别再按
+            // 这一页的结果去写历史或弹错误卡片
+            final token = _loadToken;
+            _loadWatchdog?.cancel();
             setState(() {
               _loading = false;
               _progress = 1;
@@ -191,9 +223,16 @@ class _BrowserTabState extends State<BrowserTab> {
             // 记录浏览历史（非 http/https 地址由 HistoryState 自行过滤）
             try {
               final title = await _controller.getTitle();
-              if (mounted) {
+              if (!mounted || token != _loadToken) return;
+              // WebView 自己的错误页也会回调 onPageFinished，标题固定是
+              // 「网页无法打开」：这种页面不该进历史，否则历史里全是死链
+              final errorPage = (title ?? '').contains('网页无法打开');
+              if (!errorPage && _loadError == null) {
                 await context.read<HistoryState>().add(url, title ?? '');
               }
+              // HTTP 状态错误（4xx/5xx）不会走 onWebResourceError，只会渲染成
+              // 这张错误页；这里按页面内容兜底，才不至于只剩 WebView 的错误页
+              if (errorPage) await _reportErrorPage(url, token);
             } catch (_) {}
           },
           onUrlChange: (change) {
@@ -201,9 +240,12 @@ class _BrowserTabState extends State<BrowserTab> {
             if (url != null && mounted) _syncUrl(url);
           },
           onWebResourceError: (err) {
-            if (!mounted || err.isForMainFrame != true) return;
-            setState(() => _loading = false);
-            _toast('页面加载失败：${err.description}');
+            if (!mounted) return;
+            // 只忽略「明确是子资源」的错误。`isForMainFrame` 在部分回调路径
+            // （兼容回调 / 旧 WebView）里会是 null，直接 `!= true` 会让主框架
+            // 失败被静默吞掉：进度条一直转，用户只看到 WebView 的错误页。
+            if (err.isForMainFrame == false) return;
+            _onLoadFailed(err);
           },
         ),
       );
@@ -232,6 +274,7 @@ class _BrowserTabState extends State<BrowserTab> {
 
   @override
   void dispose() {
+    _loadWatchdog?.cancel();
     _state.removeListener(_syncPopupGuard);
     _state.removeBackInterceptor(_handleSystemBack);
     // 页面卸载：同样清空本页资源与播放状态（销毁阶段不再通知监听者）
@@ -649,20 +692,178 @@ class _BrowserTabState extends State<BrowserTab> {
     if (text.isEmpty) return;
 
     Uri uri;
+    var autoScheme = false;
     final looksLikeUrl = !text.contains(' ') && text.contains('.');
     if (looksLikeUrl) {
-      uri = Uri.parse(text.contains('://') ? text : 'https://$text');
+      final hasScheme = text.contains('://');
+      uri = Uri.parse(hasScheme ? text : 'https://$text');
+      // 记下「https 是补出来的」：只支持 HTTP 的站点（老视频站、内网服务）
+      // 用 https 必然失败，失败后据此自动退回 http 再试一次
+      autoScheme = !hasScheme;
     } else {
       // 搜索引擎由「设置」决定，默认 Google；只影响之后发起的搜索
       final engine = context.read<SettingsState>().searchEngine;
       uri = Uri.parse(engine.searchUrl(text));
     }
-    _controller.loadRequest(uri);
+    _autoScheme = autoScheme;
+    _loadUrl(uri);
+  }
+
+  /// 统一入口：清错误、置加载态、挂超时兜底，再交给 WebView。
+  void _loadUrl(Uri uri) {
+    _loadToken++;
+    _armLoadWatchdog();
     setState(() {
       _hasPage = true;
+      _loading = true;
+      _progress = 0;
+      _loadError = null;
+      _loadErrorUrl = null;
       _urlCtrl.text = uri.toString();
       _currentUrl = uri.toString();
     });
+    unawaited(_controller.loadRequest(uri));
+  }
+
+  /// 主框架加载超时兜底。
+  ///
+  /// WebView 在「连接已建立但服务器一直不回包」时会既不报错也不回调
+  /// `onPageFinished`：没有这个超时，进度条就会一直转，用户面对一片空白。
+  void _armLoadWatchdog() {
+    _loadWatchdog?.cancel();
+    _loadWatchdog = Timer(const Duration(seconds: 25), () {
+      if (!mounted || !_loading || _loadError != null) return;
+      final url = _currentUrl;
+      logD('Browser', 'load watchdog fired: $url');
+      setState(() {
+        _loading = false;
+        _progress = 1;
+        _loadErrorUrl = url;
+        _loadError = '等了 25 秒还没有响应，服务器可能已停止响应';
+      });
+    });
+  }
+
+  /// 主框架加载失败：先判断能不能自动回退 http，再落到可重试的错误卡片。
+  void _onLoadFailed(WebResourceError err) {
+    // 回退 http 之后，https 那次的错误回调可能才姗姗来迟：地址已经变了，
+    // 不要把旧地址的失败盖到正在加载的新页面上
+    final failing = err.url;
+    if (_loading &&
+        failing != null &&
+        _currentUrl != null &&
+        failing != _currentUrl) {
+      logD('Browser', 'stale failure ignored: $failing');
+      return;
+    }
+    _loadWatchdog?.cancel();
+    final failedUrl = err.url ?? _currentUrl ?? '';
+    final uri = Uri.tryParse(failedUrl);
+    // 只支持 HTTP 的站点：我们补出来的 https 走不通，自动退回 http 再试
+    if (_autoScheme &&
+        uri != null &&
+        uri.scheme == 'https' &&
+        _httpRetried.add(uri.host.toLowerCase())) {
+      logD('Browser', 'https failed (${err.errorCode}), retry http: $failedUrl');
+      _autoScheme = false;
+      // 地址栏要跟着换成真的在加载的地址，否则用户看到的还是 https
+      _loadUrl(uri.replace(scheme: 'http'));
+      _toast('该站点不支持 HTTPS，已改用 HTTP 重新打开');
+      return;
+    }
+    logD('Browser', 'load failed ${err.errorCode} $failedUrl ${err.description}');
+    setState(() {
+      _loading = false;
+      _progress = 1;
+      _loadErrorUrl = failedUrl;
+      _loadError = _describeLoadError(err);
+    });
+  }
+
+  /// HTTP 状态错误（404 / 403 / 5xx）只会渲染成 WebView 自带的错误页，
+  /// 不会触发 `onWebResourceError`。这里从错误页正文里挖出 `net::ERR_*`，
+  /// 换成应用自己的可重试卡片。
+  Future<void> _reportErrorPage(String url, int token) async {
+    // 已经在加载 / 已经有错误了就别再盖一层（自动回退 http 时会出现这个时序）
+    if (!mounted || _loading || _loadError != null) return;
+    var code = '';
+    try {
+      final raw = await _controller.runJavaScriptReturningResult(
+        'String(document.body&&document.body.innerText||"").slice(0,400)',
+      );
+      final hit = RegExp(r'net::[A-Z_]+').firstMatch(raw.toString());
+      code = hit?.group(0) ?? '';
+    } catch (_) {}
+    if (!mounted || _loading || _loadError != null || token != _loadToken) {
+      return;
+    }
+    logD('Browser', 'error page $url code=${code.isEmpty ? '-' : code}');
+    setState(() {
+      _loading = false;
+      _progress = 1;
+      _loadErrorUrl = url;
+      _loadError = code.isEmpty
+          ? '站点没有返回可用内容，连接被中断或请求被拒绝'
+          : '站点没有返回可用内容（$code）';
+    });
+  }
+
+  /// 把 `net::ERR_*` 翻译成一句能指导下一步的中文，原始错误码附在后面。
+  String _describeLoadError(WebResourceError err) {
+    final hint = switch (err.errorType) {
+      WebResourceErrorType.hostLookup => '域名解析失败，网址可能写错，或当前网络无法解析',
+      WebResourceErrorType.timeout => '连接超时，服务器一直没有响应',
+      WebResourceErrorType.connect => '无法连接到服务器，站点可能拒绝访问，或被网络拦截',
+      WebResourceErrorType.failedSslHandshake => 'HTTPS 握手失败，证书可能已过期或不受信任',
+      WebResourceErrorType.io => '连接被中途断开，服务器没有返回完整内容',
+      WebResourceErrorType.redirectLoop => '重定向次数过多，站点配置可能有误',
+      WebResourceErrorType.badUrl => '网址格式不正确',
+      WebResourceErrorType.tooManyRequests => '请求过于频繁，被站点临时限制',
+      WebResourceErrorType.authentication ||
+      WebResourceErrorType.proxyAuthentication =>
+        '需要先通过身份验证',
+      _ => '连接被中断或服务器没有返回内容',
+    };
+    final raw = err.description.trim();
+    return raw.isEmpty ? hint : '$hint（$raw）';
+  }
+
+  /// 地址栏右侧的刷新 / 停止。
+  ///
+  /// 出错后这个按钮要能把错误态一起清掉，所以先走 [retry] 再回退到 reload：
+  /// 直接 `reload()` 的话，加载态与错误卡片会同时挂着。
+  void _reloadOrRetry() {
+    if (_loadError != null) {
+      _retryCurrent();
+      return;
+    }
+    unawaited(_controller.reload());
+  }
+
+  /// 错误卡片上的「重试」：按当前地址重新加载一次。
+  void _retryCurrent() {
+    final url = _loadErrorUrl ?? _currentUrl;
+    if (url == null || url.isEmpty) {
+      _goHome();
+      return;
+    }
+    final uri = Uri.tryParse(url);
+    if (uri == null) {
+      _goHome();
+      return;
+    }
+    _loadUrl(uri);
+  }
+
+  /// 错误卡片上的「改用 HTTP」：https 站点在部分网络下握手被掐、
+  /// 而站点本身也提供 http 时，这一步往往能直接打开。
+  void _retryAsHttp() {
+    final url = _loadErrorUrl ?? _currentUrl;
+    if (url == null || !url.startsWith('https://')) return;
+    final uri = Uri.tryParse(url);
+    if (uri == null) return;
+    _autoScheme = false;
+    _loadUrl(uri.replace(scheme: 'http'));
   }
 
   /// 手动清理「盖在播放器上的透明广告层」。
@@ -769,6 +970,7 @@ class _BrowserTabState extends State<BrowserTab> {
   void _goHome() {
     // 回首页前先停掉网页里的声音，避免 WebView 移出树后仍在后台播放
     unawaited(_controller.runJavaScript(kPauseWebVideosJs).catchError((_) {}));
+    _loadWatchdog?.cancel();
     setState(() {
       _hasPage = false;
       _canGoBack = false;
@@ -776,6 +978,8 @@ class _BrowserTabState extends State<BrowserTab> {
       _urlCtrl.clear();
       _loading = false;
       _progress = 1;
+      _loadError = null;
+      _loadErrorUrl = null;
     });
   }
 
@@ -826,6 +1030,23 @@ class _BrowserTabState extends State<BrowserTab> {
                 )
               else
                 _StartPage(onOpen: _open, onWindows: _openWindows),
+              // 加载失败：用应用自己的错误卡片盖住 WebView 的错误页。
+              // WebView 的错误页只有一行 `net::ERR_*`，没有重试入口，
+              // 用户只能手动点地址栏——这正是「网页打不开」的体感来源。
+              if (_hasPage && _loadError != null)
+                Positioned.fill(
+                  child: _LoadErrorCard(
+                    palette: p,
+                    url: _loadErrorUrl ?? _currentUrl ?? '',
+                    message: _loadError!,
+                    onRetry: _retryCurrent,
+                    onRetryHttp: (_loadErrorUrl ?? _currentUrl ?? '')
+                            .startsWith('https://')
+                        ? _retryAsHttp
+                        : null,
+                    onHome: _goHome,
+                  ),
+                ),
               // 赛博朋克霓虹加载进度：浮在内容顶部，不占布局高度
               Positioned(
                 top: -2,
@@ -926,7 +1147,7 @@ class _BrowserTabState extends State<BrowserTab> {
             padding: EdgeInsets.zero,
             icon: Icon(_loading ? Icons.close : Icons.refresh, size: 19),
             color: _hasPage ? p.textSub : p.textDisabled,
-            onPressed: _hasPage ? () => _controller.reload() : null,
+            onPressed: _hasPage ? _reloadOrRetry : null,
           ),
           IconButton(
             visualDensity: VisualDensity.compact,
@@ -1134,6 +1355,109 @@ class _StartPage extends StatelessWidget {
           const SizedBox(height: 24),
           _HistorySection(onOpen: onOpen),
         ],
+      ),
+    );
+  }
+}
+
+/// 主框架加载失败的兜底界面。
+///
+/// 铺满内容区（连同 WebView 自带的错误页一起盖住），因为那张页面既不能重试、
+/// 也不会被我们的地址栏状态影响，留着只会让人以为「这个 App 打不开网页」。
+class _LoadErrorCard extends StatelessWidget {
+  const _LoadErrorCard({
+    required this.palette,
+    required this.url,
+    required this.message,
+    required this.onRetry,
+    required this.onHome,
+    this.onRetryHttp,
+  });
+
+  final AppPalette palette;
+  final String url;
+  final String message;
+  final VoidCallback onRetry;
+
+  /// 仅在 https 地址时提供：部分站点/网络下 https 握手被掐，http 反而能开
+  final VoidCallback? onRetryHttp;
+  final VoidCallback onHome;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = palette;
+    return ColoredBox(
+      color: p.bg,
+      child: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+          child: Container(
+            padding: const EdgeInsets.fromLTRB(20, 22, 20, 12),
+            decoration: BoxDecoration(
+              color: p.surface,
+              borderRadius: BorderRadius.circular(p.isCyber ? 4 : 16),
+              border: Border.all(
+                color: p.isCyber ? p.accent.withValues(alpha: 0.45) : p.border,
+              ),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Icon(Icons.wifi_off, size: 30, color: p.textFaint),
+                const SizedBox(height: 12),
+                Text(
+                  '网页打不开',
+                  style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                    color: p.text,
+                  ),
+                ),
+                if (url.isNotEmpty) ...<Widget>[
+                  const SizedBox(height: 6),
+                  Text(
+                    url,
+                    maxLines: 2,
+                    textAlign: TextAlign.center,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 11, color: p.textFaint),
+                  ),
+                ],
+                const SizedBox(height: 10),
+                Text(
+                  message,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 12.5, height: 1.45, color: p.textSub),
+                ),
+                const SizedBox(height: 18),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    FilledButton(
+                      onPressed: onRetry,
+                      child: const Text('重试'),
+                    ),
+                    if (onRetryHttp != null) ...<Widget>[
+                      const SizedBox(width: 10),
+                      OutlinedButton(
+                        onPressed: onRetryHttp,
+                        child: const Text('改用 HTTP'),
+                      ),
+                    ],
+                  ],
+                ),
+                const SizedBox(height: 4),
+                TextButton(
+                  onPressed: onHome,
+                  child: Text(
+                    '回到首页',
+                    style: TextStyle(fontSize: 12, color: p.textFaint),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }

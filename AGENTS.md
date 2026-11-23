@@ -114,6 +114,22 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
   **不要调用 `clearCache()`**（Android 缓存是应用级共享的）。
 - **多窗口入口必须留在首页第一屏**：起始页搜索框下方常驻 `_WindowsEntryCard`（`browser_tab.dart`），
   和三点菜单里的同名项并存；上限文案取 `WindowRegistry.maxWindows`，不要写死数字。
+- **网页加载失败不许只弹 toast**：主框架失败统一走 `_onLoadFailed` + `_LoadErrorCard`
+  （重试 / 改用 HTTP / 回到首页），并挂 25 秒看门狗 `_armLoadWatchdog`。
+  `onWebResourceError` 只能忽略 `isForMainFrame == false`——**不能写成 `!= true`**，
+  部分回调路径里它是 `null`，会把主框架失败静默吞掉（表现就是「白屏 + 进度条一直转」）。
+  HTTP 状态错误（4xx/5xx）不走这个回调，靠 `onPageFinished` 读到标题「网页无法打开」后
+  经 `_reportErrorPage` 兜底；这类错误页不进浏览历史。异步回调必须带 `_loadToken` 校验，
+  否则 https 失败回退 http 时，旧页面的错误卡片会盖在新页面上。
+- **补 scheme 的规则**：地址栏输入不带 scheme 时补 `https://` 并记 `_autoScheme`；
+  该站只支持 HTTP 导致失败时自动回退 `http://` 再试一次，同一 host 只回退一次
+  （`_httpRetried`），不要做成两个 scheme 互跳。
+- **后台小窗 = 系统画中画**：唯一触发点是 `MainActivity.onUserLeaveHint`（配
+  `PlayerPlatform.shouldEnterPip()`），许可位由 Flutter 侧「有播放器」时用 `setAutoPip(true)`
+  打开、`PlayerPanel.dispose()` 里必须关掉，否则普通切后台也会弹空小窗。
+  PiP 里 `_PlayerLayer` 用 `Offstage` 收起页面（**保留 State**，WebView 与进度不能重建）、
+  `PlayerPanel(pip: true)` 只画画面；**不要给 PiP 加标题栏或控制条**。
+  `AppState.pipActive` 由 `onPictureInPictureModeChanged` 回报，`closePlayer()` 里要复位。
 - **多窗口交互**（对齐主流手机浏览器）：顶部一条地址栏 + 底部一条工具条
   （后退 / 前进 / 首页 / 窗口 / 关闭），窗口列表是卡片总览弹窗，**不要再加常驻标签条**；
   **新建窗口直接 `openBlank()` 落到窗口首页**（`_WindowHomeView`：搜索框 + 常用站点），

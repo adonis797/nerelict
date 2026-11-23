@@ -569,6 +569,20 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 是否正处在系统画中画（PiP）窗口里。
+  ///
+  /// 由原生 `onPictureInPictureModeChanged` 回报。PiP 时整个 Activity 被缩成
+  /// 一个小窗口，界面必须只剩播放画面——否则用户看到的是「缩小的浏览器」。
+  bool _pipActive = false;
+  bool get pipActive => _pipActive;
+
+  void setPipActive(bool value) {
+    if (_pipActive == value) return;
+    logD('Player', 'pip -> $value');
+    _pipActive = value;
+    notifyListeners();
+  }
+
   /// 上次关闭浮层的时间，避免返回网页后被同一个视频反复接管
   DateTime? playerClosedAt;
 
@@ -611,6 +625,8 @@ class AppState extends ChangeNotifier {
     logD('Player', 'close (mode=${_playerMode.name})');
     _player = null;
     _playerMode = PlayerMode.panel;
+    // 关掉播放后画中画没有意义：不重置这个标记，整个界面会一直是「只剩视频」。
+    _pipActive = false;
     playerClosedAt = DateTime.now();
     notifyListeners();
   }

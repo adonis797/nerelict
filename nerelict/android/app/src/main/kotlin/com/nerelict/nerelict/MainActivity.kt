@@ -2,6 +2,7 @@ package com.nerelict.nerelict
 
 import android.app.Activity
 import android.content.Context
+import android.content.res.Configuration
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.content.Intent
@@ -478,6 +479,28 @@ class MainActivity : FlutterActivity() {
         playerPlatform?.dispose()
         playerPlatform = null
         super.onDestroy()
+    }
+
+    /**
+     * 用户按首页键 / 切到最近任务时，如果播放器还开着就自动进画中画。
+     *
+     * 为什么放在这里：这是系统给「即将离开界面」的唯一可靠信号，比在 Flutter 侧
+     * 监听 `AppLifecycleState` 更早也更准（Flutter 收到 paused 时表面往往已经不可见）。
+     * 进 PiP 后 Activity 仍可见，ExoPlayer 继续解码，切后台不会再被系统冻住。
+     */
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        val platform = playerPlatform ?: return
+        if (platform.shouldEnterPip()) platform.enterPip()
+    }
+
+    /** PiP 状态回报给 Flutter：进入时只画播放画面，退出时恢复完整界面。 */
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration,
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        playerPlatform?.notifyPipChanged(isInPictureInPictureMode)
     }
 
     /**

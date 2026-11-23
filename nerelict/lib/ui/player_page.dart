@@ -50,6 +50,7 @@ class PlayerPanel extends StatefulWidget {
     this.onDragStart,
     this.onDragUpdate,
     this.onDragEnd,
+    this.pip = false,
   });
 
   final PlayerRequest request;
@@ -59,6 +60,11 @@ class PlayerPanel extends StatefulWidget {
   final GestureDragStartCallback? onDragStart;
   final GestureDragUpdateCallback? onDragUpdate;
   final GestureDragEndCallback? onDragEnd;
+
+  /// 系统画中画窗口里：整块区域只画画面，不要标题栏、控制条与浮层提示。
+  /// 换形态（mini / panel / fullscreen）会重建布局，而 PiP 只是「换个渲染方式」，
+  /// 播放内核、进度、轨道选择都不受影响。
+  final bool pip;
 
   @override
   State<PlayerPanel> createState() => _PlayerPanelState();
@@ -141,10 +147,19 @@ class _PlayerPanelState extends State<PlayerPanel> {
     super.didChangeDependencies();
     final mode = context.read<AppState>().playerMode;
     if (mode == _lastMode) return;
+    final wasMini = _lastMode == PlayerMode.mini;
     _lastMode = mode;
     PlayerPlatform.instance.setOrientation(
       mode == PlayerMode.fullscreen ? 'landscape' : 'auto',
     );
+    // 只有迷你小窗才是「后台播放形态」：浮层 / 全屏时按首页键本该退到后台，
+    // 这时抢进画中画反而不对（也可能撞上「去登录 / 去安装」这类切走动作）。
+    if (mode == PlayerMode.mini || wasMini) {
+      unawaited(PlayerPlatform.instance.setAutoPip(
+        mode == PlayerMode.mini,
+        aspectRatio: _core?.aspectRatio ?? 16 / 9,
+      ));
+    }
     if (mode == PlayerMode.fullscreen) _showControls();
   }
 
@@ -241,6 +256,16 @@ class _PlayerPanelState extends State<PlayerPanel> {
     await platform.keepScreenOn(true);
     await platform.setOrientation(
       _lastMode == PlayerMode.fullscreen ? 'landscape' : 'auto',
+    );
+    // 画中画：只挂回调 + 打开许可位，真正进 PiP 由原生 onUserLeaveHint 触发。
+    // 许可位只在迷你小窗形态下打开（didChangeDependencies 负责跟随形态切换）。
+    platform.onPipChanged = (inPip) {
+      if (!mounted) return;
+      context.read<AppState>().setPipActive(inPip);
+    };
+    await platform.setAutoPip(
+      _lastMode == PlayerMode.mini,
+      aspectRatio: _core?.aspectRatio ?? 16 / 9,
     );
     if (_settings.playerMediaControls) {
       platform.onMediaAction = _onMediaAction;
@@ -445,6 +470,9 @@ class _PlayerPanelState extends State<PlayerPanel> {
     _saveMemory();
     final platform = PlayerPlatform.instance;
     platform.onMediaAction = null;
+    // 播放器没了就别再接管首页键，否则普通切后台也会弹出一个空的小窗
+    platform.onPipChanged = null;
+    platform.setAutoPip(false);
     platform.enableMediaControls(false);
     platform.clearSession();
     platform.keepScreenOn(false);
@@ -827,7 +855,8 @@ class _PlayerPanelState extends State<PlayerPanel> {
   Future<void> _onMore(_MoreAction action) async {
     switch (action) {
       case _MoreAction.pip:
-        final ok = await PlayerPlatform.instance.enterPip();
+        final ok = await PlayerPlatform.instance
+            .enterPip(aspectRatio: _core?.aspectRatio);
         if (!ok) _toast('当前设备或系统版本不支持画中画');
         break;
       case _MoreAction.cast:
@@ -1075,9 +1104,64 @@ class _PlayerPanelState extends State<PlayerPanel> {
   @override
   Widget build(BuildContext context) {
     final mode = context.select<AppState, PlayerMode>((s) => s.playerMode);
+    // PiP 优先于三态：系统小窗只有几十 dp，标题栏与控制条都会挤成一团
+    if (widget.pip) return _buildPip();
     if (mode == PlayerMode.mini) return _buildMini();
     if (mode == PlayerMode.fullscreen) return _buildFullscreen();
     return _buildPanel();
+  }
+
+  /// 系统画中画窗口：只画画面。
+  ///
+  /// 不画标题栏、控制条与提示：PiP 的尺寸由系统决定，控件放不下也用不了；
+  /// 系统会在窗口上叠「展开 / 关闭」，所以这里只保留「单击暂停」。
+  Widget _buildPip() {
+    final core = _core;
+    final error = _error;
+    return ColoredBox(
+      color: Colors.black,
+      child: Stack(
+        fit: StackFit.expand,
+        children: <Widget>[
+          if (core != null)
+            Center(
+              child: AspectRatio(
+                aspectRatio:
+                    core.aspectRatio <= 0 ? 16 / 9 : core.aspectRatio,
+                child: core.videoWidget(),
+              ),
+            )
+          else
+            const Center(
+              child: SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2, color: kAccent),
+              ),
+            ),
+          if (error != null)
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.all(10),
+                child: Text(
+                  error,
+                  textAlign: TextAlign.center,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 10, color: Colors.white70),
+                ),
+              ),
+            ),
+          // 单击暂停 / 继续：PiP 里没有控制条，这是唯一能用的手势
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onTap: _togglePlay,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _buildMini() {

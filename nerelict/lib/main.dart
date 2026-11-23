@@ -246,6 +246,8 @@ class _PlayerLayerState extends State<_PlayerLayer> {
   Widget build(BuildContext context) {
     final player = widget.state.player;
     final mode = widget.state.playerMode;
+    // 系统画中画：整个 App 被系统缩成小窗，界面只该剩播放画面
+    final pip = widget.state.pipActive;
     // 小窗用持久化位置；面板只用本次会话的位置（默认顶部）
     final offset = _dragOffset ??
         (mode == PlayerMode.mini ? widget.state.playerOffset : _panelOffset);
@@ -254,7 +256,12 @@ class _PlayerLayerState extends State<_PlayerLayer> {
     final hint = widget.state.hint;
     final p = paletteOf(context);
 
-    final children = <Widget>[widget.navigator];
+    final children = <Widget>[
+      // PiP 时把页面收起来但**不销毁**：Offstage 保留 State，
+      // WebView 与浏览状态不会因为「切出去一次」被重建
+      if (pip) Offstage(offstage: true, child: widget.navigator)
+      else widget.navigator,
+    ];
 
     if (player != null) {
       final panel = SizedBox(
@@ -262,6 +269,7 @@ class _PlayerLayerState extends State<_PlayerLayer> {
         child: PlayerPanel(
           key: ValueKey('${player.url}_${player.local}'),
           request: player,
+          pip: pip,
           onClose: widget.state.closePlayer,
           onDragStart: _onPanStart,
           onDragUpdate: _onPanUpdate,
@@ -271,54 +279,59 @@ class _PlayerLayerState extends State<_PlayerLayer> {
 
       // 三种形态共用同一个 PlayerPanel 实例与播放内核：切换形态不会重建控制器。
       final Widget positioned;
-      switch (mode) {
-        case PlayerMode.fullscreen:
-          positioned = Positioned.fill(child: panel);
-          break;
-        case PlayerMode.mini:
-          final dockBottom = media.padding.bottom + _navBarHeight;
-          final left = offset?.dx ?? size.width - _miniWidth - _sideMargin;
-          final top = offset?.dy ??
-              size.height - dockBottom - _miniHeight - _sideMargin;
-          positioned = AnimatedPositioned(
-            // 拖动时跟手（零动画），松手贴边时给一个短过渡
-            duration: _dragOffset == null
-                ? const Duration(milliseconds: 220)
-                : Duration.zero,
-            curve: Curves.easeOutCubic,
-            left:
-                left.clamp(_sideMargin, size.width - _miniWidth - _sideMargin),
-            top: top.clamp(
-              media.padding.top + 6,
-              size.height -
-                  media.padding.bottom -
-                  _navBarHeight -
-                  _miniHeight -
-                  6,
-            ),
-            width: _miniWidth,
-            child: panel,
-          );
-          break;
-        case PlayerMode.panel:
-          // 默认贴住页面顶部、左右铺满；拖动只改变纵向位置
-          final minTop = media.padding.top + _topInset;
-          final top = (offset?.dy ?? minTop).clamp(
-            minTop,
-            size.height - media.padding.bottom - _navBarHeight - 120,
-          );
-          positioned = Positioned(
-            left: 0,
-            right: 0,
-            top: top,
-            child: panel,
-          );
+      if (pip) {
+        // 画中画窗口的比例由原生按视频宽高设置，这里直接铺满即可
+        positioned = Positioned.fill(child: panel);
+      } else {
+        switch (mode) {
+          case PlayerMode.fullscreen:
+            positioned = Positioned.fill(child: panel);
+            break;
+          case PlayerMode.mini:
+            final dockBottom = media.padding.bottom + _navBarHeight;
+            final left = offset?.dx ?? size.width - _miniWidth - _sideMargin;
+            final top = offset?.dy ??
+                size.height - dockBottom - _miniHeight - _sideMargin;
+            positioned = AnimatedPositioned(
+              // 拖动时跟手（零动画），松手贴边时给一个短过渡
+              duration: _dragOffset == null
+                  ? const Duration(milliseconds: 220)
+                  : Duration.zero,
+              curve: Curves.easeOutCubic,
+              left: left.clamp(
+                  _sideMargin, size.width - _miniWidth - _sideMargin),
+              top: top.clamp(
+                media.padding.top + 6,
+                size.height -
+                    media.padding.bottom -
+                    _navBarHeight -
+                    _miniHeight -
+                    6,
+              ),
+              width: _miniWidth,
+              child: panel,
+            );
+            break;
+          case PlayerMode.panel:
+            // 默认贴住页面顶部、左右铺满；拖动只改变纵向位置
+            final minTop = media.padding.top + _topInset;
+            final top = (offset?.dy ?? minTop).clamp(
+              minTop,
+              size.height - media.padding.bottom - _navBarHeight - 120,
+            );
+            positioned = Positioned(
+              left: 0,
+              right: 0,
+              top: top,
+              child: panel,
+            );
+        }
       }
       children.add(positioned);
     }
 
     // 悬停提示位于最上层：播放器浮层、页面、底部弹窗都盖不住它。
-    if (hint != null) {
+    if (hint != null && !pip) {
       children.add(Positioned(
         left: 0,
         right: 0,

@@ -17,6 +17,9 @@ class PlayerPlatform {
   /// action: play / pause / rewind / forward / stop / seek
   void Function(String action, int positionMs)? onMediaAction;
 
+  /// 系统画中画状态变化（进入 / 退出 PiP 窗口）。
+  void Function(bool inPip)? onPipChanged;
+
   bool _handlerRegistered = false;
 
   void _ensureHandler() {
@@ -29,6 +32,8 @@ class PlayerPlatform {
           (args['action'] as String?) ?? 'play',
           (args['positionMs'] as num?)?.toInt() ?? 0,
         );
+      } else if (call.method == 'pipChanged') {
+        onPipChanged?.call(call.arguments == true);
       }
       return null;
     });
@@ -113,7 +118,27 @@ class PlayerPlatform {
   Future<bool> pipSupported() async =>
       await _call<bool>('pipSupported') ?? false;
 
-  Future<bool> enterPip() async => await _call<bool>('enterPip') ?? false;
+  /// 手动进入画中画（播放器菜单里的「画中画」）。
+  Future<bool> enterPip({double? aspectRatio}) async {
+    _ensureHandler();
+    return await _call<bool>('enterPip', <String, dynamic>{
+          if (aspectRatio != null && aspectRatio.isFinite && aspectRatio > 0)
+            'aspect': aspectRatio,
+        }) ??
+        false;
+  }
+
+  /// 开启「切到后台自动进画中画」。
+  ///
+  /// 只是把开关和画面比例交给原生：真正触发在 `Activity.onUserLeaveHint`，
+  /// 这样不会和系统的「首页键 / 最近任务」抢事件。播放结束或关窗时关掉。
+  Future<void> setAutoPip(bool enabled, {double aspectRatio = 16 / 9}) async {
+    _ensureHandler();
+    await _void('setAutoPip', <String, dynamic>{
+      'enabled': enabled,
+      'aspect': aspectRatio,
+    });
+  }
 
   /// 只对本地文件可用；网络流返回 null（边界限制里已说明）。
   Future<String?> captureFrame(String path, int positionMs) async =>
