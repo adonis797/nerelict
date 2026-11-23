@@ -1230,6 +1230,48 @@ void main() {
           mainDart.contains('builder: (context, child)'),
       '播放层挂在 MaterialApp.builder 上，是应用内最高层');
 
+  // ---- 后台悬浮小窗（SYSTEM_ALERT_WINDOW）----
+  final floatKt =
+      read('android/app/src/main/kotlin/com/nerelict/nerelict/FloatingPlayer.kt');
+  check(manifest.contains('android.permission.SYSTEM_ALERT_WINDOW'),
+      '清单里声明悬浮窗权限，否则系统设置页不会出现该开关');
+  check(floatKt.contains('TYPE_APPLICATION_OVERLAY') &&
+          floatKt.contains('Settings.canDrawOverlays'),
+      '悬浮窗用系统级 overlay 窗口，开窗前先查授权');
+  check(floatKt.contains('ExoPlayer.Builder(') &&
+          floatKt.contains('setVideoTextureView('),
+      '悬浮窗自带独立播放器并直接渲染到窗口纹理，不依赖 Flutter 画面');
+  check(floatKt.contains('FLAG_NOT_FOCUSABLE'),
+      '悬浮窗不拿焦点，盖在别人上面也不抢输入');
+  check(floatKt.contains('bringToFront') &&
+          platformKt.contains('FloatingPlayer.bringToFront'),
+      '点小窗回到应用，而不是呆在原地不动');
+  check(platformKt.contains('"showFloating"') &&
+          platformKt.contains('"hideFloating"') &&
+          platformKt.contains('"hasOverlayPermission"') &&
+          platformKt.contains('"requestOverlayPermission"'),
+      '悬浮窗的权限查询 / 申请 / 显示 / 隐藏都走同一条通道');
+  check(platformKt.contains('private fun route(') &&
+          platformKt.contains('override fun onPlay() = route("play")'),
+      '媒体按键按「谁在播」分流：悬浮窗接管时不把动作转给已暂停的 Dart 侧');
+  check(platformKt.contains('if (floatingActive) {') &&
+          platformKt.contains('result.success(null)\n                        return'),
+      '悬浮窗期间不接受 Flutter 侧冻结的会话状态');
+  check(playerDart.contains('WidgetsBindingObserver') &&
+          playerDart.contains('didChangeAppLifecycleState'),
+      '播放器监听前后台，切换时在悬浮窗与本机内核之间交接');
+  check(playerDart.contains('_enterFloating') &&
+          playerDart.contains('_exitFloating') &&
+          playerDart.contains('showFloating(') &&
+          playerDart.contains('hideFloating()'),
+      '切后台起悬浮窗、回前台收回并按进度接上');
+  check(playerDart.contains('playerFloatingWindow'),
+      '悬浮小窗是用户开关，默认不偷偷申请权限');
+  final enterAt = playerDart.indexOf('await platform.hasOverlayPermission()');
+  final showAt = playerDart.indexOf('await platform.showFloating(');
+  check(enterAt >= 0 && showAt > enterAt,
+      '每次弹窗前现查权限，用户收回权限后不会再弹');
+
   stdout.writeln();
   if (failures.isEmpty) {
     stdout.writeln('全部通过：$passed 项断言');

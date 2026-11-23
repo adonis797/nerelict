@@ -70,7 +70,7 @@ class PlayerPanel extends StatefulWidget {
   State<PlayerPanel> createState() => _PlayerPanelState();
 }
 
-class _PlayerPanelState extends State<PlayerPanel> {
+class _PlayerPanelState extends State<PlayerPanel> with WidgetsBindingObserver {
   late final MediaSource _source;
   late final SettingsState _settings;
   final PlaybackMemory _memory = PlaybackMemory();
@@ -127,9 +127,17 @@ class _PlayerPanelState extends State<PlayerPanel> {
   bool _completedSaved = false;
   bool _disposed = false;
 
+  /// 实际交给播放内核的地址：直连是源地址，开了边下边播则是本机回环代理。
+  /// 后台悬浮窗必须指着同一个地址，否则等于换了一条链路重新起播。
+  String? _activeUrl;
+
+  /// 当前画面是否已经交给系统悬浮窗（此时本机内核处于暂停待命状态）。
+  bool _floating = false;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _settings = context.read<SettingsState>();
     _source = MediaSource.parse(
       url: widget.request.url,
@@ -152,6 +160,74 @@ class _PlayerPanelState extends State<PlayerPanel> {
       mode == PlayerMode.fullscreen ? 'landscape' : 'auto',
     );
     if (mode == PlayerMode.fullscreen) _showControls();
+  }
+
+  /// 切后台 / 回前台时在「原生悬浮窗」与「本机内核」之间交接播放。
+  ///
+  /// 为什么交接而不是让本机内核继续播：Activity 一停，Flutter 的纹理就被系统收走，
+  /// 画面不可能再画到别的应用上面。要让用户切出去还能看见小窗，只能起一层
+  /// `TYPE_APPLICATION_OVERLAY` 窗口，由原生 ExoPlayer 直接渲染。
+  /// 两边指同一个地址，交接只换渲染端，进度按当前位置对齐。
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (!mounted) return;
+    if (state == AppLifecycleState.paused) {
+      unawaited(_enterFloating());
+    } else if (state == AppLifecycleState.resumed) {
+      unawaited(_exitFloating());
+    }
+  }
+
+  Future<void> _enterFloating() async {
+    if (_floating || _disposed || _error != null) return;
+    if (!_settings.playerFloatingWindow) return;
+    final core = _core;
+    final url = _activeUrl;
+    if (core == null || url == null) return;
+    final platform = PlayerPlatform.instance;
+    // 权限随时可能被用户收回，每次都现查，不缓存
+    if (!await platform.hasOverlayPermission()) return;
+    // 查权限是异步的：这期间用户可能已经回到前台，或者播放器被关掉
+    if (_floating || _disposed || !mounted || _core == null) return;
+    final target = _source.local ? Uri.file(_source.raw).toString() : url;
+    final ok = await platform.showFloating(
+      url: target,
+      kind: _source.kind.name,
+      headers: _source.headers,
+      positionMs: core.position.inMilliseconds,
+      playing: core.isPlaying,
+      aspectRatio: core.aspectRatio,
+      speed: _speed,
+      title: _source.displayTitle,
+    );
+    if (!ok) {
+      logD('Player', 'floating unavailable, keep in-process playback');
+      return;
+    }
+    _floating = true;
+    logD('Player', 'floating on @${core.position.inSeconds}s');
+    // 悬浮窗已经接手画面与声音，本机内核让位：两个播放器同时出声会重音，
+    // 同时占一套解码器也更容易被厂商省电策略盯上
+    await core.pause();
+  }
+
+  Future<void> _exitFloating() async {
+    if (!_floating) return;
+    _floating = false;
+    final result = await PlayerPlatform.instance.hideFloating();
+    final core = _core;
+    if (core == null || _disposed) return;
+    if (result != null) {
+      logD('Player', 'floating off @${(result.positionMs / 1000).round()}s');
+      await core.seekTo(Duration(milliseconds: result.positionMs));
+      if (result.playing) {
+        await core.play();
+      } else {
+        await core.pause();
+      }
+      _saveMemory();
+    }
+    if (mounted) _showControls();
   }
 
   Future<void> _init() async {
@@ -213,6 +289,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
         return;
       }
       _core = core;
+      _activeUrl = playbackUrl ?? _source.url;
       core.values.addListener(_onValue);
       setState(() {});
 
@@ -253,6 +330,18 @@ class _PlayerPanelState extends State<PlayerPanel> {
     platform.onPipChanged = (inPip) {
       if (!mounted) return;
       context.read<AppState>().setPipActive(inPip);
+    };
+    // 悬浮窗的 × 与失败回落：和「媒体通知控制」开不开无关，必须常挂
+    platform.onFloatingClosed = () {
+      if (!mounted || _disposed) return;
+      logD('Player', 'floating closed by user');
+      widget.onClose();
+    };
+    platform.onFloatingFailed = () {
+      if (!mounted || _disposed) return;
+      logD('Player', 'floating failed, resume in-app');
+      _floating = false;
+      _core?.play();
     };
     await platform.keepAlive(true);
     if (_settings.playerMediaControls) {
@@ -367,6 +456,9 @@ class _PlayerPanelState extends State<PlayerPanel> {
 
   void _publishSession() {
     if (!_settings.playerMediaControls) return;
+    // 悬浮窗接管期间会话状态由原生侧维护（它每秒回报真实进度），
+    // 这里再发一次只会把冻结的位置写回去
+    if (_floating) return;
     final core = _core;
     if (core == null) return;
     PlayerPlatform.instance.updateSession(
@@ -450,6 +542,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
   @override
   void dispose() {
     _disposed = true;
+    WidgetsBinding.instance.removeObserver(this);
     _tick?.cancel();
     _hideTimer?.cancel();
     _hintTimer?.cancel();
@@ -459,6 +552,13 @@ class _PlayerPanelState extends State<PlayerPanel> {
     final platform = PlayerPlatform.instance;
     platform.onMediaAction = null;
     platform.onPipChanged = null;
+    platform.onFloatingClosed = null;
+    platform.onFloatingFailed = null;
+    // 播放器关了就把悬浮窗一起收掉，别在别人屏幕上留一块没主的画面
+    if (_floating) {
+      _floating = false;
+      unawaited(platform.hideFloating());
+    }
     // 播放器没了就撤掉前台服务与常驻通知，别在后台留一个空转的保活
     platform.keepAlive(false);
     platform.enableMediaControls(false);

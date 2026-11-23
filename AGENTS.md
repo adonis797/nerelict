@@ -134,6 +134,15 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
   `PlayerPanel(pip: true)` 只画画面，**不要加标题栏或控制条**。
   通知 ID 必须与 `PlaybackService.NOTIFICATION_ID` 一致（8801），`publishState()` 里
   `if (!sessionEnabled) return` 不能去掉，否则关闭播放器会留下一条滑不掉的残影通知。
+- **后台看得见画面 = `TYPE_APPLICATION_OVERLAY` 悬浮窗**（`FloatingPlayer.kt`），它和前台
+  播放器是**两个 ExoPlayer**：靠 `showFloating` / `hideFloating` 按当前位置交接，两边必须
+  指着同一个地址（`_activeUrl` = 代理地址或 `file://`）与同一份请求头。交接点在
+  `_PlayerPanelState.didChangeAppLifecycleState`（`paused` 进、`resumed` 出），
+  **不要改成 `onUserLeaveHint` 自动 PiP**；悬浮窗起来后本机内核必须 `pause()`，否则重音。
+  `SYSTEM_ALERT_WINDOW` 只能用户手动授予：`showFloating` 前**每次**都要 `hasOverlayPermission()`，
+  不许缓存结果；没授权就当后台出声，不要弹任何提示。悬浮窗期间 Dart 侧的
+  `updateSession` 由原生丢弃（`_publishSession` 里 `if (_floating) return`），媒体按键走
+  `PlayerPlatform.route()` 分流到正在播的那一侧，**不要再直连 `emit()`**。
 - **多窗口交互**（对齐主流手机浏览器）：顶部一条地址栏 + 底部一条工具条
   （后退 / 前进 / 首页 / 窗口 / 关闭），窗口列表是卡片总览弹窗，**不要再加常驻标签条**；
   **新建窗口直接 `openBlank()` 落到窗口首页**（`_WindowHomeView`：搜索框 + 常用站点），

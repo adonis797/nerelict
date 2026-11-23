@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -5,6 +7,7 @@ import '../models/theme_mode.dart';
 import '../services/apk_installer.dart';
 import '../services/app_log.dart';
 import '../services/player_core.dart' show kPlaybackSpeeds;
+import '../services/player_platform.dart';
 import '../services/storage_service.dart';
 import '../services/streaming_proxy.dart';
 import '../state/app_state.dart';
@@ -656,6 +659,7 @@ List<Widget> _playerPage(
     _SettingCard(
       titles: [
         '通知栏 / 锁屏媒体控制',
+        '后台悬浮小窗',
         '自动续播',
         '画面手势',
         '播放时拦截网页弹窗',
@@ -672,6 +676,8 @@ List<Widget> _playerPage(
           secondary: Icon(Icons.notifications_active_outlined, color: p.accent),
           contentPadding: const EdgeInsets.symmetric(horizontal: 14),
         ),
+        Divider(height: 1, color: p.border),
+        _FloatingWindowTile(p: p, settings: settings),
         Divider(height: 1, color: p.border),
         SwitchListTile(
           value: settings.playerAutoResume,
@@ -1490,6 +1496,106 @@ class _PickerRowState<T> extends State<_PickerRow<T>> {
         ],
       ),
       onTap: _open,
+    );
+  }
+}
+
+/// 「后台悬浮小窗」开关：需要系统的「显示在其他应用上层」权限。
+///
+/// 这个权限没法在应用内弹窗要，只能跳系统设置页让用户自己开。所以点开关时先跳过去，
+/// 等用户回来（`resumed`）再复查一次——授权成功就直接把开关打开，
+/// 免得用户以为没生效又点一遍。
+class _FloatingWindowTile extends StatefulWidget {
+  const _FloatingWindowTile({required this.p, required this.settings});
+
+  final AppPalette p;
+  final SettingsState settings;
+
+  @override
+  State<_FloatingWindowTile> createState() => _FloatingWindowTileState();
+}
+
+class _FloatingWindowTileState extends State<_FloatingWindowTile>
+    with WidgetsBindingObserver {
+  /// 权限是否已授予；null 表示还在查。
+  bool? _granted;
+
+  /// 刚从系统设置页离开，回来时要复查并按结果自动打开开关。
+  bool _awaiting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(_refresh());
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) return;
+    unawaited(_refreshAndMaybeEnable());
+  }
+
+  Future<bool> _refresh() async {
+    final ok = await PlayerPlatform.instance.hasOverlayPermission();
+    if (mounted) setState(() => _granted = ok);
+    return ok;
+  }
+
+  Future<void> _refreshAndMaybeEnable() async {
+    final ok = await _refresh();
+    if (!mounted || !_awaiting) return;
+    _awaiting = false;
+    if (ok) {
+      await widget.settings.setPlayerFloatingWindow(true);
+    } else {
+      _snack('还没有允许「显示在其他应用上层」，悬浮小窗无法显示');
+    }
+  }
+
+  Future<void> _onChanged(bool value) async {
+    if (!value) {
+      await widget.settings.setPlayerFloatingWindow(false);
+      return;
+    }
+    final ok = _granted ?? await _refresh();
+    if (ok) {
+      await widget.settings.setPlayerFloatingWindow(true);
+      return;
+    }
+    _awaiting = true;
+    await PlayerPlatform.instance.requestOverlayPermission();
+    if (!mounted) return;
+    _snack('请在系统设置里允许「显示在其他应用上层」，返回后会自动开启');
+  }
+
+  void _snack(String text) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final p = widget.p;
+    final granted = _granted;
+    return SwitchListTile(
+      value: widget.settings.playerFloatingWindow,
+      onChanged: _onChanged,
+      title: const Text('后台悬浮小窗'),
+      subtitle: Text(
+        granted == false
+            ? '切到后台后用系统悬浮窗继续显示画面，覆盖在其它应用之上；'
+                '当前没有「显示在其他应用上层」权限，打开时会跳到系统设置'
+            : '切到后台后用系统悬浮窗继续显示画面，覆盖在其它应用之上；'
+                '点小窗回到应用，拖到边缘会自动贴边',
+      ),
+      secondary: Icon(Icons.picture_in_picture_alt_outlined, color: p.accent),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 14),
     );
   }
 }

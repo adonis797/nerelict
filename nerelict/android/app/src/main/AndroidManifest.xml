@@ -8,6 +8,9 @@
          Android 14+ 还需要单独声明 FOREGROUND_SERVICE_MEDIA_PLAYBACK -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+    <!-- 后台悬浮小窗：切到其它应用后仍显示播放画面，需用户在系统设置里
+         手动开启「显示在其他应用上层」，应用内无法代授 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
     <!-- 应用内安装 APK：REQUEST_INSTALL_PACKAGES 用于调起系统安装器；
          INSTALL_PACKAGES 是系统级权限，只有系统签名/预装 priv-app 或 root 才能生效，
          普通安装包声明它不会获得授权，仅用于「已预装」场景下启用静默安装。 -->

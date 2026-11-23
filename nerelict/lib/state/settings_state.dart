@@ -48,6 +48,9 @@ class SettingsState extends ChangeNotifier {
   static const _kPlayerAutoResume = 'player_auto_resume';
   static const _kPlayerGestures = 'player_gestures';
   static const _kPlayerBlockPagePopups = 'player_block_page_popups';
+
+  /// 后台悬浮小窗（需要「显示在其他应用上层」权限）
+  static const _kPlayerFloatingWindow = 'player_floating_window';
   static const _kPlayerStreamingCache = 'player_streaming_cache';
   static const _kPlayerCacheLimitMb = 'player_cache_limit_mb';
   static const _kPlayerSpeed = 'player_speed';
@@ -78,6 +81,10 @@ class SettingsState extends ChangeNotifier {
   /// 播放期间拦截网页弹窗（window.open / alert / confirm / prompt）。
   /// 原生对话框会压在播放器之上，用户点按钮时点到的是弹窗而不是播放器。
   bool _playerBlockPagePopups = true;
+
+  /// 切到后台时改用系统悬浮窗继续显示画面（默认关闭：要用户先去系统设置授权，
+  /// 悄悄申请一个「显示在其他应用上层」的权限会让人莫名其妙）。
+  bool _playerFloatingWindow = false;
   bool _playerStreamingCache = false;
   int _playerCacheLimitMb = kDefaultCacheLimitMb;
   double _playerSpeed = 1.0;
@@ -123,6 +130,9 @@ class SettingsState extends ChangeNotifier {
   /// 播放期间拦截网页弹窗与对话框
   bool get playerBlockPagePopups => _playerBlockPagePopups;
 
+  /// 切到后台时用系统悬浮窗继续显示画面（需 SYSTEM_ALERT_WINDOW 权限）
+  bool get playerFloatingWindow => _playerFloatingWindow;
+
   /// 边下边播：本地代理缓存 HLS 分片（默认关闭）
   bool get playerStreamingCache => _playerStreamingCache;
 
@@ -165,6 +175,8 @@ class SettingsState extends ChangeNotifier {
       _playerGestures = prefs.getBool(_kPlayerGestures) ?? true;
       _playerBlockPagePopups =
           prefs.getBool(_kPlayerBlockPagePopups) ?? true;
+      _playerFloatingWindow =
+          prefs.getBool(_kPlayerFloatingWindow) ?? false;
       _playerStreamingCache = prefs.getBool(_kPlayerStreamingCache) ?? false;
       final savedLimitMb = prefs.getInt(_kPlayerCacheLimitMb) ?? kDefaultCacheLimitMb;
       _playerCacheLimitMb = kCacheLimitOptionsMb.contains(savedLimitMb)
@@ -293,6 +305,17 @@ class SettingsState extends ChangeNotifier {
     _playerBlockPagePopups = value;
     notifyListeners();
     await _save(_kPlayerBlockPagePopups, value);
+  }
+
+  /// 后台悬浮小窗开关。
+  ///
+  /// 只管「愿不愿意用」，权限是另一回事：`showFloating` 每次都会现查授权，
+  /// 用户把权限收回之后开关还亮着也不会假装能弹窗。
+  Future<void> setPlayerFloatingWindow(bool value) async {
+    if (_playerFloatingWindow == value) return;
+    _playerFloatingWindow = value;
+    notifyListeners();
+    await _save(_kPlayerFloatingWindow, value);
   }
 
   Future<void> setPlayerStreamingCache(bool value) async {

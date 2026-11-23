@@ -21,6 +21,7 @@ import android.media.MediaMetadata
 import android.media.MediaMetadataRetriever
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
@@ -73,6 +74,18 @@ class PlayerPlatform(
     private var keepAlive = false
     private var pipAspect = 16f / 9f
 
+    /**
+     * 后台悬浮窗。
+     *
+     * 切到后台时由 Flutter 侧交接过来：窗口用 `TYPE_APPLICATION_OVERLAY` 挂在
+     * 其它应用之上，内部是独立的 ExoPlayer；回到前台再交接回去。窗口用的是
+     * application context，不跟着 Activity 一起销毁。
+     */
+    private var floating: FloatingPlayer? = null
+
+    private val floatingActive: Boolean
+        get() = floating?.showing == true
+
     private var lastTitle = "Nerelict 播放器"
     private var lastPlaying = false
     private var lastPositionMs = 0L
@@ -82,7 +95,7 @@ class PlayerPlatform(
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val action = intent?.getStringExtra("action") ?: return
-            emit(action)
+            route(action)
         }
     }
 
@@ -96,6 +109,12 @@ class PlayerPlatform(
                     result.success(null)
                 }
                 "updateSession" -> {
+                    // 悬浮窗接管期间不接受 Flutter 侧的会话更新：那边已经暂停、
+                    // 进度是冻结的，覆盖上去会让通知栏与小窗各说各话
+                    if (floatingActive) {
+                        result.success(null)
+                        return
+                    }
                     lastTitle = call.argument<String>("title") ?: lastTitle
                     lastPlaying = call.argument<Boolean>("playing") ?: false
                     lastPositionMs = (call.argument<Number>("positionMs") ?: 0).toLong()
@@ -145,6 +164,17 @@ class PlayerPlatform(
                     setKeepAlive(call.argument<Boolean>("enabled") ?: false)
                     result.success(null)
                 }
+                "overlaySupported" -> result.success(overlaySupported())
+                "hasOverlayPermission" -> result.success(hasOverlayPermission())
+                "requestOverlayPermission" -> result.success(requestOverlayPermission())
+                "showFloating" -> result.success(showFloating(call))
+                "hideFloating" -> {
+                    val (pos, playing) = hideFloating()
+                    result.success(
+                        mapOf("positionMs" to pos, "playing" to playing)
+                    )
+                }
+                "floatingActive" -> result.success(floatingActive)
                 "captureFrame" -> captureFrame(call, result)
                 "shareText" -> {
                     result.success(shareText(call.argument<String>("text") ?: ""))
@@ -190,14 +220,16 @@ class PlayerPlatform(
                     MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS
             )
             session.setCallback(object : MediaSession.Callback() {
-                override fun onPlay() = emit("play")
-                override fun onPause() = emit("pause")
-                override fun onFastForward() = emit("forward")
-                override fun onRewind() = emit("rewind")
-                override fun onSkipToNext() = emit("forward")
-                override fun onSkipToPrevious() = emit("rewind")
-                override fun onStop() = emit("stop")
-                override fun onSeekTo(pos: Long) = emit("seek", pos)
+                // 悬浮窗在播时控制权在它手上：Flutter 侧已经暂停，
+                // 这时候把 play 转给 Dart 只会得到一个「看起来在播、其实没声音」的会话。
+                override fun onPlay() = route("play")
+                override fun onPause() = route("pause")
+                override fun onFastForward() = route("forward")
+                override fun onRewind() = route("rewind")
+                override fun onSkipToNext() = route("forward")
+                override fun onSkipToPrevious() = route("rewind")
+                override fun onStop() = route("stop")
+                override fun onSeekTo(pos: Long) = route("seek", pos)
             })
             mediaSession = session
         }
@@ -237,7 +269,154 @@ class PlayerPlatform(
         }
     }
 
-    private fun publishState() {
+    /**
+     * 悬浮窗自己的事件（关窗 / 播放失败）。
+     *
+     * 不走 `mediaAction`：那条链只在用户开着「媒体通知控制」时才在 Dart 侧挂回调，
+     * 悬浮窗的行为不该被这个设置影响。
+     */
+    private fun emitFloating(method: String) {
+        main.post {
+            try {
+                channel.invokeMethod(method, null)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /**
+     * 媒体按键的去向：悬浮窗在播就直接控它，否则转给 Flutter 播放器。
+     *
+     * 通知栏 / 锁屏 / 蓝牙耳机都从这条链进来，两条链同时活着的话，
+     * 必然有一边点了没反应——所以必须按「谁在播」分流。
+     */
+    private fun route(action: String, positionMs: Long = lastPositionMs) {
+        val fp = floating
+        if (fp != null && fp.showing) {
+            when (action) {
+                "play" -> fp.setPlaying(true)
+                "pause" -> fp.setPlaying(false)
+                "toggle" -> fp.setPlaying(!lastPlaying)
+                "forward" -> fp.seekBy(10_000)
+                "rewind" -> fp.seekBy(-10_000)
+                "seek" -> fp.seekTo(positionMs)
+                "stop" -> {
+                    // 通知栏被滑掉 / 会话被停：收掉悬浮窗并结束会话
+                    hideFloating()
+                    main.post { emit("stop") }
+                    return
+                }
+                else -> return
+            }
+            return
+        }
+        emit(action, positionMs)
+    }
+
+    // ---- 后台悬浮窗 ----
+
+    private fun overlaySupported(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+
+    private fun hasOverlayPermission(): Boolean = try {
+        Settings.canDrawOverlays(activity)
+    } catch (_: Exception) {
+        false
+    }
+
+    /**
+     * 跳系统设置页开「显示在其他应用上层」。
+     *
+     * 这个权限只能由用户在系统设置里开，应用内弹窗代替不了；返回值是**当前**是否
+     * 已授权，调用方要按 false 处理并等用户回来再复查一次。
+     */
+    private fun requestOverlayPermission(): Boolean {
+        if (!overlaySupported()) return false
+        if (hasOverlayPermission()) return true
+        return try {
+            val intent = Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:${activity.packageName}")
+            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            activity.startActivity(intent)
+            false
+        } catch (_: Exception) {
+            // 部分 ROM 没有这一页，退到应用详情页让用户自己找
+            try {
+                activity.startActivity(
+                    Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:${activity.packageName}")
+                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } catch (_: Exception) {
+            }
+            false
+        }
+    }
+
+    /**
+     * 打开后台悬浮窗。
+     *
+     * 地址与请求头原样交给原生 ExoPlayer：与前台播放器指着同一个 URL
+     * （本机回环代理或本地文件），解码结果和前台一致。
+     */
+    private fun showFloating(call: MethodCall): Boolean {
+        if (!hasOverlayPermission()) return false
+        val url = call.argument<String>("url") ?: return false
+        val headers = call.argument<Map<String, String>>("headers") ?: emptyMap()
+        val positionMs = (call.argument<Number>("positionMs") ?: 0).toLong()
+        val playing = call.argument<Boolean>("playing") ?: true
+        val aspect = (call.argument<Number>("aspect") ?: 16.0 / 9.0).toFloat()
+        val speed = (call.argument<Number>("speed") ?: 1.0).toFloat()
+        val kind = call.argument<String>("kind")
+        call.argument<String>("title")?.let { if (it.isNotBlank()) lastTitle = it }
+
+        val fp = floating ?: FloatingPlayer(
+            context = activity.applicationContext,
+            onClose = {
+                // × 关窗：悬浮窗自己已经隐藏，这里只把会话结束的信号交回 Dart
+                emitFloating("floatingClosed")
+            },
+            onBackToApp = {
+                main.post { FloatingPlayer.bringToFront(activity.applicationContext) }
+            },
+            onTick = { pos, duration, isPlaying ->
+                if (isPlaying != lastPlaying) {
+                    lastPositionMs = pos
+                    lastDurationMs = duration
+                    lastPlaying = isPlaying
+                    publishState(notify = true)
+                } else {
+                    lastPositionMs = pos
+                    if (duration > 0) lastDurationMs = duration
+                    publishState(notify = false)
+                }
+            },
+            onFailed = {
+                // 悬浮窗播不了：交回 Flutter 侧继续出声，别在别人屏幕上留一块黑
+                emitFloating("floatingFailed")
+            },
+        ).also { floating = it }
+
+        val ok = fp.show(
+            uriString = url,
+            mimeType = FloatingPlayer.mimeFor(kind),
+            headers = headers,
+            positionMs = positionMs,
+            playing = playing,
+            aspect = aspect,
+            speed = speed,
+        )
+        return ok
+    }
+
+    private fun hideFloating(): Pair<Long, Boolean> {
+        val fp = floating ?: return 0L to false
+        return fp.hide()
+    }
+
+    private fun publishState(notify: Boolean = true) {
         val session = mediaSession ?: return
         val state = PlaybackState.Builder()
             .setActions(
@@ -266,7 +445,7 @@ class PlayerPlatform(
         )
         // 会话已经关掉就别再发通知：关闭播放器的顺序是「关会话 → 清会话状态」，
         // 这里若再 notify 一次，通知栏会留下一条点了没反应、也滑不掉的残影。
-        if (!sessionEnabled) return
+        if (!sessionEnabled || !notify) return
         try {
             notificationManager.notify(NOTIFICATION_ID, buildNotification())
         } catch (_: Exception) {
@@ -578,6 +757,11 @@ class PlayerPlatform(
 
     fun dispose() {
         keepAlive = false
+        try {
+            floating?.release()
+        } catch (_: Exception) {
+        }
+        floating = null
         PlaybackService.stop(activity)
         abandonFocus()
         unregisterReceiver()

@@ -86,4 +86,9 @@ flutter {
 dependencies {
     // FileProvider（把安装包安全地交给系统安装器）
     implementation("androidx.core:core-ktx:1.13.1")
+    // 后台悬浮窗自带一个 ExoPlayer。版本与 video_player_android 用的保持一致：
+    // 同一个进程里同时存在两个播放器，版本不一致会撞上同名类冲突。
+    implementation("androidx.media3:media3-exoplayer:1.9.2")
+    implementation("androidx.media3:media3-exoplayer-hls:1.9.2")
+    implementation("androidx.media3:media3-exoplayer-dash:1.9.2")
 }

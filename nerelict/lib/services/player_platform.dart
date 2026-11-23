@@ -1,5 +1,13 @@
 import 'package:flutter/services.dart';
 
+/// 悬浮窗关掉时交回给 Flutter 播放器的状态。
+class FloatingPlayback {
+  const FloatingPlayback({required this.positionMs, required this.playing});
+
+  final int positionMs;
+  final bool playing;
+}
+
 /// 原生媒体能力通道（media_session 层）。
 ///
 /// 对应 Kotlin 侧 PlayerPlatform.kt：MediaSession / 通知栏媒体控制、
@@ -20,6 +28,12 @@ class PlayerPlatform {
   /// 系统画中画状态变化（进入 / 退出 PiP 窗口）。
   void Function(bool inPip)? onPipChanged;
 
+  /// 用户点了悬浮窗右上角的 ×：应当结束整个播放会话。
+  void Function()? onFloatingClosed;
+
+  /// 悬浮窗自己播不了（防盗链 / 解码失败）：交回 Flutter 侧继续出声。
+  void Function()? onFloatingFailed;
+
   bool _handlerRegistered = false;
 
   void _ensureHandler() {
@@ -34,6 +48,10 @@ class PlayerPlatform {
         );
       } else if (call.method == 'pipChanged') {
         onPipChanged?.call(call.arguments == true);
+      } else if (call.method == 'floatingClosed') {
+        onFloatingClosed?.call();
+      } else if (call.method == 'floatingFailed') {
+        onFloatingFailed?.call();
       }
       return null;
     });
@@ -135,6 +153,71 @@ class PlayerPlatform {
   /// 小窗与播放位置原样继续。关闭播放器时必须关掉，否则会留下常驻通知。
   Future<void> keepAlive(bool enabled) =>
       _void('keepAlive', <String, dynamic>{'enabled': enabled});
+
+  // ---- 后台悬浮窗（SYSTEM_ALERT_WINDOW） ----
+
+  /// 系统能否加悬浮窗（Android 6.0+）。
+  Future<bool> overlaySupported() async =>
+      await _call<bool>('overlaySupported') ?? false;
+
+  /// 「显示在其他应用上层」是否已授权。只能由用户在系统设置里开。
+  Future<bool> hasOverlayPermission() async =>
+      await _call<bool>('hasOverlayPermission') ?? false;
+
+  /// 跳到系统设置页授权；返回**当前**是否已授权（首次调用通常为 false，
+  /// 需要等用户回来后再查一次）。
+  Future<bool> requestOverlayPermission() async =>
+      await _call<bool>('requestOverlayPermission') ?? false;
+
+  /// 打开后台悬浮窗并按给定进度起播。
+  ///
+  /// [url] 与前台播放器指向同一个地址（本机回环代理或 `file://` 本地文件），
+  /// [kind] 用于选择媒体源类型（`hls` / `dash`，其余交给后缀推断）。
+  Future<bool> showFloating({
+    required String url,
+    required String kind,
+    required Map<String, String> headers,
+    required int positionMs,
+    required bool playing,
+    required double aspectRatio,
+    required double speed,
+    required String title,
+  }) async {
+    _ensureHandler();
+    return await _call<bool>('showFloating', <String, dynamic>{
+          'url': url,
+          'kind': kind,
+          'headers': headers,
+          'positionMs': positionMs,
+          'playing': playing,
+          'aspect': aspectRatio.isFinite && aspectRatio > 0
+              ? aspectRatio
+              : 16.0 / 9.0,
+          'speed': speed,
+          'title': title,
+        }) ??
+        false;
+  }
+
+  /// 关闭悬浮窗，返回交回给 Flutter 播放器的进度与播放状态。
+  Future<FloatingPlayback?> hideFloating() async {
+    try {
+      final raw = await _channel.invokeMethod<dynamic>('hideFloating');
+      if (raw is Map) {
+        return FloatingPlayback(
+          positionMs: (raw['positionMs'] as num?)?.toInt() ?? 0,
+          playing: raw['playing'] == true,
+        );
+      }
+    } on MissingPluginException {
+      // 旧版原生层没有悬浮窗
+    } catch (_) {}
+    return null;
+  }
+
+  /// 悬浮窗当前是否在显示（原生侧为准）。
+  Future<bool> floatingActive() async =>
+      await _call<bool>('floatingActive') ?? false;
 
   /// 只对本地文件可用；网络流返回 null（边界限制里已说明）。
   Future<String?> captureFrame(String path, int positionMs) async =>
