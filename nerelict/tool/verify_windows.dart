@@ -228,12 +228,14 @@ void main() {
   check(tab.contains('BrowserWindowsPage(initialUrl: _currentUrl)'),
       '主界面把当前地址带进多窗口页');
   check(tab.contains('_openingWindows'), '多窗口入口有重复 push 防抖');
-  check(tab.contains('_WindowsEntryCard') && tab.contains('_WindowsEntryCard(onTap: onWindows)'),
-      '首页把多窗口入口放在搜索框下方，一眼可见');
+  check(
+      tab.contains('_buildHomeHeader') &&
+          tab.contains('onPressed: _openWindows'),
+      '首页把多窗口入口收进标题栏，不再占一张通栏卡压首屏');
   check(
       tab.contains('WindowRegistry.maxWindows') &&
-          tab.contains('同时开多个网页，最多'),
-      '首页入口文案的上限取自 WindowRegistry，不写死数字');
+          !tab.contains('_WindowsEntryCard'),
+      '标题栏提示的上限取自 WindowRegistry，首页不再有第二张多窗口卡');
   check(!registrySrc.contains("import 'package:flutter") &&
           !modelSrc.contains("import 'package:flutter"),
       '状态层与模型层保持纯 Dart，可被 dart run 直接测试');

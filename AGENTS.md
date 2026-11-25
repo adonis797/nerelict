@@ -112,8 +112,14 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
   `window_registry.dart`（纯 Dart，可用 `dart run` 测）+ `windows_state.dart`（ChangeNotifier），
   窗口上限 5 个；关闭时先换掉 `NavigationDelegate` 再卸载 `about:blank`，
   **不要调用 `clearCache()`**（Android 缓存是应用级共享的）。
-- **多窗口入口必须留在首页第一屏**：起始页搜索框下方常驻 `_WindowsEntryCard`（`browser_tab.dart`），
-  和三点菜单里的同名项并存；上限文案取 `WindowRegistry.maxWindows`，不要写死数字。
+- **首页只有一个输入焦点**：地址栏在 `_hasPage == false` 时收起，换成 `_buildHomeHeader`
+  （品牌 + 窗口 / 嗅探 / 更多）；**不要再往首屏加第二个输入框**。多窗口入口就是这个标题栏图标
+  （`_openWindows`），和三点菜单里的同名项并存，上限文案取 `WindowRegistry.maxWindows`。
+- **首页内容分三段**：「继续上次」（`_ContinueCard`，只在有历史时出现）→ 常用站点 4 列宫格
+  （`_ShortcutSection`）→ 分段控件内容卡（`_HomeContent`：快速访问 / 收藏 / 历史，各自只列 4 条）。
+  间距与圆角只从 `_kHomePad` / `_kHomeGap` / `_kHomeRadius` 取值，**不要再散落 10/14/18/22/24**；
+  空状态用 `_DashedHint`（虚线细条），不要给空列表套一张和真实内容同款的白卡。
+  响应式靠 `LayoutBuilder`：`maxWidth >= 700` 两列、`maxHeight < 640` 让出继续上次卡。
 - **网页加载失败不许只弹 toast**：主框架失败统一走 `_onLoadFailed` + `_LoadErrorCard`
   （重试 / 改用 HTTP / 回到首页），并挂 25 秒看门狗 `_armLoadWatchdog`。
   `onWebResourceError` 只能忽略 `isForMainFrame == false`——**不能写成 `!= true`**，

@@ -6,8 +6,10 @@ import 'package:provider/provider.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
 
+import '../models/history_item.dart';
 import '../models/player_request.dart' show PlayerMode;
 import '../models/sniffed_media.dart';
+import '../models/web_favorite.dart';
 import '../services/ad_filter.dart';
 import '../services/app_log.dart';
 import '../services/click_sniff.dart';
@@ -225,10 +227,13 @@ class _BrowserTabState extends State<BrowserTab> {
               final title = await _controller.getTitle();
               if (!mounted || token != _loadToken) return;
               // WebView 自己的错误页也会回调 onPageFinished，标题固定是
-              // 「网页无法打开」：这种页面不该进历史，否则历史里全是死链
-              final errorPage = (title ?? '').contains('网页无法打开');
+              // 「网页无法打开」：这种页面不该进历史，否则历史里全是死链。
+              // 系统语言是英文时标题是「Webpage not available」，一并拦掉。
+              final pageTitle = title ?? '';
+              final errorPage = pageTitle.contains('网页无法打开') ||
+                  pageTitle.contains('Webpage not available');
               if (!errorPage && _loadError == null) {
-                await context.read<HistoryState>().add(url, title ?? '');
+                await context.read<HistoryState>().add(url, pageTitle);
               }
               // HTTP 状态错误（4xx/5xx）不会走 onWebResourceError，只会渲染成
               // 这张错误页；这里按页面内容兜底，才不至于只剩 WebView 的错误页
@@ -1005,7 +1010,12 @@ class _BrowserTabState extends State<BrowserTab> {
     // 返回键统一由 HomeScreen 分发（见 AppState.handleBack），这里只渲染内容
     return Column(
       children: [
-        SafeArea(bottom: false, child: _buildUrlBar(p)),
+        SafeArea(
+          bottom: false,
+          // 首页不再显示地址栏：搜索框就在首屏正中，两个输入框做同一件事
+          // 只会让人犹豫该点哪个。进了网页才切成地址栏。
+          child: _hasPage ? _buildUrlBar(p) : _buildHomeHeader(p),
+        ),
         Expanded(
           child: Stack(
             children: [
@@ -1029,7 +1039,7 @@ class _BrowserTabState extends State<BrowserTab> {
                   ],
                 )
               else
-                _StartPage(onOpen: _open, onWindows: _openWindows),
+                _StartPage(onOpen: _open),
               // 加载失败：用应用自己的错误卡片盖住 WebView 的错误页。
               // WebView 的错误页只有一行 `net::ERR_*`，没有重试入口，
               // 用户只能手动点地址栏——这正是「网页打不开」的体感来源。
@@ -1070,9 +1080,6 @@ class _BrowserTabState extends State<BrowserTab> {
   Widget _buildUrlBar(AppPalette p) {
     // 只订阅资源数量：底部横幅移除后，让入口本身能反映当前结果
     final sniffCount = context.select<AppState, int>((s) => s.sniffed.length);
-    final favorites = context.watch<WebFavoritesState>();
-    final currentUrl = _currentUrl;
-    final favorited = currentUrl != null && favorites.contains(currentUrl);
     return Container(
       padding: const EdgeInsets.fromLTRB(10, 7, 6, 7),
       color: p.bg,
@@ -1180,68 +1187,144 @@ class _BrowserTabState extends State<BrowserTab> {
             ),
           ),
           // 收藏与主动嗅探统一收纳进右上角三点菜单，地址栏只留高频入口
-          Builder(
-            builder: (menuContext) => IconButton(
-              visualDensity: VisualDensity.compact,
-              constraints: const BoxConstraints.tightFor(width: 36, height: 36),
-              padding: EdgeInsets.zero,
-              tooltip: '更多',
-              icon: Icon(Icons.more_vert, size: 20, color: p.textSub),
-              onPressed: () async {
-                final action = await showAppMenu<_UrlMenuAction>(
-                  context: menuContext,
-                  anchorContext: menuContext,
-                  title: '页面操作',
-                  items: <AppMenuItem<_UrlMenuAction>>[
-                    AppMenuItem<_UrlMenuAction>(
-                      value: _UrlMenuAction.favorite,
-                      label: favorited ? '取消收藏本页' : '收藏本页',
-                      icon: favorited ? Icons.star : Icons.star_border,
-                      enabled: _hasPage && currentUrl != null,
-                    ),
-                    AppMenuItem<_UrlMenuAction>(
-                      value: _UrlMenuAction.sniff,
-                      label: '手动嗅探当前页',
-                      icon: Icons.radar_outlined,
-                      enabled: _hasPage,
-                    ),
-                    AppMenuItem<_UrlMenuAction>(
-                      value: _UrlMenuAction.clearLayers,
-                      label: '清理页面遮挡层',
-                      icon: Icons.layers_clear_outlined,
-                      enabled: _hasPage,
-                    ),
-                    AppMenuItem<_UrlMenuAction>(
-                      value: _UrlMenuAction.clickHelp,
-                      label: '点击捕获说明',
-                      icon: Icons.ads_click_outlined,
-                      enabled: _hasPage,
-                    ),
-                    AppMenuItem<_UrlMenuAction>(
-                      value: _UrlMenuAction.resetClick,
-                      label: '重置点击捕获',
-                      icon: Icons.restart_alt,
-                      enabled: _hasPage,
-                    ),
-                    AppMenuItem<_UrlMenuAction>(
-                      value: _UrlMenuAction.favorites,
-                      label: '全部网页收藏',
-                      icon: Icons.bookmarks_outlined,
-                    ),
-                    AppMenuItem<_UrlMenuAction>(
-                      value: _UrlMenuAction.windows,
-                      label: '多窗口浏览',
-                      icon: Icons.tab,
-                    ),
-                  ],
-                );
-                if (action != null) await _onUrlMenu(action);
-              },
-            ),
-          ),
+          Builder(builder: (menuContext) => _moreButton(menuContext, p)),
         ],
       ),
     );
+  }
+
+  /// 首页标题栏：品牌 + 多窗口 / 嗅探 / 更多三个动作。
+  ///
+  /// 首页不需要地址栏（搜索框就是唯一入口），但多窗口要一眼能看到——
+  /// 原来它独占一张 58dp 通栏卡压在首屏，现在收进标题栏，把首屏还给搜索框。
+  Widget _buildHomeHeader(AppPalette p) {
+    final sniffCount = context.select<AppState, int>((s) => s.sniffed.length);
+    return Container(
+      padding: const EdgeInsets.fromLTRB(_kHomePad, 8, 6, 4),
+      color: p.bg,
+      child: Row(
+        children: <Widget>[
+          Container(
+            width: 26,
+            height: 26,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: p.accent.withValues(alpha: 0.14),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(Icons.travel_explore, size: 16, color: p.accent),
+          ),
+          const SizedBox(width: 9),
+          Text(
+            'Nerelict',
+            style: TextStyle(
+              fontSize: 17,
+              fontWeight: FontWeight.w700,
+              letterSpacing: -0.2,
+              color: p.text,
+            ),
+          ),
+          const Spacer(),
+          IconButton(
+            tooltip: '多窗口浏览 · 最多 ${WindowRegistry.maxWindows} 个',
+            visualDensity: VisualDensity.compact,
+            constraints: const BoxConstraints.tightFor(width: 38, height: 38),
+            padding: EdgeInsets.zero,
+            icon: Icon(Icons.filter_none, size: 19, color: p.textSub),
+            onPressed: _openWindows,
+          ),
+          IconButton(
+            visualDensity: VisualDensity.compact,
+            constraints: const BoxConstraints.tightFor(width: 38, height: 38),
+            padding: EdgeInsets.zero,
+            icon: Badge(
+              isLabelVisible: sniffCount > 0,
+              label: Text('$sniffCount'),
+              child: Icon(
+                sniffCount > 0 ? Icons.bolt : Icons.bolt_outlined,
+                size: 20,
+              ),
+            ),
+            color: sniffCount > 0 ? p.accent : p.textSub,
+            tooltip:
+                sniffCount > 0 ? '已嗅探 $sniffCount 个视频资源，点击查看全部' : '已嗅探的源（点击查看）',
+            onPressed: () => showSniffedSheet(
+              context,
+              _state,
+              _openPlayer,
+              onOpenPage: _open,
+            ),
+          ),
+          Builder(builder: (menuContext) => _moreButton(menuContext, p)),
+        ],
+      ),
+    );
+  }
+
+  /// 右上角三点：地址栏与首页标题栏共用同一个菜单。
+  Widget _moreButton(BuildContext menuContext, AppPalette p) {
+    return IconButton(
+      visualDensity: VisualDensity.compact,
+      constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+      padding: EdgeInsets.zero,
+      tooltip: '更多',
+      icon: Icon(Icons.more_vert, size: 20, color: p.textSub),
+      onPressed: () => _openMoreMenu(menuContext),
+    );
+  }
+
+  Future<void> _openMoreMenu(BuildContext menuContext) async {
+    final favorites = context.read<WebFavoritesState>();
+    final currentUrl = _currentUrl;
+    final favorited = currentUrl != null && favorites.contains(currentUrl);
+    final action = await showAppMenu<_UrlMenuAction>(
+      context: menuContext,
+      anchorContext: menuContext,
+      title: '页面操作',
+      items: <AppMenuItem<_UrlMenuAction>>[
+        AppMenuItem<_UrlMenuAction>(
+          value: _UrlMenuAction.favorite,
+          label: favorited ? '取消收藏本页' : '收藏本页',
+          icon: favorited ? Icons.star : Icons.star_border,
+          enabled: _hasPage && currentUrl != null,
+        ),
+        AppMenuItem<_UrlMenuAction>(
+          value: _UrlMenuAction.sniff,
+          label: '手动嗅探当前页',
+          icon: Icons.radar_outlined,
+          enabled: _hasPage,
+        ),
+        AppMenuItem<_UrlMenuAction>(
+          value: _UrlMenuAction.clearLayers,
+          label: '清理页面遮挡层',
+          icon: Icons.layers_clear_outlined,
+          enabled: _hasPage,
+        ),
+        AppMenuItem<_UrlMenuAction>(
+          value: _UrlMenuAction.clickHelp,
+          label: '点击捕获说明',
+          icon: Icons.ads_click_outlined,
+          enabled: _hasPage,
+        ),
+        AppMenuItem<_UrlMenuAction>(
+          value: _UrlMenuAction.resetClick,
+          label: '重置点击捕获',
+          icon: Icons.restart_alt,
+          enabled: _hasPage,
+        ),
+        AppMenuItem<_UrlMenuAction>(
+          value: _UrlMenuAction.favorites,
+          label: '全部网页收藏',
+          icon: Icons.bookmarks_outlined,
+        ),
+        AppMenuItem<_UrlMenuAction>(
+          value: _UrlMenuAction.windows,
+          label: '多窗口浏览',
+          icon: Icons.tab,
+        ),
+      ],
+    );
+    if (action != null && mounted) await _onUrlMenu(action);
   }
 
   /// 三点菜单：收藏 / 主动嗅探 / 网页收藏单页
@@ -1291,73 +1374,894 @@ class _BrowserTabState extends State<BrowserTab> {
   }
 }
 
+/// 首页的间距与圆角基准。全部区块只从这里取值，避免又回到「10/14/18/22/24」混用。
+const double _kHomePad = 20;
+const double _kHomeGap = 22;
+const double _kHomeRadius = 14;
+
+/// 首页卡片：浅色主题加一层很淡的投影把卡片从底色上抬起来；
+/// 深色与赛博主题只靠描边区分——深底上的投影看不出来，只会显脏。
+BoxDecoration _homeCard(AppPalette p, {Color? color, double radius = _kHomeRadius}) {
+  return BoxDecoration(
+    color: color ?? p.surface,
+    borderRadius: BorderRadius.circular(p.isCyber ? 4 : radius),
+    border: Border.all(
+      color: p.isCyber ? p.accent.withValues(alpha: 0.30) : p.border,
+    ),
+    boxShadow: p.isCyber || p.brightness == Brightness.dark
+        ? null
+        : <BoxShadow>[
+            BoxShadow(
+              color: const Color(0xFF16202E).withValues(alpha: 0.05),
+              blurRadius: 8,
+              offset: const Offset(0, 2),
+            ),
+          ],
+  );
+}
+
+/// 段落标题：首页唯一的「标题层」，字重与字号都跟辅助文字拉开。
+TextStyle _homeSection(AppPalette p) => TextStyle(
+      fontSize: 15,
+      fontWeight: FontWeight.w600,
+      height: 1.35,
+      color: p.text,
+    );
+
+/// 行标题
+TextStyle _homeRow(AppPalette p) => TextStyle(
+      fontSize: 12.5,
+      fontWeight: FontWeight.w500,
+      height: 1.35,
+      color: p.text,
+    );
+
+/// 辅助说明 / 站点域名
+TextStyle _homeMeta(AppPalette p) => TextStyle(
+      fontSize: 11.5,
+      height: 1.3,
+      color: p.textFaint,
+    );
+
 /// 原生起始页：不加载任何远端首页，避免被 App 深链劫持。
 ///
-/// 只保留能用的东西：搜索框、多窗口入口、常用站点、快速访问、收藏与历史。
-/// 刻意不写「怎么用」的引导文案——第一次打开就该直接能搜。
-class _StartPage extends StatelessWidget {
-  const _StartPage({required this.onOpen, required this.onWindows});
+/// 首屏只有一个焦点——搜索框。地址栏在首页收起（见 `_buildHomeHeader`），
+/// 所以这里不再出现第二个输入框；其余内容分成「继续上次 / 常用站点 /
+/// 快速访问·收藏·历史」三段，越往下越低频。
+class _StartPage extends StatefulWidget {
+  const _StartPage({required this.onOpen});
 
   final void Function(String) onOpen;
 
-  /// 进入多窗口页：首页是「一眼能看到」的入口，不再只藏在三点菜单里
-  final VoidCallback onWindows;
+  @override
+  State<_StartPage> createState() => _StartPageState();
+}
+
+class _StartPageState extends State<_StartPage> {
+  @override
+  Widget build(BuildContext context) {
+    final history = context.watch<HistoryState>().items;
+    final last = history.isEmpty ? null : history.first;
+
+    return LayoutBuilder(
+      builder: (context, c) {
+        // 平板 / 分屏：内容定宽居中，宽到一定程度才分两列（不要拉成超宽单列）
+        final wide = c.maxWidth >= 700;
+        // 矮屏（横屏手机、分屏）：先保搜索与入口，「继续上次」让位给历史列表
+        final short = c.maxHeight < 640;
+
+        final continueCard = last == null
+            ? const SizedBox.shrink()
+            : _ContinueCard(
+                palette: paletteOf(context),
+                url: last.url,
+                title: last.displayTitle,
+                host: last.displayHost,
+                onTap: () => widget.onOpen(last.url),
+              );
+
+        final shortcuts = _ShortcutSection(onOpen: widget.onOpen);
+
+        if (wide) {
+          return SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(_kHomePad, 8, _kHomePad, 24),
+            child: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 980),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Expanded(
+                      flex: 5,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          HomeSearchBox(onSubmit: widget.onOpen),
+                          const SizedBox(height: _kHomeGap),
+                          shortcuts,
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 24),
+                    Expanded(
+                      flex: 4,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          if (last != null) ...<Widget>[
+                            continueCard,
+                            const SizedBox(height: _kHomeGap),
+                          ],
+                          _HomeContent(onOpen: widget.onOpen),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        }
+
+        return SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(_kHomePad, 8, _kHomePad, 24),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 560),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  HomeSearchBox(onSubmit: widget.onOpen),
+                  if (last != null && !short) ...<Widget>[
+                    const SizedBox(height: _kHomeGap),
+                    continueCard,
+                  ],
+                  const SizedBox(height: _kHomeGap),
+                  shortcuts,
+                  const SizedBox(height: _kHomeGap),
+                  _HomeContent(onOpen: widget.onOpen),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// 「继续上次」：把回访从第三屏提到第一屏。
+///
+/// 只在有历史时出现——空状态不该占首屏，第一次打开时应一眼看到搜索框。
+class _ContinueCard extends StatelessWidget {
+  const _ContinueCard({
+    required this.palette,
+    required this.url,
+    required this.title,
+    required this.host,
+    required this.onTap,
+  });
+
+  final AppPalette palette;
+  final String url;
+  final String title;
+  final String host;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = palette;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(p.isCyber ? 4 : _kHomeRadius),
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(13, 11, 10, 11),
+          decoration: _homeCard(
+            p,
+            color: p.accent.withValues(alpha: p.isCyber ? 0.12 : 0.06),
+          ),
+          child: Row(
+            children: <Widget>[
+              SiteIcon(url: url, size: 32, radius: 9),
+              const SizedBox(width: 11),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: _homeRow(p)),
+                    const SizedBox(height: 3),
+                    Text('继续上次 · $host',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: _homeMeta(p)),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Container(
+                height: 32,
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: p.accent,
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Icon(Icons.play_arrow_rounded, size: 16, color: p.onAccent),
+                    const SizedBox(width: 2),
+                    Text('继续',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: p.onAccent,
+                        )),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 常用站点：4 列图标宫格。
+///
+/// chip 只能横着排，站点一多就换行成一条参差不齐的长条；宫格让每一格都是
+/// 稳定的点击目标（约 72×84），拇指扫一格就是一格。
+class _ShortcutSection extends StatelessWidget {
+  const _ShortcutSection({required this.onOpen});
+
+  final void Function(String) onOpen;
+
+  static const List<(String, String)> _sites = <(String, String)>[
+    ('hls.js', 'https://hlsjs.video-dev.org/demo/'),
+    ('Bing', 'https://www.bing.com'),
+    ('百度', 'https://m.baidu.com'),
+    ('谷歌', 'https://www.google.com'),
+  ];
 
   @override
   Widget build(BuildContext context) {
     final p = paletteOf(context);
-
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(24, 32, 24, 24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          HomeSearchBox(onSubmit: onOpen),
-          const SizedBox(height: 14),
-          _WindowsEntryCard(onTap: onWindows),
-          const SizedBox(height: 24),
-          Text(
-            '常用站点',
-            style: TextStyle(fontSize: 13, color: p.textFaint),
-          ),
-          const SizedBox(height: 10),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              _QuickChip(
-                p: p,
-                label: 'hls.js 演示页',
-                onTap: () => onOpen('https://hlsjs.video-dev.org/demo/'),
-              ),
-              _QuickChip(
-                p: p,
-                label: 'Bing',
-                onTap: () => onOpen('https://www.bing.com'),
-              ),
-              _QuickChip(
-                p: p,
-                label: '百度',
-                onTap: () => onOpen('https://m.baidu.com'),
-              ),
-              _QuickChip(
-                p: p,
-                label: '谷歌',
-                icon: Icons.g_mobiledata,
-                onTap: () => onOpen('https://www.google.com'),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text('常用站点', style: _homeSection(p)),
+        const SizedBox(height: 12),
+        // 固定 4 个站点：用等宽 Row 而不是 GridView。
+        // GridView 会按 childAspectRatio 定出整块视口，图标在格子里居中后
+        // 标题与图标之间会多出一段说不清来源的空白；等宽 Row 的高度就是内容高度。
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            for (var i = 0; i < _sites.length; i++) ...<Widget>[
+              if (i > 0) const SizedBox(width: 10),
+              Expanded(
+                child: _ShortcutTile(
+                  palette: p,
+                  label: _sites[i].$1,
+                  url: _sites[i].$2,
+                  onTap: () => onOpen(_sites[i].$2),
+                ),
               ),
             ],
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+/// 宫格里的一个站点：46dp 图标方块 + 11.5 标签，整格可点。
+class _ShortcutTile extends StatelessWidget {
+  const _ShortcutTile({
+    required this.palette,
+    required this.label,
+    required this.url,
+    required this.onTap,
+  });
+
+  final AppPalette palette;
+  final String label;
+  final String url;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = palette;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Column(
+          children: <Widget>[
+            Container(
+              width: 46,
+              height: 46,
+              alignment: Alignment.center,
+              decoration: _homeCard(p, radius: 14),
+              child: SiteIcon(url: url, size: 28, radius: 8),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 11.5, color: p.textSub),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 首页内容区：三组并列区块合并成一个分段控件。
+///
+/// 原来「快速访问 / 网页收藏 / 最近浏览」各占一张同款白卡，三个标题加三个
+/// 右侧入口，看完仍然要滚一屏；现在共用一张卡，标题行变成可切换的分段，
+/// 右侧入口跟着当前分段走。
+class _HomeContent extends StatefulWidget {
+  const _HomeContent({required this.onOpen});
+
+  final void Function(String) onOpen;
+
+  @override
+  State<_HomeContent> createState() => _HomeContentState();
+}
+
+class _HomeContentState extends State<_HomeContent> {
+  int _index = 0;
+
+  Future<void> _openPage(Widget page) async {
+    final url = await Navigator.of(context).push<String>(
+      MaterialPageRoute<String>(builder: (_) => page),
+    );
+    if (url != null && mounted) widget.onOpen(url);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final p = paletteOf(context);
+    final favorites = context.watch<WebFavoritesState>();
+    final history = context.watch<HistoryState>().items;
+    final quick = favorites.quickAccessItems;
+    final all = favorites.items;
+
+    const labels = <String>['快速访问', '收藏', '历史'];
+    final counts = <int>[quick.length, all.length, history.length];
+    final actions = <IconData>[
+      Icons.tune,
+      Icons.bookmarks_outlined,
+      Icons.list_alt,
+    ];
+    final hints = <String>['管理快速访问', '全部收藏', '全部历史'];
+
+    return Container(
+      decoration: _homeCard(p),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        children: <Widget>[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(8, 8, 4, 8),
+            child: Row(
+              children: <Widget>[
+                for (var i = 0; i < labels.length; i++) ...<Widget>[
+                  if (i > 0) const SizedBox(width: 2),
+                  _Segment(
+                    palette: p,
+                    label: labels[i],
+                    count: counts[i],
+                    selected: _index == i,
+                    onTap: () => setState(() => _index = i),
+                  ),
+                ],
+                const Spacer(),
+                IconButton(
+                  tooltip: hints[_index],
+                  visualDensity: VisualDensity.compact,
+                  constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+                  padding: EdgeInsets.zero,
+                  icon: Icon(actions[_index], size: 18, color: p.accent),
+                  onPressed: () => _openPage(
+                    _index == 2 ? const HistoryPage() : const WebFavoritesPage(),
+                  ),
+                ),
+              ],
+            ),
           ),
-          const SizedBox(height: 22),
-          _QuickAccessSection(onOpen: onOpen),
-          const SizedBox(height: 24),
-          _WebFavoritesSection(onOpen: onOpen),
-          const SizedBox(height: 24),
-          _HistorySection(onOpen: onOpen),
+          Divider(height: 1, color: p.border),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(6, 6, 6, 6),
+            child: switch (_index) {
+              0 => _QuickAccessBody(
+                  palette: p,
+                  items: quick,
+                  onOpen: widget.onOpen,
+                  onManage: () => _openPage(const WebFavoritesPage()),
+                ),
+              1 => _FavoritesBody(
+                  palette: p,
+                  items: all,
+                  onOpen: widget.onOpen,
+                  onManage: () => _openPage(const WebFavoritesPage()),
+                ),
+              _ => _HistoryBody(
+                  palette: p,
+                  items: history,
+                  onOpen: widget.onOpen,
+                  onManage: () => _openPage(const HistoryPage()),
+                ),
+            },
+          ),
         ],
       ),
     );
   }
+}
+
+/// 分段控件的一格：选中态用主色淡底 + 主色文字，未选中只留文字。
+class _Segment extends StatelessWidget {
+  const _Segment({
+    required this.palette,
+    required this.label,
+    required this.count,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final AppPalette palette;
+  final String label;
+  final int count;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = palette;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(9),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 160),
+        curve: Curves.easeOut,
+        height: 30,
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        decoration: BoxDecoration(
+          color: selected
+              ? p.accent.withValues(alpha: p.isCyber ? 0.20 : 0.12)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(9),
+          border: selected
+              ? Border.all(color: p.accent.withValues(alpha: 0.28))
+              : null,
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 12.5,
+                fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+                color: selected ? p.accent : p.textSub,
+              ),
+            ),
+            if (count > 0) ...<Widget>[
+              const SizedBox(width: 4),
+              Text(
+                '$count',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: selected ? p.accent : p.textDisabled,
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 快速访问：4 列宫格，与首屏的常用站点同一套视觉。
+class _QuickAccessBody extends StatelessWidget {
+  const _QuickAccessBody({
+    required this.palette,
+    required this.items,
+    required this.onOpen,
+    required this.onManage,
+  });
+
+  final AppPalette palette;
+  final List<WebFavorite> items;
+  final void Function(String) onOpen;
+  final VoidCallback onManage;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = palette;
+    if (items.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+        child: _DashedHint(
+          palette: p,
+          icon: Icons.bolt_outlined,
+          text: '在全部收藏里点 ☆，常用网页就会出现在这里',
+          onTap: onManage,
+        ),
+      );
+    }
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 4),
+      child: LayoutBuilder(
+        builder: (context, c) {
+          // 和上方常用站点同一套网格：4 列、列距 10，格子宽度按可用宽度算
+          final cell = (c.maxWidth - 30) / 4;
+          return Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: <Widget>[
+              for (final item in items)
+                SizedBox(
+                  width: cell,
+                  child: InkWell(
+                    onTap: () => onOpen(item.url),
+                    borderRadius: BorderRadius.circular(10),
+                    child: Column(
+                      children: <Widget>[
+                        SiteIcon(
+                          url: item.url,
+                          iconUrl: item.iconUrl,
+                          size: 30,
+                          radius: 9,
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          item.displayTitle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 11.5, color: p.textSub),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// 收藏：只列最近 4 条，删除与排序都在「全部收藏」里做。
+class _FavoritesBody extends StatelessWidget {
+  const _FavoritesBody({
+    required this.palette,
+    required this.items,
+    required this.onOpen,
+    required this.onManage,
+  });
+
+  final AppPalette palette;
+  final List<WebFavorite> items;
+  final void Function(String) onOpen;
+  final VoidCallback onManage;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = palette;
+    if (items.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+        child: _DashedHint(
+          palette: p,
+          icon: Icons.star_border,
+          text: '还没有收藏网页 · 网页页三点菜单里可以「收藏本页」',
+          onTap: onManage,
+        ),
+      );
+    }
+    final shown = items.take(4).toList();
+    return Column(
+      children: <Widget>[
+        for (var i = 0; i < shown.length; i++) ...<Widget>[
+          if (i > 0) Divider(height: 1, color: p.border),
+          InkWell(
+            onTap: () => onOpen(shown[i].url),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 9),
+              child: Row(
+                children: <Widget>[
+                  SiteIcon(
+                    url: shown[i].url,
+                    iconUrl: shown[i].iconUrl,
+                    size: 22,
+                    radius: 6,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Text(shown[i].displayTitle,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: _homeRow(p)),
+                        const SizedBox(height: 2),
+                        Text(
+                          shown[i].isUncategorized
+                              ? shown[i].host
+                              : '${shown[i].host} · ${shown[i].categoryLabel}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: _homeMeta(p),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (shown[i].quickAccess)
+                    Padding(
+                      padding: const EdgeInsets.only(left: 6),
+                      child: Icon(Icons.bolt, size: 14, color: p.accent),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
+        if (items.length > shown.length)
+          _MoreRow(
+            palette: p,
+            icon: Icons.bookmarks_outlined,
+            label: '查看全部 ${items.length} 个收藏',
+            onTap: onManage,
+          ),
+      ],
+    );
+  }
+}
+
+/// 浏览历史：只列最近 4 条，批量删除在独立历史页。
+class _HistoryBody extends StatelessWidget {
+  const _HistoryBody({
+    required this.palette,
+    required this.items,
+    required this.onOpen,
+    required this.onManage,
+  });
+
+  final AppPalette palette;
+  final List<HistoryItem> items;
+  final void Function(String) onOpen;
+  final VoidCallback onManage;
+
+  static String _time(DateTime t) {
+    final now = DateTime.now();
+    final hm = '${t.hour.toString().padLeft(2, '0')}:'
+        '${t.minute.toString().padLeft(2, '0')}';
+    if (now.year == t.year && now.month == t.month && now.day == t.day) {
+      return '今天 $hm';
+    }
+    return '${t.month.toString().padLeft(2, '0')}-'
+        '${t.day.toString().padLeft(2, '0')} $hm';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final p = palette;
+    if (items.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+        child: _DashedHint(
+          palette: p,
+          icon: Icons.history,
+          text: '还没有浏览记录 · 打开过的网页会按时间出现在这里',
+          onTap: onManage,
+        ),
+      );
+    }
+    final shown = items.take(4).toList();
+    return Column(
+      children: <Widget>[
+        for (var i = 0; i < shown.length; i++) ...<Widget>[
+          if (i > 0) Divider(height: 1, color: p.border),
+          InkWell(
+            onTap: () => onOpen(shown[i].url),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 9),
+              child: Row(
+                children: <Widget>[
+                  Icon(Icons.history, size: 15, color: p.textFaint),
+                  const SizedBox(width: 9),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Text(shown[i].displayTitle,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: _homeRow(p)),
+                        const SizedBox(height: 2),
+                        Text(shown[i].displayHost,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: _homeMeta(p)),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    _time(shown[i].visitedAt),
+                    style: TextStyle(fontSize: 11, color: p.textDisabled),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+        if (items.length > shown.length)
+          _MoreRow(
+            palette: p,
+            icon: Icons.unfold_more,
+            label: '查看全部 ${items.length} 条浏览记录',
+            onTap: onManage,
+          ),
+      ],
+    );
+  }
+}
+
+/// 「还有更多」的浅底一行：只在条目超过 4 条时出现。
+class _MoreRow extends StatelessWidget {
+  const _MoreRow({
+    required this.palette,
+    required this.icon,
+    required this.label,
+    required this.onTap,
+  });
+
+  final AppPalette palette;
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = palette;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(10),
+      child: Container(
+        margin: const EdgeInsets.fromLTRB(4, 6, 4, 2),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+        decoration: BoxDecoration(
+          color: p.surfaceAlt,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Row(
+          children: <Widget>[
+            Icon(icon, size: 15, color: p.accent),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 12, color: p.textSub)),
+            ),
+            Icon(Icons.chevron_right, size: 16, color: p.textFaint),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 空状态：虚线细条而不是一张白卡。
+///
+/// 白卡空状态和真实内容卡长得一样，用户得点进去才知道是空的；
+/// 虚线框一眼就能看出「这里还能放东西」。
+class _DashedHint extends StatelessWidget {
+  const _DashedHint({
+    required this.palette,
+    required this.icon,
+    required this.text,
+    this.onTap,
+  });
+
+  final AppPalette palette;
+  final IconData icon;
+  final String text;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = palette;
+    final box = Container(
+      height: 48,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      decoration: BoxDecoration(
+        color: p.surfaceAlt.withValues(alpha: p.isCyber ? 0.35 : 0.55),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: CustomPaint(
+        painter: _DashedBorderPainter(color: p.border, radius: 10),
+        child: Row(
+          children: <Widget>[
+            Icon(icon, size: 15, color: p.textDisabled),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                text,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  height: 1.3,
+                  color: p.textFaint,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (onTap == null) return box;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(10),
+      child: box,
+    );
+  }
+}
+
+/// 圆角虚线描边。Flutter 的 `Border` 只支持实线，这里按路径长度自己切段。
+class _DashedBorderPainter extends CustomPainter {
+  const _DashedBorderPainter({required this.color, required this.radius});
+
+  final Color color;
+  final double radius;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.isEmpty) return;
+    final path = Path()
+      ..addRRect(RRect.fromRectAndRadius(
+        Offset.zero & size,
+        Radius.circular(radius),
+      ));
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1;
+    const dash = 5.0;
+    const gap = 4.0;
+    for (final metric in path.computeMetrics()) {
+      var at = 0.0;
+      while (at < metric.length) {
+        final next = at + dash > metric.length ? metric.length : at + dash;
+        canvas.drawPath(metric.extractPath(at, next), paint);
+        at = next + gap;
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _DashedBorderPainter old) =>
+      old.color != color || old.radius != radius;
 }
 
 /// 主框架加载失败的兜底界面。
@@ -1463,489 +2367,6 @@ class _LoadErrorCard extends StatelessWidget {
   }
 }
 
-/// 首页的多窗口入口：卡片紧贴搜索框下方，进浏览器第一屏就能看到。
-///
-/// 主界面只维护一个浏览上下文，多窗口是另一套独立的 WebView 集合；
-/// 把它做成首页常驻入口，比只放在右上角三点菜单里更容易被发现。
-class _WindowsEntryCard extends StatelessWidget {
-  const _WindowsEntryCard({required this.onTap});
-
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    final p = paletteOf(context);
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(12),
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
-        decoration: BoxDecoration(
-          color: p.surface,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: p.isCyber ? p.accent.withValues(alpha: 0.32) : p.border,
-          ),
-        ),
-        child: Row(
-          children: <Widget>[
-            Container(
-              width: 32,
-              height: 32,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: p.accent.withValues(alpha: 0.12),
-                borderRadius: BorderRadius.circular(9),
-              ),
-              child: Icon(Icons.filter_none, size: 17, color: p.accent),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  Text(
-                    '多窗口浏览',
-                    style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                      color: p.text,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    '同时开多个网页，最多 ${WindowRegistry.maxWindows} 个',
-                    style: TextStyle(fontSize: 10.5, color: p.textFaint),
-                  ),
-                ],
-              ),
-            ),
-            Icon(Icons.chevron_right, size: 18, color: p.textFaint),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// 首页「快速访问」：放进快速访问的网页收藏，图标自动识别。
-class _QuickAccessSection extends StatelessWidget {
-  const _QuickAccessSection({required this.onOpen});
-
-  final void Function(String) onOpen;
-
-  Future<void> _manage(BuildContext context) async {
-    final url = await Navigator.of(context).push<String>(
-      MaterialPageRoute<String>(builder: (_) => const WebFavoritesPage()),
-    );
-    if (url != null && context.mounted) onOpen(url);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final p = paletteOf(context);
-    final items = context.watch<WebFavoritesState>().quickAccessItems;
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: <Widget>[
-        Row(
-          children: <Widget>[
-            Text('快速访问', style: TextStyle(fontSize: 13, color: p.textFaint)),
-            if (items.isNotEmpty) ...<Widget>[
-              const SizedBox(width: 6),
-              Text('${items.length}',
-                  style: TextStyle(fontSize: 11, color: p.textDisabled)),
-            ],
-            const Spacer(),
-            TextButton.icon(
-              onPressed: () => _manage(context),
-              icon: Icon(Icons.tune, size: 14, color: p.accent),
-              label:
-                  Text('管理', style: TextStyle(fontSize: 11.5, color: p.accent)),
-              style: TextButton.styleFrom(
-                visualDensity: VisualDensity.compact,
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 6),
-        if (items.isEmpty)
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-            decoration: BoxDecoration(
-              color: p.surface,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: p.border),
-            ),
-            child: Row(
-              children: <Widget>[
-                Icon(Icons.bolt_outlined, size: 15, color: p.textDisabled),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    '把常看的网页加入快速访问：全部收藏 → 条目右侧 ☆',
-                    style: TextStyle(fontSize: 11.5, color: p.textDisabled),
-                  ),
-                ),
-              ],
-            ),
-          )
-        else
-          GridView.count(
-            crossAxisCount: 4,
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            mainAxisSpacing: 8,
-            crossAxisSpacing: 8,
-            childAspectRatio: 0.92,
-            children: <Widget>[
-              for (final item in items)
-                InkWell(
-                  onTap: () => onOpen(item.url),
-                  borderRadius: BorderRadius.circular(10),
-                  child: Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: p.surface,
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(
-                        color: p.isCyber
-                            ? p.accent.withValues(alpha: 0.28)
-                            : p.border,
-                      ),
-                    ),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: <Widget>[
-                        SiteIcon(
-                          url: item.url,
-                          iconUrl: item.iconUrl,
-                          size: 30,
-                          radius: 8,
-                        ),
-                        const SizedBox(height: 6),
-                        Text(
-                          item.displayTitle,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          textAlign: TextAlign.center,
-                          style: TextStyle(fontSize: 10.5, color: p.textSub),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-            ],
-          ),
-      ],
-    );
-  }
-}
-
-/// 首页「网页收藏」：最近收藏的页面，分类与图标一并展示；
-/// 排序、归类、编辑都在「全部收藏」单页里完成。
-class _WebFavoritesSection extends StatelessWidget {
-  const _WebFavoritesSection({required this.onOpen});
-
-  final void Function(String) onOpen;
-
-  Future<void> _openAll(BuildContext context) async {
-    final url = await Navigator.of(context).push<String>(
-      MaterialPageRoute<String>(builder: (_) => const WebFavoritesPage()),
-    );
-    if (url != null && context.mounted) onOpen(url);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final p = paletteOf(context);
-    final favorites = context.watch<WebFavoritesState>();
-    final all = favorites.items;
-    final items = all.take(5).toList();
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Text('网页收藏', style: TextStyle(fontSize: 13, color: p.textFaint)),
-            if (all.isNotEmpty) ...[
-              const SizedBox(width: 6),
-              Text('${all.length}',
-                  style: TextStyle(fontSize: 11, color: p.textDisabled)),
-            ],
-            const Spacer(),
-            TextButton.icon(
-              onPressed: () => _openAll(context),
-              icon: Icon(Icons.bookmarks_outlined, size: 14, color: p.accent),
-              label: Text('全部收藏',
-                  style: TextStyle(fontSize: 11.5, color: p.accent)),
-              style: TextButton.styleFrom(
-                visualDensity: VisualDensity.compact,
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 6),
-        if (all.isEmpty)
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-            decoration: BoxDecoration(
-              color: p.surface,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: p.border),
-            ),
-            child: Row(
-              children: [
-                Icon(Icons.star_border, size: 15, color: p.textDisabled),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    '还没有收藏网页 · 网页页点地址栏右上角「⋮」→ 收藏本页',
-                    style: TextStyle(fontSize: 11.5, color: p.textDisabled),
-                  ),
-                ),
-              ],
-            ),
-          )
-        else
-          Container(
-            decoration: BoxDecoration(
-              color: p.surface,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: p.border),
-            ),
-            clipBehavior: Clip.antiAlias,
-            child: Column(
-              children: <Widget>[
-                for (var i = 0; i < items.length; i++) ...<Widget>[
-                  if (i > 0) Divider(height: 1, color: p.border),
-                  ListTile(
-                    dense: true,
-                    contentPadding: const EdgeInsets.fromLTRB(12, 0, 2, 0),
-                    leading: SiteIcon(
-                      url: items[i].url,
-                      iconUrl: items[i].iconUrl,
-                      size: 20,
-                      radius: 5,
-                    ),
-                    title: Text(
-                      items[i].displayTitle,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 12.5, color: p.text),
-                    ),
-                    subtitle: Text(
-                      items[i].isUncategorized
-                          ? items[i].host
-                          : '${items[i].host} · ${items[i].categoryLabel}',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 10.5, color: p.textFaint),
-                    ),
-                    trailing: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: <Widget>[
-                        if (items[i].quickAccess)
-                          Icon(Icons.bolt, size: 14, color: p.accent),
-                        IconButton(
-                          visualDensity: VisualDensity.compact,
-                          tooltip: '移除收藏',
-                          icon: Icon(Icons.close, size: 15, color: p.textFaint),
-                          onPressed: () => favorites.remove(items[i].url),
-                        ),
-                      ],
-                    ),
-                    onTap: () => onOpen(items[i].url),
-                  ),
-                ],
-              ],
-            ),
-          ),
-        if (all.length > items.length)
-          InkWell(
-            onTap: () => _openAll(context),
-            borderRadius: BorderRadius.circular(10),
-            child: Container(
-              margin: const EdgeInsets.only(top: 8),
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              decoration: BoxDecoration(
-                color: p.surfaceAlt,
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: p.border),
-              ),
-              child: Row(
-                children: [
-                  Icon(Icons.bookmarks_outlined, size: 15, color: p.accent),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      '更多 · 查看全部 ${all.length} 个网页收藏',
-                      style: TextStyle(fontSize: 12, color: p.textSub),
-                    ),
-                  ),
-                  Icon(Icons.chevron_right, size: 16, color: p.textFaint),
-                ],
-              ),
-            ),
-          ),
-      ],
-    );
-  }
-}
-
-/// 首页「最近浏览」：按访问时间倒序展示；右上角进入「全部历史」，
-/// 多选与批量删除在独立历史页完成。
-class _HistorySection extends StatelessWidget {
-  const _HistorySection({required this.onOpen});
-
-  final void Function(String) onOpen;
-
-  static String _time(DateTime t) {
-    final now = DateTime.now();
-    final hm = '${t.hour.toString().padLeft(2, '0')}:'
-        '${t.minute.toString().padLeft(2, '0')}';
-    if (now.year == t.year && now.month == t.month && now.day == t.day) {
-      return '今天 $hm';
-    }
-    return '${t.month.toString().padLeft(2, '0')}-'
-        '${t.day.toString().padLeft(2, '0')} $hm';
-  }
-
-  /// 进入独立历史页；页内可多选批量删除，返回时把选中地址交给浏览器打开。
-  Future<void> _openAllHistory(BuildContext context) async {
-    final url = await Navigator.of(context).push<String>(
-      MaterialPageRoute<String>(builder: (_) => const HistoryPage()),
-    );
-    if (url != null && context.mounted) onOpen(url);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final p = paletteOf(context);
-    final history = context.watch<HistoryState>();
-    final items = history.items.take(5).toList();
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Text('最近浏览', style: TextStyle(fontSize: 13, color: p.textFaint)),
-            const Spacer(),
-            TextButton.icon(
-              onPressed: () => _openAllHistory(context),
-              icon: Icon(Icons.list_alt, size: 14, color: p.accent),
-              label: Text('全部历史',
-                  style: TextStyle(fontSize: 11.5, color: p.accent)),
-              style: TextButton.styleFrom(
-                visualDensity: VisualDensity.compact,
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 6),
-        if (items.isEmpty)
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: 6),
-            child: Text('还没有浏览记录',
-                style: TextStyle(fontSize: 11.5, color: p.textDisabled)),
-          )
-        else
-          Container(
-            decoration: BoxDecoration(
-              color: p.surface,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: p.border),
-            ),
-            child: Column(
-              children: [
-                for (var i = 0; i < items.length; i++) ...[
-                  if (i > 0) Divider(height: 1, color: p.border),
-                  InkWell(
-                    onTap: () => onOpen(items[i].url),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 9),
-                      child: Row(
-                        children: [
-                          Icon(Icons.history, size: 15, color: p.textFaint),
-                          const SizedBox(width: 9),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  items[i].displayTitle,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style:
-                                      TextStyle(fontSize: 12.5, color: p.text),
-                                ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  items[i].displayHost,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                      fontSize: 10.5, color: p.textFaint),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Text(
-                            _time(items[i].visitedAt),
-                            style:
-                                TextStyle(fontSize: 10, color: p.textDisabled),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
-              ],
-            ),
-          ),
-        // 「更多」展开框：跳转到独立单页浏览历史
-        InkWell(
-          onTap: () => _openAllHistory(context),
-          borderRadius: BorderRadius.circular(10),
-          child: Container(
-            margin: const EdgeInsets.only(top: 8),
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            decoration: BoxDecoration(
-              color: p.surfaceAlt,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: p.border),
-            ),
-            child: Row(
-              children: [
-                Icon(Icons.unfold_more, size: 15, color: p.accent),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    '更多 · 查看全部浏览历史',
-                    style: TextStyle(fontSize: 12, color: p.textSub),
-                  ),
-                ),
-                Icon(Icons.chevron_right, size: 16, color: p.textFaint),
-              ],
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-}
-
 /// 长按网页视频后出现的浮标：只提供一个明确的手动接管入口。
 ///
 /// [overlay] 为 true 时表示这条来自「点击后浮层播放」的捕获，
@@ -2003,49 +2424,6 @@ class _VideoFloatEntry extends StatelessWidget {
                 padding: EdgeInsets.all(5),
                 child: Icon(Icons.close, size: 14, color: Colors.white54),
               ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _QuickChip extends StatelessWidget {
-  const _QuickChip({
-    required this.p,
-    required this.label,
-    required this.onTap,
-    this.icon,
-  });
-
-  final AppPalette p;
-  final String label;
-  final VoidCallback onTap;
-  final IconData? icon;
-
-  @override
-  Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(8),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-        decoration: BoxDecoration(
-          color: p.surfaceAlt,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: p.border),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (icon != null) ...[
-              Icon(icon, size: 14, color: p.accent),
-              const SizedBox(width: 4),
-            ],
-            Text(
-              label,
-              style: TextStyle(fontSize: 12, color: p.textSub),
             ),
           ],
         ),

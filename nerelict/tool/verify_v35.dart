@@ -1180,6 +1180,8 @@ void main() {
       '加载失败落在可重试的应用内卡片上，而不是只剩 WebView 错误页');
   check(tab35.contains('网页无法打开') && tab35.contains('_reportErrorPage'),
       'HTTP 状态错误（4xx/5xx）也按错误页兜底，且不写进浏览历史');
+  check(tab35.contains('Webpage not available'),
+      '系统语言为英文时错误页标题也要拦掉，否则历史里会混进死链');
   check(tab35.contains('_loadToken'),
       '异步回调带加载令牌，旧页面的错误不会盖到新页面上');
 
@@ -1291,6 +1293,69 @@ void main() {
       '缩放倍率记在本地，下次弹窗沿用用户挑的大小');
   check(!floatKt.contains('maxVideoHeight'),
       '窗口尺寸不再跟着视频比例走，宽度只由屏幕与缩放倍率决定');
+
+  // ---- 首页改版（信息层级 / 首屏焦点 / 响应式）----
+  //
+  // 旧首页有两个输入框（地址栏 + 首屏搜索卡）、三张同款白卡、两块零信息量的
+  // 空状态，首屏 5 个区块要滚动才能看完。改版把地址栏在首页收起，其余内容
+  // 收成「继续上次 / 常用站点 / 分段内容区」三段。
+  final homeTab = read('lib/ui/browser_tab.dart');
+  check(homeTab.contains('_hasPage ? _buildUrlBar(p) : _buildHomeHeader(p)'),
+      '首页收起地址栏：整页只剩搜索框一个输入焦点');
+  check(homeTab.contains("'Nerelict'") &&
+          homeTab.contains('fontSize: 17') &&
+          homeTab.contains('fontWeight: FontWeight.w700'),
+      '首页标题栏只留品牌与右侧动作');
+  check(homeTab.contains('class _ContinueCard') &&
+          homeTab.contains('继续上次 ·'),
+      '首屏有「继续上次」，回访不用翻到第三屏');
+  final continueIndex = homeTab.indexOf('class _ContinueCard');
+  final startPageAt = homeTab.indexOf('class _StartPage');
+  check(startPageAt >= 0 && continueIndex > startPageAt,
+      '继续上次卡属于起始页，不进网页视图');
+  check(
+      homeTab.contains(
+          "const labels = <String>['快速访问', '收藏', '历史'];"),
+      '三组并列区块合并成一个分段控件');
+  check(homeTab.contains('class _Segment') &&
+          homeTab.contains('AnimatedContainer'),
+      '分段控件有选中态（主色淡底 + 主色文字）');
+  check(
+      homeTab.contains('class _ShortcutSection') &&
+          homeTab.contains('class _ShortcutTile') &&
+          homeTab.contains('width: 46'),
+      '常用站点从 chip 改成 4 列图标宫格，单格点击目标约 90×70');
+  check(homeTab.contains('class _DashedHint') &&
+          homeTab.contains('class _DashedBorderPainter'),
+      '空状态改成虚线细条，不再和真实内容卡长得一样');
+  check(homeTab.contains('_kHomePad = 20') &&
+          homeTab.contains('_kHomeGap = 22') &&
+          homeTab.contains('_kHomeRadius = 14'),
+      '页面边距 / 区块间距 / 圆角收敛到唯一一组常量');
+  check(homeTab.contains('fontSize: 15') &&
+          homeTab.contains('fontSize: 12.5') &&
+          homeTab.contains('fontSize: 11.5'),
+      '字号阶梯回到 15 / 12.5 / 11.5 三档可读层级');
+  check(homeTab.contains('BoxShadow(') && homeTab.contains('blurRadius: 8'),
+      '浅色主题的卡片有淡投影，不再是 1px 描边的白条');
+  check(homeTab.contains('maxWidth: 560') &&
+          homeTab.contains('c.maxWidth >= 700') &&
+          homeTab.contains('c.maxHeight < 640'),
+      '窄屏定宽居中、宽屏两列、矮屏让出继续上次卡');
+  check(!homeTab.contains('_WindowsEntryCard') &&
+          !homeTab.contains('_QuickChip'),
+      '旧的通栏入口卡与 chip 组件已删除');
+  check(homeTab.contains('class _HomeContent') &&
+          homeTab.contains('class _HomeContentState'),
+      '首页内容区是独立组件，分段状态自持');
+
+  final homeSearch = read('lib/ui/widgets/home_search_box.dart');
+  check(homeSearch.contains('height: 52') && homeSearch.contains('width: 40'),
+      '搜索框加高到 52dp，发送键是 40dp 实心圆');
+  check(!homeSearch.contains('gradient: LinearGradient'),
+      '搜索框不再用霓虹渐变环（与其余组件不是同一套语言）');
+  check(read('lib/ui/site_icon.dart').contains('_fallback(p),'),
+      'favicon 未下回来时先显示首字母色块，宫格不会留一块空白');
 
   stdout.writeln();
   if (failures.isEmpty) {

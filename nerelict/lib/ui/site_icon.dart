@@ -125,18 +125,26 @@ class _SiteIconState extends State<SiteIcon> {
     final p = paletteOf(context);
     if (_failed || _urls.isEmpty) return _fallback(p);
     final url = _urls[_index.clamp(0, _urls.length - 1)];
+    // 首字母色块垫在图片下面：favicon 还没下回来 / 离线时不会留一块空白，
+    // 图片透明的地方也能看出这是哪个站。
     return ClipRRect(
       borderRadius: BorderRadius.circular(widget.radius),
-      child: Image.network(
-        url,
-        width: widget.size,
-        height: widget.size,
-        fit: BoxFit.cover,
-        gaplessPlayback: true,
-        errorBuilder: (_, __, ___) {
-          _next();
-          return _fallback(p);
-        },
+      child: Stack(
+        alignment: Alignment.center,
+        children: <Widget>[
+          _fallback(p),
+          Image.network(
+            url,
+            width: widget.size,
+            height: widget.size,
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+            errorBuilder: (_, __, ___) {
+              _next();
+              return const SizedBox.shrink();
+            },
+          ),
+        ],
       ),
     );
   }
