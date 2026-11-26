@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
@@ -673,7 +674,7 @@ class HlsDownloader {
               }
               keyCache[keyId] = keyBytes;
             }
-            data = aes128Decrypt(
+            data = await _decryptSegment(
               data,
               keyBytes,
               key.iv ?? ivFromSequence(seg.sequence),
@@ -1375,6 +1376,23 @@ class HlsDownloader {
     }
     final msg = e.toString().replaceFirst('Exception: ', '');
     return msg.length > 160 ? '${msg.substring(0, 160)}…' : msg;
+  }
+
+  /// 分片解密挪到独立 isolate。
+  ///
+  /// `aes128Decrypt` 是纯 Dart 的分组循环，2MB 的分片要跑十几万次
+  /// `processBlock`，在主 isolate 上就是几十毫秒——四个 worker 一起跑，
+  /// 边下载边播放（或边滚动网页）时每一段都会顶掉几帧。
+  /// 小分片直接算，省掉起 isolate 的固定开销。
+  static Future<Uint8List> _decryptSegment(
+    Uint8List data,
+    Uint8List key,
+    Uint8List iv,
+  ) {
+    if (data.length < 128 * 1024) {
+      return Future<Uint8List>.value(aes128Decrypt(data, key, iv));
+    }
+    return Isolate.run(() => aes128Decrypt(data, key, iv));
   }
 }
 

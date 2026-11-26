@@ -130,6 +130,24 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 - **补 scheme 的规则**：地址栏输入不带 scheme 时补 `https://` 并记 `_autoScheme`；
   该站只支持 HTTP 导致失败时自动回退 `http://` 再试一次，同一 host 只回退一次
   （`_httpRetried`），不要做成两个 scheme 互跳。
+- **下载进度不许直接 `notifyListeners()`**：下载器按网络分片回调，一个任务每秒上百次。
+  统一走 `AppState._notifyProgress()`（120ms 合并窗口，≤8 次/秒），状态切换仍即时通知，
+  任务收尾时把排队中的那一次并掉。`_schedulePersist()` 也只在没有排队时新建 Timer，
+  不要每来一个分片就 cancel + 新建。
+- **`AppState` 的订阅要收窄**：它挂在根上，且 `IndexedStack` 会让没显示的页面也参与重建。
+  页面级 build 一律 `context.read` + 对真正影响结构的标量 `context.select`
+  （如 `filesRevision` / `hasUnfinishedTasks` / `sniffedCount` / `taskCount`），
+  **不要再写 `final state = context.watch<AppState>()`**；需要跟着进度刷新的只有
+  小块的横幅（`_ActiveDownloadsBanner`）与下载页。为长度而 `List.unmodifiable` 整张表
+  也不行——selector 每次通知都执行。
+  `MaterialApp.builder` 里的 `_PlayerLayer` 用 `Selector<AppState, Object?>` 只订阅
+  播放相关的值（`player` / `playerMode` / `pipActive` / `hint` / `playerOffset`）。
+- **别让解密占 UI 线程**：HLS 的 AES-128-CBC 是纯 Dart 分组循环，2MB 分片就是十几万次
+  `processBlock`。≥128KB 的分片走 `Isolate.run`（`HlsDownloader._decryptSegment`），
+  小分片原地算，别为几 KB 起 isolate。
+- **播放代理复用连接池**：`StreamingProxy._upstreamClient()` 是长连接，HLS 每 4~10 秒一个
+  分片，**不要每次 `HttpClient()` 再 `close(force: true)`**——那等于每片重做一次 TCP + TLS
+  握手，边下载边播放时和下载器抢 CPU。空闲回收交给 `idleTimeout`，进程级关闭走 `stop()`。
 - **后台播放 = `mediaPlayback` 前台服务，不是画中画**：只要播放器活着就开
   `PlaybackService`（`PlayerPlatform.setKeepAlive` ← Dart 侧 `keepAlive(true)` 在
   `_preparePlatform`、`dispose` 里 `keepAlive(false)`）。切后台不改变界面形态，

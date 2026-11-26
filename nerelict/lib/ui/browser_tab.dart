@@ -1079,7 +1079,7 @@ class _BrowserTabState extends State<BrowserTab> {
 
   Widget _buildUrlBar(AppPalette p) {
     // 只订阅资源数量：底部横幅移除后，让入口本身能反映当前结果
-    final sniffCount = context.select<AppState, int>((s) => s.sniffed.length);
+    final sniffCount = context.select<AppState, int>((s) => s.sniffedCount);
     return Container(
       padding: const EdgeInsets.fromLTRB(10, 7, 6, 7),
       color: p.bg,
@@ -1198,7 +1198,7 @@ class _BrowserTabState extends State<BrowserTab> {
   /// 首页不需要地址栏（搜索框就是唯一入口），但多窗口要一眼能看到——
   /// 原来它独占一张 58dp 通栏卡压在首屏，现在收进标题栏，把首屏还给搜索框。
   Widget _buildHomeHeader(AppPalette p) {
-    final sniffCount = context.select<AppState, int>((s) => s.sniffed.length);
+    final sniffCount = context.select<AppState, int>((s) => s.sniffedCount);
     return Container(
       padding: const EdgeInsets.fromLTRB(_kHomePad, 8, 6, 4),
       color: p.bg,

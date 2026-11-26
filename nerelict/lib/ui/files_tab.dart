@@ -537,7 +537,20 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    final state = context.watch<AppState>();
+    // 这里**不能**用 context.watch<AppState>()：本页挂在 IndexedStack 上，
+    // 即使正停在其他标签页也照样参与重建，而下载进度每秒会通知很多次，
+    // 一次重建就要重算几千个文件的分类计数并重排列表——正是「边下边播时
+    // 滑动发涩」的来源之一。只订阅真正影响本页结构的几个值（元组按值比较，
+    // 进度变化时这几个值不变就不会重建）：文件列表版本号、是否有未完成任务、
+    // 上次扫描是否不完整、是否存在任何任务。
+    final state = context.read<AppState>();
+    final (_, anyActive, lastScanIncomplete, hasTasks) = context
+        .select<AppState, (int, bool, bool, bool)>((s) => (
+              s.filesRevision,
+              s.hasUnfinishedTasks,
+              s.lastScanIncomplete,
+              s.taskCount > 0,
+            ));
     final p = paletteOf(context);
     final isStorage = _view == _FilesView.storage;
     final files = isStorage ? _storageFiles : state.localFiles;
@@ -556,14 +569,9 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
       appBar: _selecting ? _selectionAppBar(files) : _normalAppBar(state, visible),
       body: Column(
         children: <Widget>[
-          if (state.tasks.any((t) => !t.status.isFinished))
-            _ActiveDownloadsBanner(
-              tasks: state.tasks,
-              p: p,
-              onOpen: _openDownloads,
-            ),
-          if (!isStorage && state.lastScanIncomplete)
-            _ScanIncompleteBanner(p: p),
+          // 横幅自己订阅进度：只有这一小块按 8Hz 重建，列表不受影响
+          if (anyActive) _ActiveDownloadsBanner(p: p, onOpen: _openDownloads),
+          if (!isStorage && lastScanIncomplete) _ScanIncompleteBanner(p: p),
           if (isStorage && _storageIncomplete)
             _StorageIncompleteBanner(p: p, errors: _storageErrors),
           if (isStorage && _storageTruncated)
@@ -637,7 +645,7 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
                     : files.isEmpty
                         ? _EmptyState(
                             p: p,
-                            hasTasks: state.tasks.isNotEmpty,
+                            hasTasks: hasTasks,
                             isStorage: isStorage,
                             onBrowse: () => state.setTab(0),
                             onOpenDownloads: _openDownloads,
@@ -1463,17 +1471,17 @@ class _ScanIncompleteBanner extends StatelessWidget {
 /// 顶部「有任务在跑」提示：不切页也能看到下载进度，点一下进下载分支。
 class _ActiveDownloadsBanner extends StatelessWidget {
   const _ActiveDownloadsBanner({
-    required this.tasks,
     required this.p,
     required this.onOpen,
   });
 
-  final List<DownloadTask> tasks;
   final AppPalette p;
   final VoidCallback onOpen;
 
   @override
   Widget build(BuildContext context) {
+    // 只有这一小块跟着下载进度刷新，文件列表不参与
+    final tasks = context.watch<AppState>().tasks;
     final running = tasks.where((t) => t.status.isActive).toList();
     final paused = tasks.where((t) => t.status == TaskStatus.paused).length;
     final progress = running.isEmpty

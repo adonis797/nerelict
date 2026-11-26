@@ -86,9 +86,21 @@ class M8BrowserApp extends StatelessWidget {
             theme: buildAppTheme(s.themeMode),
             // builder 位于 Navigator 之上：浮层盖住页面、底部弹窗、SnackBar 与对话框，
             // 始终是当前应用里层级最高的内容。
-            builder: (context, child) => Consumer<AppState>(
-              builder: (context, appState, _) => _PlayerLayer(
-                state: appState,
+            //
+            // 这里刻意用 Selector 而不是 Consumer：AppState 还会因为下载进度高频通知，
+            // 而这一层只关心「哪个视频、什么形态、有没有提示、小窗在哪」。
+            // 若整层跟着进度重建，播放面板与浮层每 120ms 就要重新 build + layout 一次，
+            // 与网页滚动争同一帧预算。
+            builder: (context, child) => Selector<AppState, Object?>(
+              selector: (_, s) => (
+                s.player,
+                s.playerMode,
+                s.pipActive,
+                s.hint,
+                s.playerOffset,
+              ),
+              builder: (context, _, __) => _PlayerLayer(
+                state: context.read<AppState>(),
                 navigator: child ?? const SizedBox.shrink(),
               ),
             ),

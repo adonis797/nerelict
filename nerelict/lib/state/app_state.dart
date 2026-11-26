@@ -177,9 +177,31 @@ class AppState extends ChangeNotifier {
   Timer? _persistTimer;
 
   /// 任务状态落盘（合并 600ms 内的多次变化，避免每个分片都写一次文件）。
+  ///
+  /// 已经排队就不再重置：分片回调每秒上百次，反复 cancel + 新建 Timer
+  /// 除了多出一堆临时对象什么也换不来——首尾各一次落盘就够了。
   void _schedulePersist() {
-    _persistTimer?.cancel();
+    if (_persistTimer != null) return;
     _persistTimer = Timer(const Duration(milliseconds: 600), _persistNow);
+  }
+
+  /// 进度通知合并窗口。
+  ///
+  /// 下载器是按「网络分片」回调的，一个 4 连接的任务轻松每秒上百次；
+  /// 每来一次就 `notifyListeners()`，会让挂在同一个 provider 上的整棵树
+  /// ——包括 `IndexedStack` 里根本没显示的文件页——每秒重建上百次，
+  /// 表现就是「边下边播时网页滑动发涩」。这里压到最多 8 次/秒，
+  /// 状态切换（开始 / 合并 / 完成 / 失败）仍走即时通知，不受影响。
+  static const Duration _progressNotifyGap = Duration(milliseconds: 120);
+  Timer? _progressTimer;
+
+  void _notifyProgress() {
+    if (_disposed || _progressTimer != null) return;
+    _progressTimer = Timer(_progressNotifyGap, () {
+      _progressTimer = null;
+      if (_disposed) return;
+      notifyListeners();
+    });
   }
 
   void _persistNow() {
@@ -374,6 +396,10 @@ class AppState extends ChangeNotifier {
   int _scanSeq = 0;
   bool _disposed = false;
 
+  /// 文件列表版本号。每次扫描结果落地都会变，界面据此用 `select` 精准订阅，
+  /// 不再因为「下载进度跳了一下」把整张文件列表跟着重建。
+  int get filesRevision => _scanSeq;
+
   /// 上次扫描是否不完整（目录枚举或读取出错）。此时保留旧列表，
   /// 不让「部分结果」把已经显示出来的文件抹掉，并由界面给出提示。
   bool _lastScanIncomplete = false;
@@ -550,6 +576,17 @@ class AppState extends ChangeNotifier {
 
   List<SniffedMedia> get sniffed => List.unmodifiable(_sniffed);
   List<DownloadTask> get tasks => List.unmodifiable(_tasks);
+
+  /// 给 `context.select` 用的标量口径。
+  ///
+  /// 上面两个 getter 每次调用都会 `List.unmodifiable` 拷一份，
+  /// 而 select 的 selector 在**每次通知**上都会执行；下载进度高频通知时，
+  /// 这点拷贝会变成每秒上百次的临时分配。要读数量就直说，别为了一个长度拷整张表。
+  int get sniffedCount => _sniffed.length;
+  int get taskCount => _tasks.length;
+  bool get hasUnfinishedTasks =>
+      _tasks.any((t) => !t.status.isFinished);
+
   SniffedMedia? get latest => _latest;
   String? get selectedUrl => _selectedUrl;
 
@@ -888,7 +925,7 @@ class AppState extends ChangeNotifier {
         task,
         onUpdate: () {
           if (task.detached) return;
-          notifyListeners();
+          _notifyProgress();
           // 进度落盘做节流：崩溃 / 杀进程后能恢复到最接近的分片位置
           _schedulePersist();
         },
@@ -921,6 +958,9 @@ class AppState extends ChangeNotifier {
     } finally {
       _running.remove(task.id);
       _scheduleRetryIfNeeded(task);
+      // 任务收尾要立刻落地：把还排着队的进度通知并掉，只发这一次
+      _progressTimer?.cancel();
+      _progressTimer = null;
       if (!task.detached) notifyListeners();
       _persistNow();
       unawaited(_pump());
@@ -1182,6 +1222,7 @@ class AppState extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     _persistTimer?.cancel();
+    _progressTimer?.cancel();
     _wifiTimer?.cancel();
     _retryTimer?.cancel();
     _persistNow();

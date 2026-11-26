@@ -450,7 +450,8 @@ void main() {
       '扫描不完整时不覆盖已有列表');
   check(appState.contains('bool get lastScanIncomplete'),
       '扫描状态可被界面读取');
-  check(filesTab.contains('state.lastScanIncomplete'), '文件页提示扫描不完整');
+  check(filesTab.contains('s.lastScanIncomplete'),
+      '文件页提示扫描不完整');
   check(downloaderDart.contains('await sink.addStream('),
       '直链写入带背压');
   check(!downloaderDart.contains('sink.add(chunk)'), '不再无背压堆积分片');
@@ -1356,6 +1357,50 @@ void main() {
       '搜索框不再用霓虹渐变环（与其余组件不是同一套语言）');
   check(read('lib/ui/site_icon.dart').contains('_fallback(p),'),
       'favicon 未下回来时先显示首字母色块，宫格不会留一块空白');
+
+  stdout.writeln('=== 24. 边下边播时的卡顿治理 ===');
+  // 进度是按网络分片回调的，一个任务每秒上百次；直接 notifyListeners
+  // 会把整棵树（含 IndexedStack 里没显示的页）一起重建，网页滚动就是在抢这部分的帧。
+  check(appState.contains('void _notifyProgress()') &&
+      appState.contains('_progressNotifyGap'),
+      '下载进度通知做了合并，最多 8 次/秒');
+  final runTaskStart = appState.indexOf('Future<void> _runTask(');
+  final runTaskBody = runTaskStart < 0
+      ? ''
+      : appState.substring(runTaskStart, runTaskStart + 1600);
+  check(runTaskBody.contains('_notifyProgress()') &&
+      !runTaskBody.contains('if (task.detached) return;\n          notifyListeners();'),
+      'onUpdate 不再直接 notifyListeners');
+  check(appState.contains('_progressTimer?.cancel();\n      _progressTimer = null;\n      if (!task.detached) notifyListeners();'),
+      '任务收尾时合并掉排队中的进度通知，只发一次最终状态');
+
+  check(filesTab.contains('final state = context.read<AppState>()') &&
+      !filesTab.contains('final state = context.watch<AppState>()'),
+      '文件页不再整页订阅 AppState（它在 IndexedStack 里，看不见也会重建）');
+  check(filesTab.contains('s.filesRevision') && appState.contains('int get filesRevision'),
+      '文件列表按版本号订阅，只有扫描落地才重建');
+  check(filesTab.contains('class _ActiveDownloadsBanner') &&
+      filesTab.contains('context.watch<AppState>().tasks'),
+      '下载横幅自己订阅进度，列表不跟着刷新');
+  check(appState.contains('int get sniffedCount') &&
+      appState.contains('bool get hasUnfinishedTasks') &&
+      !homeTab.contains('s.sniffed.length'),
+      '给 select 提供标量口径，不再为了一个长度拷贝整张表');
+
+  check(mainDart.contains('Selector<AppState, Object?>') &&
+      !mainDart.contains('builder: (context, child) => Consumer<AppState>('),
+      '浮层只订阅播放相关的值，不跟着下载进度重建');
+
+  check(downloaderDart.contains('static Future<Uint8List> _decryptSegment') &&
+      downloaderDart.contains('Isolate.run(() => aes128Decrypt('),
+      'AES-128 分片解密挪到独立 isolate，不占 UI 线程');
+  check(downloaderDart.contains('data.length < 128 * 1024'),
+      '小分片仍走原地解密，不为几 KB 起 isolate');
+
+  final proxyDart = read('lib/services/streaming_proxy.dart');
+  check(proxyDart.contains('HttpClient _upstreamClient()') &&
+      proxyDart.contains('idleTimeout'),
+      '播放代理复用连接池，不再每个分片握一次 TLS');
 
   stdout.writeln();
   if (failures.isEmpty) {

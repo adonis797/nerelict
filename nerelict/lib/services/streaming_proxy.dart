@@ -39,6 +39,19 @@ class StreamingProxy {
   /// 只放最近几份，播放器取完就不需要了，不落盘。
   final Map<String, String> _localPlaylists = <String, String>{};
 
+  /// 回源用的复用客户端。
+  ///
+  /// 以前每个分片请求都 `HttpClient()` 建一个再 `close(force: true)`：HLS 每 4~10 秒
+  /// 就来一个分片，等于每次都重做 TCP + TLS 握手甚至重新解析 DNS。边下载边播放时
+  /// 下载器本来就在抢连接与 CPU，这一串握手会直接反映成掉帧与首帧变慢。
+  /// 连接池交给 dart:io 自己管，空闲 20 秒自动回收。
+  HttpClient? _upstream;
+
+  HttpClient _upstreamClient() => _upstream ??= HttpClient()
+    ..connectionTimeout = const Duration(seconds: 8)
+    ..idleTimeout = const Duration(seconds: 20)
+    ..autoUncompress = true;
+
   /// 最近一次回源被拒的摘要（状态码 + Content-Type + 路径）。
   ///
   /// 播放器只会报一句 `Source error`，真正的原因在代理这一层：可能是 m3u8
@@ -369,9 +382,7 @@ class StreamingProxy {
       } catch (_) {}
     }
 
-    final client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 8)
-      ..autoUncompress = true;
+    final client = _upstreamClient();
     try {
       final req = await client.getUrl(Uri.parse(target));
       await _applyHeaders(req, referer, target, h);
@@ -428,7 +439,8 @@ class StreamingProxy {
         await request.response.close();
       }
     } finally {
-      client.close(force: true);
+      // 共享连接池**不能**在这里 close：每片一次握手正是要消掉的成本。
+      // 空闲连接由 `idleTimeout`（20 秒）回收，进程内整体关闭走 `stop()`。
     }
   }
 
@@ -547,5 +559,7 @@ class StreamingProxy {
   Future<void> stop() async {
     await _server?.close(force: true);
     _server = null;
+    _upstream?.close(force: true);
+    _upstream = null;
   }
 }
