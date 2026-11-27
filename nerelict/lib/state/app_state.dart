@@ -968,11 +968,16 @@ class AppState extends ChangeNotifier {
   }
 
   /// 设置里开启「一键转换为 MP4」时：下载完成即刻转封装，
-  /// 成功后删除 M3U8 合并出来的 TS 源文件，只保留 MP4。
+  /// 成功后删除合并出来的视频轨，只保留 MP4。
+  ///
+  /// 音轨被拆成独立流的任务**必须**合并一次，与开关无关：不合并留下的
+  /// 只是「无声视频 + 一条音轨」，不是能直接看的成品。
   Future<void> _autoConvertIfEnabled(DownloadTask task) async {
     if (task.detached) return;
+    final mustMux = task.needsAudioMux;
     final enabled = autoConvertMp4?.call() ?? false;
-    if (!enabled || !task.canConvert) return;
+    if (!mustMux && !enabled) return;
+    if (!task.canConvert) return;
     await convertToMp4(task, deleteSource: true, automatic: true);
   }
 
@@ -1068,8 +1073,10 @@ class AppState extends ChangeNotifier {
 
   /// 转封装并校验产物：系统解码器读不出时长/画面时判定失败，
   /// 避免把「转换成功但打不开」的文件交给播放器。
-  Future<String> _convertAndVerify(String sourcePath) async {
-    final path = await Mp4Converter.convert(sourcePath);
+  ///
+  /// [audioPath] 非空表示音轨是独立下载的那一条，交给原生侧做双输入归并。
+  Future<String> _convertAndVerify(String sourcePath, {String? audioPath}) async {
+    final path = await Mp4Converter.convert(sourcePath, audioPath: audioPath);
     Map<String, dynamic> info = const <String, dynamic>{};
     try {
       info = await Mp4Converter.info(path);
@@ -1117,6 +1124,7 @@ class AppState extends ChangeNotifier {
 
     final source = task.filePath;
     if (source == null) return;
+    final audioSource = task.audioPath;
 
     task.conversion = ConversionState.converting;
     task.conversionError = null;
@@ -1124,8 +1132,10 @@ class AppState extends ChangeNotifier {
     _persistNow();
 
     try {
-      logD('Convert', 'start ${task.id} $source');
-      final path = await _convertAndVerify(source);
+      logD('Convert', 'start ${task.id} $source'
+          '${audioSource == null ? '' : ' + audio'}');
+      final path =
+          await _convertAndVerify(source, audioPath: audioSource);
       // 原生转换是 await 点，期间任务可能已被「清除已完成」移除。
       // 此时不再写回状态 / 删源 / 导出 / 弹提示；产物留在下载目录，
       // 用户仍能在「文件」页看到它。
@@ -1140,10 +1150,16 @@ class AppState extends ChangeNotifier {
       }
 
       if (deleteSource) {
-        // 自动转换：只留 MP4，删掉 M3U8 合并出的 TS
+        // 自动转换：只留 MP4，删掉合并出的视频轨与独立音轨
         try {
           if (await File(source).exists()) await File(source).delete();
           if (task.filePath == source) task.filePath = null;
+          if (audioSource != null) {
+            if (await File(audioSource).exists()) {
+              await File(audioSource).delete();
+            }
+            if (task.audioPath == audioSource) task.audioPath = null;
+          }
         } catch (_) {
           // 删除失败就保留源文件，不影响 MP4 可用
         }
@@ -1209,6 +1225,9 @@ class AppState extends ChangeNotifier {
     // 读取导出位置也是 await 点，期间任务可能已被清除
     if (task.detached) return;
     final src = path ?? task.filePath;
+    // 音轨还没合进画面时先不导出：导出去的是一个没声音的文件，
+    // 用户会以为下载坏了。等合并完成再按 MP4 导出。
+    if (path == null && task.needsAudioMux) return;
     if (uri == null || uri.isEmpty || src == null) return;
     final name = src.split(Platform.pathSeparator).last;
     final ok = await StorageService.exportFile(uri: uri, path: src, name: name);

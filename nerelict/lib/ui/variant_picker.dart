@@ -223,31 +223,23 @@ class _VariantSheet extends StatelessWidget {
                 final separateAudio = master.separateAudioFor(v);
                 final subtitles = master.subtitlesFor(v);
                 final isLast = lastKey != null && v.key == lastKey;
-                final blocked = separateAudio.isNotEmpty;
 
                 final notes = <String>[
                   v.bandwidthLabel,
-                  if (separateAudio.isNotEmpty) '音轨独立，暂无法合并画面',
+                  if (separateAudio.isNotEmpty) '音轨独立，会一并下载后合并',
                   if (subtitles.isNotEmpty) '字幕 ${subtitles.length} 条',
                   if (isLast) '上次选择',
                 ];
 
                 return ListTile(
                   dense: true,
-                  enabled: !blocked,
                   title: Text(
                     v.resolution ?? v.bandwidthLabel,
-                    style: TextStyle(
-                      fontSize: 14,
-                      color: blocked ? p.textDisabled : p.text,
-                    ),
+                    style: TextStyle(fontSize: 14, color: p.text),
                   ),
                   subtitle: Text(
                     notes.join(' · '),
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: blocked ? p.textDisabled : p.textSub,
-                    ),
+                    style: TextStyle(fontSize: 12, color: p.textSub),
                   ),
                   trailing: i == 0
                       ? Text(
@@ -257,9 +249,7 @@ class _VariantSheet extends StatelessWidget {
                       : (isLast
                           ? Icon(Icons.check, size: 16, color: p.accent)
                           : null),
-                  onTap: blocked
-                      ? null
-                      : () => Navigator.of(context).pop(v),
+                  onTap: () => Navigator.of(context).pop(v),
                 );
               },
             ),
@@ -268,7 +258,8 @@ class _VariantSheet extends StatelessWidget {
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 10, 20, 14),
             child: Text(
-              '音轨独立的档位无法与画面合并，选中会得到没有声音的文件，因此不可选。',
+              '音轨独立成流的档位会把音轨一起下载，下载完成后自动合并成有声的 MP4，'
+              '不会得到没声音的文件。',
               style: TextStyle(fontSize: 11, color: p.textFaint, height: 1.5),
             ),
           ),

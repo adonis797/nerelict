@@ -601,8 +601,10 @@ void main() {
   final downloaderText = read('lib/services/hls_downloader.dart');
   check(downloaderText.contains('var chosen = master.pick(task.variantKey)'),
       '下载按用户选择的档位执行，不再硬取最高码率');
-  check(downloaderText.contains('task.variantNote = note'),
-      '档位被自动调整时留下可见说明');
+  check(
+      downloaderText.contains('task.variantNote = audio == null') &&
+          downloaderText.contains('会与画面合并成一个 MP4'),
+      '音轨独立时留下可见说明，而不是静默降级或直接失败');
   check(downloaderText.contains('range: seg.hasRange'),
       '字节区间分片按 Range 请求');
   check(downloaderText.contains('字节区间不符'),

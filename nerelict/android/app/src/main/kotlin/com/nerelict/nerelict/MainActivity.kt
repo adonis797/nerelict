@@ -686,13 +686,15 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "convert" -> {
                         val path = call.argument<String>("path")
+                        // 音轨被拆成独立流时多带一条音轨路径，原生侧做双输入归并
+                        val audioPath = call.argument<String>("audioPath")
                         if (path.isNullOrEmpty()) {
                             result.error("BAD_ARG", "源文件路径为空", null)
                             return@setMethodCallHandler
                         }
                         Thread {
                             try {
-                                val out = Mp4Converter.convert(path)
+                                val out = Mp4Converter.convert(path, audioPath)
                                 post { result.success(out) }
                             } catch (e: Exception) {
                                 post {

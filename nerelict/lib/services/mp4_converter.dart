@@ -5,10 +5,14 @@ import 'package:flutter/services.dart';
 class Mp4Converter {
   static const _channel = MethodChannel('com.nerelict/mp4');
 
-  static Future<String> convert(String tsPath) async {
+  /// 转封装。 [audioPath] 非空时表示音轨被拆成了独立流：
+  /// 原生侧把视频轨与音轨按 PTS 归并成一个 MP4，而不是各转各的。
+  static Future<String> convert(String tsPath, {String? audioPath}) async {
     try {
-      final out =
-          await _channel.invokeMethod<String>('convert', {'path': tsPath});
+      final out = await _channel.invokeMethod<String>('convert', {
+        'path': tsPath,
+        if (audioPath != null && audioPath.isNotEmpty) 'audioPath': audioPath,
+      });
       if (out == null || out.isEmpty) {
         throw Exception('转换未返回输出文件');
       }

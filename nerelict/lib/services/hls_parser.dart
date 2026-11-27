@@ -193,6 +193,27 @@ class HlsMasterPlaylist {
         .toList();
   }
 
+  /// 下载时默认取哪一条独立音轨。
+  ///
+  /// 顺序是 `DEFAULT=YES` → 中文（zh / chi / cmn / 中文语种标记）→ 组内第一条。
+  /// 不取「声道最多」的那条：多声道的常是导演评论轨，把正片音轨换掉反而更糟。
+  HlsRendition? preferredAudioFor(HlsVariant v) {
+    final list = separateAudioFor(v);
+    if (list.isEmpty) return null;
+    for (final r in list) {
+      if (r.isDefault) return r;
+    }
+    for (final r in list) {
+      final lang = (r.language ?? '').toLowerCase();
+      if (lang.startsWith('zh') || lang == 'chi' || lang == 'cmn') return r;
+      final name = r.name.toLowerCase();
+      if (name.contains('中文') || name.contains('国语') || name.contains('普通话')) {
+        return r;
+      }
+    }
+    return list.first;
+  }
+
   /// 某个变体可选的字幕
   List<HlsRendition> subtitlesFor(HlsVariant v) {
     final group = v.subtitleGroup;

@@ -42,22 +42,37 @@ object Mp4Converter {
     private const val MIN_FRAME_DUR_US = 8_000L
     private const val MAX_FRAME_DUR_US = 1_000_000L
 
-    fun convert(inputPath: String): String {
+    /**
+     * TS -> MP4 转封装。
+     *
+     * [audioPath] 非空表示这是一条「音轨被拆成独立流」的视频：视频轨与音轨
+     * 分别落在两个文件里，此时不能按单文件那套逻辑直接返回，必须走双输入归并。
+     */
+    fun convert(inputPath: String, audioPath: String? = null): String {
         val input = File(inputPath)
         require(input.exists() && input.length() > 0) { "源文件不存在或为空" }
-        // 已经是 mp4 就不需要再转一次
-        if (input.extension.equals("mp4", true) ||
-            input.extension.equals("m4v", true)
-        ) {
-            return input.absolutePath
+        val audio = audioPath
+            ?.takeIf { it.isNotBlank() }
+            ?.let { path -> File(path).takeIf { it.exists() && it.length() > 0 } }
+        if (audio == null) {
+            // 已经是 mp4 就不需要再转一次
+            if (input.extension.equals("mp4", true) ||
+                input.extension.equals("m4v", true)
+            ) {
+                return input.absolutePath
+            }
         }
 
         val target = uniqueTarget(input)
         var success = false
         try {
-            val expectedMs = remux(input, target)
+            val expectedMs = if (audio == null) {
+                remux(input, target)
+            } else {
+                remuxTwo(input, audio, target)
+            }
             if (!probe(target, expectedMs)) {
-                throw IllegalArgumentException("转换产物未通过校验（时长或时间轴异常），可能不是标准 TS 流")
+                throw IllegalArgumentException("转换产物未通过校验（时长或时间轴异常），可能不是标准流")
             }
             success = true
             return target.absolutePath
@@ -412,6 +427,274 @@ object Mp4Converter {
             } catch (_: Exception) {
             }
             extractor.release()
+        }
+    }
+
+    /**
+     * 双输入转封装：视频轨与独立音轨来自两个文件，按 PTS 归并写进同一个 MP4。
+     *
+     * 为什么不能各转各的再拼：MediaMuxer 只能从 0 开始顺序写样本，两个文件
+     * 各自转出来的 mp4 再合并需要 container 级别的重写，代价远大于一次归并。
+     *
+     * 时间轴：以两条轨里较早的起点为基准整体平移，保留原始相对偏移；
+     * 视频沿用 B 帧网格重建，音轨只做防回退（音频 PTS 本身单调）。
+     */
+    private fun remuxTwo(video: File, audio: File, target: File): Long {
+        val vEx = MediaExtractor()
+        val aEx = MediaExtractor()
+        var muxer: MediaMuxer? = null
+        try {
+            vEx.setDataSource(video.absolutePath)
+            aEx.setDataSource(audio.absolutePath)
+
+            var vTrack = -1
+            for (i in 0 until vEx.trackCount) {
+                val mime = vEx.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: continue
+                if (isSupportedVideo(mime)) {
+                    vTrack = i
+                    break
+                }
+            }
+            var aTrack = -1
+            var audioMime: String? = null
+            for (i in 0 until aEx.trackCount) {
+                val mime = aEx.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: continue
+                if (isSupportedAudio(mime)) {
+                    aTrack = i
+                    audioMime = mime
+                    break
+                }
+            }
+            if (vTrack < 0) {
+                throw IllegalArgumentException("音轨已下载，但画面编码不支持直接转封装（仅支持 H.264/HEVC）")
+            }
+            if (aTrack < 0) {
+                throw IllegalArgumentException("独立音轨的编码不支持直接转封装（仅支持 AAC/MP3）")
+            }
+
+            vEx.selectTrack(vTrack)
+            aEx.selectTrack(aTrack)
+
+            // fMP4 音轨本身就是 mp4 封装，样本是裸 AAC；只有 TS 里的音轨才是
+            // ADTS 封装，需要拆帧并把 csd-0 从 ADTS 头换成 AudioSpecificConfig。
+            val audioIsMp4 = audio.extension.lowercase() in
+                setOf("mp4", "m4a", "m4v")
+            val isAdtsAac = audioMime == AAC && !audioIsMp4
+            val audioSampleRate = runCatching {
+                aEx.getTrackFormat(aTrack).getInteger(MediaFormat.KEY_SAMPLE_RATE)
+            }.getOrDefault(44100)
+            val audioFrameDurUs = if (audioSampleRate > 0) {
+                (1024L * 1_000_000L) / audioSampleRate
+            } else {
+                FALLBACK_AUDIO_STEP_US
+            }
+
+            val vTiming = analyzeTrack(video, vTrack, 180)
+            val aTiming = analyzeTrack(audio, aTrack, 90)
+            val vFirst = vTiming?.firstPtsUs ?: 0L
+            val aFirst = aTiming?.firstPtsUs ?: 0L
+            // 分轨后两条流各自从 0 起算；统一按较早的一条归零，
+            // 保留它们原本的相对起点，避免几十毫秒到几秒的口型偏移。
+            val globalMin = minOf(vFirst, aFirst)
+
+            var vDur = vTiming?.frameDurUs ?: 0L
+            if (vDur <= 0) {
+                val declared = readFrameRate(vEx.getTrackFormat(vTrack))
+                vDur = if (declared > 0) {
+                    (1_000_000.0 / declared).toLong()
+                } else {
+                    FALLBACK_VIDEO_STEP_US
+                }
+            }
+            vDur = vDur.coerceIn(MIN_FRAME_DUR_US, MAX_FRAME_DUR_US)
+
+            val vClock = TrackClock(
+                mode = if (vTiming?.reordered == true) {
+                    TrackClock.Mode.GRID
+                } else {
+                    TrackClock.Mode.STRICT
+                },
+                frameDurUs = vDur,
+                basePtsUs = vTiming?.firstPtsUs ?: -1L,
+                startUs = (vFirst - globalMin).coerceAtLeast(0L),
+            )
+            val aClock = TrackClock(
+                mode = TrackClock.Mode.STRICT,
+                frameDurUs = audioFrameDurUs,
+                basePtsUs = aTiming?.firstPtsUs ?: -1L,
+                startUs = (aFirst - globalMin).coerceAtLeast(0L),
+            )
+
+            val vFormat = vEx.getTrackFormat(vTrack)
+            val aFormat = aEx.getTrackFormat(aTrack)
+            val mx = MediaMuxer(
+                target.absolutePath,
+                MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
+            )
+            muxer = mx
+            val muxV = mx.addTrack(vFormat)
+            if (isAdtsAac) fixAacCsd(aFormat)
+            val muxA = mx.addTrack(aFormat)
+            val rotation = if (vFormat.containsKey(MediaFormat.KEY_ROTATION)) {
+                vFormat.getInteger(MediaFormat.KEY_ROTATION)
+            } else {
+                0
+            }
+            if (rotation != 0) mx.setOrientationHint(rotation)
+            mx.start()
+
+            val vBuf = ByteBuffer.allocateDirect(4 * 1024 * 1024)
+            val aBuf = ByteBuffer.allocateDirect(1024 * 1024)
+            val scratch = ByteBuffer.allocateDirect(256 * 1024)
+            val info = MediaCodec.BufferInfo()
+
+            var vSize = -1
+            var vPts = -1L
+            var vFlags = 0
+            var vDone = false
+            var aSize = -1
+            var aPts = -1L
+            var aFlags = 0
+            var aDone = false
+            var vWritten = 0
+            var aWritten = 0
+            var maxOutPts = 0L
+            var videoSynced = false
+
+            fun pullVideo() {
+                while (true) {
+                    vBuf.clear()
+                    val size = try {
+                        vEx.readSampleData(vBuf, 0)
+                    } catch (_: Exception) {
+                        -1
+                    }
+                    if (size < 0) {
+                        vDone = true
+                        return
+                    }
+                    val pts = vEx.sampleTime
+                    if (pts < 0 || size <= 0) {
+                        if (!vEx.advance()) {
+                            vDone = true
+                            return
+                        }
+                        continue
+                    }
+                    // 视频必须从关键帧开始，否则开头会缺参考帧
+                    if (!videoSynced &&
+                        (vEx.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) == 0
+                    ) {
+                        if (!vEx.advance()) {
+                            vDone = true
+                            return
+                        }
+                        continue
+                    }
+                    videoSynced = true
+                    vSize = size
+                    vPts = pts
+                    vFlags = vEx.sampleFlags
+                    return
+                }
+            }
+
+            fun pullAudio() {
+                while (true) {
+                    aBuf.clear()
+                    val size = try {
+                        aEx.readSampleData(aBuf, 0)
+                    } catch (_: Exception) {
+                        -1
+                    }
+                    if (size < 0) {
+                        aDone = true
+                        return
+                    }
+                    val pts = aEx.sampleTime
+                    if (pts < 0 || size <= 0) {
+                        if (!aEx.advance()) {
+                            aDone = true
+                            return
+                        }
+                        continue
+                    }
+                    aSize = size
+                    aPts = pts
+                    aFlags = aEx.sampleFlags
+                    return
+                }
+            }
+
+            fun advanceVideo() {
+                if (!vEx.advance()) vDone = true else pullVideo()
+            }
+
+            fun advanceAudio() {
+                if (!aEx.advance()) aDone = true else pullAudio()
+            }
+
+            pullVideo()
+            pullAudio()
+            while (!vDone || !aDone) {
+                val takeVideo = !vDone && (aDone || vPts <= aPts)
+                if (takeVideo) {
+                    val pts = vClock.next(vPts, vDur)
+                    if (writeSlice(mx, muxV, vBuf, 0, vSize, pts, vFlags, scratch, info)) {
+                        vWritten++
+                        if (pts > maxOutPts) maxOutPts = pts
+                    }
+                    advanceVideo()
+                } else {
+                    val pts = aClock.next(aPts, audioFrameDurUs)
+                    val frames = if (isAdtsAac) adtsFrames(aBuf, aSize) else null
+                    if (frames != null) {
+                        var framePts = pts
+                        var p = 0
+                        while (p + 1 < frames.size) {
+                            val off = frames[p]
+                            val len = frames[p + 1]
+                            if (writeSlice(mx, muxA, aBuf, off, len, framePts, 0, scratch, info)) {
+                                aWritten++
+                            }
+                            aClock.markWritten(framePts)
+                            if (framePts > maxOutPts) maxOutPts = framePts
+                            framePts += audioFrameDurUs
+                            p += 2
+                        }
+                    } else if (writeSlice(mx, muxA, aBuf, 0, aSize, pts, aFlags, scratch, info)) {
+                        aWritten++
+                        if (pts > maxOutPts) maxOutPts = pts
+                    }
+                    advanceAudio()
+                }
+            }
+
+            Log.i(
+                TAG,
+                "remuxTwo done: video=$vWritten audio=$aWritten adts=$isAdtsAac " +
+                    "lastPtsUs=$maxOutPts vStart=${vFirst - globalMin} aStart=${aFirst - globalMin}"
+            )
+            if (vWritten <= 0) throw IllegalArgumentException("没有可写入的视频样本")
+            if (aWritten <= 0) throw IllegalArgumentException("音轨里没有可写入的音频样本")
+            return (maxOutPts + vDur) / 1000
+        } finally {
+            try {
+                muxer?.stop()
+            } catch (_: Exception) {
+            }
+            try {
+                muxer?.release()
+            } catch (_: Exception) {
+            }
+            try {
+                vEx.release()
+            } catch (_: Exception) {
+            }
+            try {
+                aEx.release()
+            } catch (_: Exception) {
+            }
         }
     }
 

@@ -81,12 +81,18 @@ class DownloadTask {
   /// 成品是否已另外同步到用户自选的下载位置（不展示具体路径）
   bool exported = false;
 
-  /// 只有下载完成且产物是 TS 时，转换按钮才有意义
+  /// 音轨被拆成独立流时多出来的一条轨：下载完成后停在分轨状态，
+  /// 必须再转封装一次才能得到「有声的 MP4」。
+  bool get needsAudioMux =>
+      audioPath != null && audioPath!.trim().isNotEmpty;
+
+  /// 只有下载完成、且产物是 TS 或被拆成了两条轨时，转换按钮才有意义。
+  /// 双轨情形下视频轨本身可能已经是 mp4（fMP4），所以不能只看扩展名。
   bool get canConvert =>
       status == TaskStatus.done &&
       filePath != null &&
-      filePath!.toLowerCase().endsWith('.ts') &&
-      conversion != ConversionState.converting;
+      conversion != ConversionState.converting &&
+      (needsAudioMux || filePath!.toLowerCase().endsWith('.ts'));
 
   /// 可在 Nerelict 里直接播放的成品（优先 MP4）
   String? get playablePath => mp4Path ?? filePath;
@@ -110,6 +116,16 @@ class DownloadTask {
 
   /// 该码率声明了哪些字幕（仅展示，不参与下载）
   String? subtitleNote;
+
+  /// 独立音轨的子播放列表地址（`#EXT-X-MEDIA` 的 AUDIO 组带 URI）。
+  /// 非空表示这次下载取了「视频轨 + 音轨」两条，转封装时才合成有声文件。
+  String? audioUrl;
+
+  /// 音轨的语言 / 名称，用于任务卡片说明是哪一条音轨
+  String? audioName;
+
+  /// 音轨分轨产物（合并后、转封装前的中间文件）
+  String? audioPath;
 
   /// 档位被自动调整时的说明，例如「最高清晰度音轨独立，已自动改用 720p」。
   /// 让降级是可见的，而不是静默发生。
@@ -202,6 +218,9 @@ class DownloadTask {
         'variantKey': variantKey,
         'subtitleNote': subtitleNote,
         'variantNote': variantNote,
+        'audioUrl': audioUrl,
+        'audioName': audioName,
+        'audioPath': audioPath,
         'discontinuities': discontinuities,
         'isLive': isLive,
         'segments': segments,
@@ -278,6 +297,13 @@ class DownloadTask {
         raw['subtitleNote'] is String ? raw['subtitleNote'] as String : null;
     task.variantNote =
         raw['variantNote'] is String ? raw['variantNote'] as String : null;
+    // 旧任务没有这三个字段：按 null 恢复，续传时重新解析主播放列表再补上
+    task.audioUrl =
+        raw['audioUrl'] is String ? raw['audioUrl'] as String : null;
+    task.audioName =
+        raw['audioName'] is String ? raw['audioName'] as String : null;
+    task.audioPath =
+        raw['audioPath'] is String ? raw['audioPath'] as String : null;
     task.discontinuities = asInt(raw['discontinuities']);
     task.isLive = raw['isLive'] == true;
     final segs = raw['segments'];

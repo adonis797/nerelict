@@ -214,6 +214,16 @@ class HlsDownloader {
     return (dirs: dirs, bytes: bytes);
   }
 
+  /// 删掉某个任务留下的分片目录（双轨两段都完成后统一调用）。
+  Future<void> _dropTaskTemp(String taskId) async {
+    try {
+      final root = await (resolveTempDir?.call() ??
+          Future<Directory>.value(Directory.systemTemp));
+      final dir = Directory(joinPath(root.path, 'ss_$taskId'));
+      if (await dir.exists()) await dir.delete(recursive: true);
+    } catch (_) {}
+  }
+
   Future<int> _directoryBytes(Directory dir) async {
     var total = 0;
     try {
@@ -300,44 +310,71 @@ class HlsDownloader {
         // 默认仍是最高码率（与旧行为一致）；用户选过档时按持久化的 key 还原，
         // 站点换了列表就退到同高度的最近一档，实在没有才回落最高。
         var chosen = master.pick(task.variantKey) ?? master.variants.first;
-        // 每次重新解析都清空旧提示，避免续传后残留上一次的说明
-        String? note;
-        // 音轨被拆成独立流时，只下视频变体会得到没有声音的成品。
-        // 用户明确点了这一档就如实拒绝；只是默认落到这里，则自动退到
-        // 第一个音轨内嵌的档位并说明原因——不让「点了下载直接失败」变成
-        // 新的坑，也不静默降质。
-        if (master.separateAudioFor(chosen).isNotEmpty) {
-          final requested = task.variantKey;
-          final usable = master.variants
-              .where((v) => master.separateAudioFor(v).isEmpty)
-              .toList();
-          if (requested != null && requested.isNotEmpty) {
-            throw Exception(
-                '该清晰度把音轨拆成了独立流（${master.separateAudioFor(chosen).first.label}），'
-                '当前版本无法与画面合并；请改选内置音轨的清晰度');
-          }
-          if (usable.isEmpty) {
-            throw Exception('这个视频的所有清晰度都把音轨拆成了独立流，'
-                '当前版本无法合并音画');
-          }
-          note = '最高清晰度音轨独立，已自动改用 ${usable.first.label}';
-          chosen = usable.first;
-        }
+        // 音轨被拆成独立流时，视频轨本身没有声音。0.4.x 及以前直接拒绝这一档，
+        // 结果是这类站点整体下不了；现在把音轨单独下下来，转封装时再合成。
+        final audio = master.preferredAudioFor(chosen);
         task.variant = chosen.label;
         task.variantKey = chosen.key;
-        task.variantNote = note;
+        task.variantNote = audio == null
+            ? null
+            : '音轨独立（${audio.label}），会与画面合并成一个 MP4';
+        task.audioName = audio?.label;
         final subs = master.subtitlesFor(chosen);
         task.subtitleNote = subs.isEmpty
             ? null
             : subs.map((s) => s.label).where((s) => s.isNotEmpty).join(' / ');
+
+        // 先取音轨清单：它的分片数要并进同一个进度分母，
+        // 否则音轨那一段一开始进度条就会往回跳。
+        HlsMediaPlaylist? audioMedia;
+        if (audio != null && audio.uri != null) {
+          final ar = await _fetchText(audio.uri!, task.referer, task, canceled);
+          if (canceled()) throw const CanceledException();
+          audioMedia = parseMediaPlaylist(ar.body, ar.uri);
+          task.audioUrl = ar.uri.toString();
+        }
+
         final second = await _fetchText(
             chosen.uri.toString(), task.referer, task, canceled);
         if (canceled()) throw const CanceledException();
         text = second.body;
         base = second.uri;
         final media = parseMediaPlaylist(text, base);
+        final videoTotal = media.segments.length;
+        final audioTotal = audioMedia?.segments.length ?? 0;
+        final grandTotal = videoTotal + audioTotal;
         await _downloadMedia(task, media, tick, canceled,
-            limitSegments: limitSegments, resume: resume);
+            limitSegments: limitSegments,
+            resume: resume,
+            progressTotal: grandTotal,
+            deferDone: audioMedia != null);
+        if (audioMedia != null) {
+          try {
+            await _downloadMedia(task, audioMedia, tick, canceled,
+                resume: resume,
+                isAudio: true,
+                progressOffset: videoTotal,
+                progressTotal: grandTotal,
+                deferDone: true);
+          } catch (e) {
+            if (canceled()) rethrow;
+            // 音轨失败时把刚落地的无声视频删掉：留着它只会让用户
+            // 以为「下完了就是没声音」，比明确报错更难排查。
+            await _deleteQuietly(task.filePath);
+            task.filePath = null;
+            task.audioPath = null;
+            task.progress = 0;
+            throw Exception('画面已下载，音轨抓取失败：${_friendlyError(e)}');
+          }
+          if (task.filePath != null && task.audioPath != null) {
+            task.progress = 1;
+            task.status = TaskStatus.done;
+            tick();
+            // 两段都完成了才删分片目录：视频段收尾时为了支持音轨阶段
+            // 暂停续传，那个目录是刻意留着的。
+            await _dropTaskTemp(task.id);
+          }
+        }
       } else {
         final media = parseMediaPlaylist(text, base);
         await _downloadMedia(task, media, tick, canceled,
@@ -518,13 +555,24 @@ class HlsDownloader {
     }
   }
 
-  Future<void> _downloadMedia(
+  /// 按一份 media playlist 下载全部分片并合并成一个文件。
+  ///
+  /// [isAudio] 为 true 时这是「音轨独立流」里的那一条音轨：分片落独立临时目录、
+  /// 产物命名为 `<标题>.audio.<ext>`，进度按 [progressOffset] / [progressTotal]
+  /// 并入视频那一段的分母，不把任务的完成状态提前置成 done。
+  ///
+  /// 返回值是本次合并出的文件路径。
+  Future<String> _downloadMedia(
     DownloadTask task,
     HlsMediaPlaylist media,
     void Function() tick,
     bool Function() canceled, {
     int? limitSegments,
     required bool resume,
+    bool isAudio = false,
+    int progressOffset = 0,
+    int progressTotal = 0,
+    bool deferDone = false,
   }) async {
     if (limitSegments != null && media.segments.length > limitSegments) {
       final kept = media.segments.take(limitSegments).toList();
@@ -541,10 +589,13 @@ class HlsDownloader {
     }
     // 直播流没有 #EXT-X-ENDLIST：这里只能保存当前窗口的片段。
     // 标记到任务上，让下载页与完成提示明确告知用户，不再假装是完整视频。
-    task.isLive = media.isLive;
-    // 时间轴中途跳变（插播 / 换源 / 换编码）：直接拼接仍能播，但时间戳会跳，
-    // 转 MP4 后时长可能对不上。记下来如实告知，不假装产出了连续时间轴。
-    task.discontinuities = media.discontinuities;
+    // 音轨段不覆盖这些标记——它们描述的是整条视频的属性。
+    if (!isAudio) {
+      task.isLive = media.isLive;
+      // 时间轴中途跳变（插播 / 换源 / 换编码）：直接拼接仍能播，但时间戳会跳，
+      // 转 MP4 后时长可能对不上。记下来如实告知，不假装产出了连续时间轴。
+      task.discontinuities = media.discontinuities;
+    }
     tick();
     // 只实现了 AES-128：SAMPLE-AES / 其他 METHOD 若不解密直接合并，
     // 会产出一个看似成功、实际打不开的文件。提前报错，别静默交付坏文件。
@@ -557,7 +608,11 @@ class HlsDownloader {
 
     final root = await (resolveTempDir?.call() ??
         Future<Directory>.value(Directory.systemTemp));
-    final tmp = Directory(joinPath(root.path, 'ss_${task.id}'));
+    // 音轨走子目录：两段的分片文件名各自按 URL 摘要，混在一起会互相覆盖，
+    // 续传时的「清理不属于本轮 playlist 的分片」也会把另一段误删。
+    final tmp = Directory(isAudio
+        ? joinPath(joinPath(root.path, 'ss_${task.id}'), 'audio')
+        : joinPath(root.path, 'ss_${task.id}'));
     await tmp.create(recursive: true);
 
     try {
@@ -609,10 +664,15 @@ class HlsDownloader {
       }
 
       task.status = TaskStatus.downloading;
-      task.totalSegments = total;
-      task.doneSegments = done;
-      task.bytes = written;
-      task.progress = total == 0 ? 0 : done / total;
+      // 双轨时两条 playlist 的分片数各自算一半以上的进度，
+      // 用合并后的分母，否则音轨一开始进度条就会往回跳。
+      final totalAll = progressTotal > 0 ? progressTotal : total;
+      task.totalSegments = totalAll;
+      task.doneSegments = progressOffset + done;
+      // 音轨段的字节要累加，不能把视频段已经下到的量冲掉
+      task.bytes = (isAudio ? task.bytes : 0) + written;
+      task.progress =
+          totalAll == 0 ? 0 : (progressOffset + done) / totalAll;
       tick();
 
       // fMP4 的初始化分片：播放列表里可能有多段 #EXT-X-MAP（换编码 / 插播），
@@ -688,8 +748,8 @@ class HlsDownloader {
           partPaths[idx] = part.path;
 
           done++;
-          task.doneSegments = done;
-          task.progress = done / total;
+          task.doneSegments = progressOffset + done;
+          task.progress = totalAll == 0 ? 0 : (progressOffset + done) / totalAll;
           task.bytes += data.length;
           tick();
         }
@@ -706,7 +766,8 @@ class HlsDownloader {
 
       final outDir = await _outputDir();
       final ext = media.isFmp4 ? 'mp4' : 'ts';
-      final out = _uniqueFile(outDir, task.title, ext);
+      final out = _uniqueFile(
+          outDir, isAudio ? '${task.title}.audio' : task.title, ext);
 
       final sink = out.openWrite();
       try {
@@ -731,14 +792,26 @@ class HlsDownloader {
         await sink.close();
       }
 
-      task.bytes = await out.length();
-      task.filePath = out.path;
-      task.progress = 1;
-      task.status = TaskStatus.done;
+      final size = await out.length();
+      if (isAudio) {
+        // 音轨只是分轨产物：任务还没完成，等调用方把两段都拿到再收尾
+        task.bytes += size;
+        task.audioPath = out.path;
+      } else {
+        task.bytes = size;
+        task.filePath = out.path;
+        if (!deferDone) {
+          task.progress = 1;
+          task.status = TaskStatus.done;
+        }
+      }
       tick();
+      return out.path;
     } finally {
-      // 暂停时保留临时分片供续传，其余情况（完成/失败/删除）清理
-      if (!task.pauseRequested) {
+      // 暂停时保留临时分片供续传，其余情况（完成/失败/删除）清理。
+      // 双轨里视频段先下完：此时还不能清，音轨阶段如果暂停 / 失败，
+      // 下次续传还得靠这些分片——真正的清理由 _download 在两段都收尾后统一做。
+      if (!task.pauseRequested && !(deferDone && !isAudio)) {
         try {
           await tmp.delete(recursive: true);
         } catch (_) {}
@@ -779,6 +852,15 @@ class HlsDownloader {
     name.write('.');
     name.write(ext);
     return name.toString();
+  }
+
+  /// 删除文件但不抛异常：用在失败路径的清理上，清理本身不该盖掉原始错误。
+  Future<void> _deleteQuietly(String? path) async {
+    if (path == null || path.isEmpty) return;
+    try {
+      final file = File(path);
+      if (await file.exists()) await file.delete();
+    } catch (_) {}
   }
 
   /// 原子写：先落 .tmp 再改名，中途被杀只会留下会被续传清理的临时文件，
