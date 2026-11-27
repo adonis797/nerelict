@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../models/theme_mode.dart';
-import '../services/apk_installer.dart';
 import '../services/app_log.dart';
 import '../services/player_core.dart' show kPlaybackSpeeds;
 import '../services/player_platform.dart';
@@ -13,6 +12,7 @@ import '../services/streaming_proxy.dart';
 import '../state/app_state.dart';
 import '../state/settings_state.dart';
 import 'app_theme.dart';
+import 'update_sheet.dart';
 import 'widgets/app_menu.dart';
 
 /// 设置主页：分类入口 + 搜索框，点进去是二级页面。
@@ -196,10 +196,10 @@ class _SettingsTabState extends State<SettingsTab> {
           page: _downloadPage,
         ),
         _SettingsEntry(
-          title: '安装应用更新',
+          title: '检查更新',
           category: '关于',
           icon: Icons.system_update_outlined,
-          keywords: const <String>['更新', '升级', '安装', 'apk'],
+          keywords: const <String>['更新', '升级', '新版本', 'github', 'release'],
           value: 'v${SettingsTab.appVersion}',
           page: _aboutPage,
         ),
@@ -831,24 +831,12 @@ List<Widget> _aboutPage(
 ) {
   return <Widget>[
     _SettingCard(
-      titles: ['安装应用更新', '诊断日志'],
+      titles: ['检查更新', '诊断日志'],
       children: <Widget>[
         _InfoRow('应用名称', 'Nerelict', p),
         _InfoRow('版本', SettingsTab.appVersion, p),
         Divider(height: 1, color: p.border),
-        ListTile(
-          dense: true,
-          contentPadding:
-              const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
-          leading:
-              Icon(Icons.system_update_outlined, size: 19, color: p.accent),
-          title: Text(
-            '安装应用更新',
-            style: TextStyle(fontSize: 13, color: p.text),
-          ),
-          trailing: Icon(Icons.chevron_right, size: 18, color: p.textDisabled),
-          onTap: () => _installUpdate(context),
-        ),
+        UpdateTile(p: p, currentVersion: SettingsTab.appVersion),
         Divider(height: 1, color: p.border),
         ListTile(
           dense: true,
@@ -894,13 +882,6 @@ Future<void> _exportLog(BuildContext context) async {
     return;
   }
   app.showToast('已导出：${path.split('/').last}');
-}
-
-Future<void> _installUpdate(BuildContext context) async {
-  final app = context.read<AppState>();
-  final result = await ApkInstaller.pickAndInstall();
-  app.showToast(
-      result.ok ? '${result.modeLabel}：${result.message}' : result.message);
 }
 
 /// 二级设置页：标题 + 内容，内容随设置变化自动重建。

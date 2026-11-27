@@ -188,12 +188,12 @@ void main() {
   check(converter.contains('droppedVideo > writtenVideo / 10'),
       '直通失败（丢帧过多）时自动改走网格');
 
-  stdout.writeln('=== 7. 安装入口归位（仅自我更新） ===');
+  stdout.writeln('=== 7. 更新入口（自动检查，不再手动挑包） ===');
   final settingsTab = read('lib/ui/settings_tab.dart');
   check(!settingsTab.contains("_SectionTitle('应用安装'"), '设置页不再有安装开关区块');
-  check(settingsTab.contains('安装应用更新'), '关于区提供更新入口');
-  check(!projectFile('lib/ui/app_update_sheet.dart').existsSync(), '已移除中间的更新面板');
-  check(settingsTab.contains('ApkInstaller.pickAndInstall'), '关于页直接调起安装，无中间内容');
+  check(settingsTab.contains('检查更新'), '关于区提供检查更新入口');
+  check(!projectFile('lib/ui/app_update_sheet.dart').existsSync(), '已移除旧的更新面板');
+  check(settingsTab.contains('UpdateTile('), '更新入口是带状态的检查控件，不再直接调起安装');
 
   stdout.writeln('=== 8. 迷你小窗与提示框 ===');
   final appState = read('lib/state/app_state.dart');

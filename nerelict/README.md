@@ -258,7 +258,7 @@
 | 默认倍速 | 设置 → 播放 / Nerelict 播放器 | 1x | 播放器内也可临时调整并记住 |
 | 播放缓存上限 / 占用与清理 | 设置 → 播放 / Nerelict 播放器 | 256MB | 显示真实占用，可切换 64~1024MB 并一键清理 |
 | 屏幕常亮 | 设置 → 屏幕常亮 | 开 | 交由系统息屏策略，长时间任务可能因休眠中断 |
-| 应用内安装 APK | 设置 → 应用安装 | — | 静默不可用时回退系统安装器，需手动确认 |
+| 检查更新 / 应用内安装 APK | 设置 → 关于 → 检查更新 | — | 读本项目 GitHub Release 比对版本；6 小时内不重复请求，静默不可用时回退系统安装器 |
 | 多窗口浏览 | 浏览器首页标题栏的「窗口」图标，或更多 → 多窗口浏览 | 最多 5 个窗口 | 回到单窗口浏览，嗅探与下载仍在主界面进行 |
 | 全盘文件管理 | 文件页（默认） | 默认开启 | 递归扫描整个内部存储并分类；下载目录管理收进「更多」菜单 |
 
@@ -297,6 +297,12 @@
 - **MP4 转换**：Android 原生 `MediaExtractor` + `MediaMuxer` 无重编码转封装
   （`android/app/src/main/kotlin/.../Mp4Converter.kt`），通过 MethodChannel 调用；
   只搬运 H.264/HEVC + AAC 样本，不重新编码、不引入 FFmpeg。转换后可直接在应用内播放产物。
+- **检查更新**：设置 → 关于 → 检查更新，读本项目 GitHub Release 的 `releases/latest`，
+  比对 `tag_name` 与当前版本（三段按数字比，`0.4.9 < 0.4.10`），只取 `arm64` 的 `.apk` 附件。
+  匿名 API 每小时只有 60 次，所以 6 小时内复用上次结论（缓存落 prefs，界面会注明「N 小时前检查」），
+  用户想立刻重查时给一个「重新检查」入口。下载到应用缓存目录并按附件体积校验，缺一段自动重试一次；
+  授权「安装未知应用」后再次点击是「继续安装」，复用已下好的包，不重复拉 20 MB。
+  安装仍要求与旧版本同一 keystore，换过签名的包会被系统直接拒绝。
 
 ## 环境要求
 
@@ -354,6 +360,7 @@ dart run tool/verify_v042.dart   # 选流 / Cookie 鉴权 / 字节区间 / 断�
 dart run tool/verify_mp4_timeline.dart  # 转封装时间轴算法（B 帧网格重建）
 dart run tool/verify_p1.dart     # 临时目录清理与直链背压
 dart run tool/verify_p0.dart     # 重定向、直播标记、续传、If-Range
+dart run tool/verify_update.dart # 更新检查：版本比较 / tag 归一 / 节流窗口 / 缺 assets 降级
 ```
 
 装机后另可用 `dart run tool/smoke_device.dart` 跑真机冒烟：冷启动、底部三页切换、
@@ -369,6 +376,7 @@ lib/
   models/
     download_task.dart        任务状态机 + MP4 转换状态
     sniffed_media.dart        一条嗅探结果
+    release_info.dart         Release 投影 + 三段版本比较 + 节流判断（纯 Dart）
   services/
     sniffer_js.dart           注入 WebView 的 m3u8 嗅探脚本（自动 + 手动重扫）
     player_probe_js.dart      注入 WebView 的「可播放视频」探测 + 暂停网页视频
@@ -388,6 +396,7 @@ lib/
     hls_parser.dart           m3u8 解析（主列表/媒体列表/KEY/MAP/序列号）
     hls_downloader.dart       分片并发下载 + AES 解密 + 合并；直链视频下载
     mp4_converter.dart        MethodChannel 封装（convert / info）
+    release_feed.dart         更新源：GitHub Release 查询、6 小时节流缓存、APK 下载与体积校验
     local_media_scanner.dart  扫描下载目录（单层）与通用目录；下载目录来源封装
     storage_scanner.dart      递归扫描整个内部存储：深度/系统目录跳过、取消、上限截断（纯 Dart）
     file_kinds.dart           文件类型枚举 + 扩展名映射 + 文件头魔数嗅探 + LocalFile 快照（纯 Dart）
@@ -412,6 +421,7 @@ lib/
     history_page.dart         「全部历史」单页（多选 / 全选 / 批量删除）
     file_manager_sheet.dart   文件管理面板（信息 / 重命名 / 删除 / 多选批量删除，全盘与下载目录共用）
     settings_tab.dart         搜索/外观/视频播放/Nerelict 播放器/下载与转换 + 关于
+    update_sheet.dart         检查更新入口与更新弹层：说明 / 体积 / 下载进度 / 继续安装
     widgets/home_search_box.dart 首页搜索框（起始页与多窗口新标签页共用）
 android/app/src/main/kotlin/.../
   MainActivity.kt             MethodChannel: convert / info / pickDirectory / exportFile / player
