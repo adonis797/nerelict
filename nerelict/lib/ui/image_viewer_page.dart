@@ -133,6 +133,9 @@ class _ImagePageState extends State<_ImagePage> {
 
   @override
   Widget build(BuildContext context) {
+    // 按屏宽的 2 倍解码：4000×3000 的原图整张解出来要 48 MB，低端机上
+    // 连滑几张就会被系统杀掉；2 倍宽在 2.5 倍放大下仍然清晰。
+    final cacheWidth = (MediaQuery.sizeOf(context).width * 2).round();
     return GestureDetector(
       onTap: widget.onTap,
       // 双击放大 / 还原：单手看细节比双指更顺手
@@ -148,6 +151,7 @@ class _ImagePageState extends State<_ImagePage> {
             File(widget.file.path),
             fit: BoxFit.contain,
             gaplessPlayback: true,
+            cacheWidth: cacheWidth,
             filterQuality: FilterQuality.medium,
             errorBuilder: (context, error, stack) =>
                 _BrokenImage(name: widget.file.name),
