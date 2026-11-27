@@ -22,7 +22,7 @@ import 'widgets/app_menu.dart';
 class SettingsTab extends StatefulWidget {
   const SettingsTab({super.key});
 
-  static const String appVersion = '0.4.14';
+  static const String appVersion = '0.5.0';
 
   @override
   State<SettingsTab> createState() => _SettingsTabState();
