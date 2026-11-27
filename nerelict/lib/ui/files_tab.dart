@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../models/download_task.dart';
+import '../services/apk_installer.dart';
+import '../services/file_index.dart';
 import '../services/local_media_scanner.dart';
 import '../services/media_meta.dart';
 import '../services/media_probe.dart';
@@ -14,6 +16,7 @@ import '../state/app_state.dart';
 import 'app_theme.dart';
 import 'download_tasks_page.dart';
 import 'file_manager_sheet.dart';
+import 'image_viewer_page.dart';
 import 'mp4_convert_sheet.dart';
 
 /// 排序维度。`duration` 只对已探测过元数据的视频有意义，拿不到的排末尾。
@@ -60,15 +63,12 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
   bool _selecting = false;
   final Set<String> _selected = <String>{};
 
-  // ---- 全盘扫描状态 ----
-  List<LocalFile> _storageFiles = const <LocalFile>[];
-  bool _storageScanning = false;
-  bool _storageTruncated = false;
-  bool _storageIncomplete = false;
-  int _storageErrors = 0;
+  // ---- 全盘扫描：结果存在 FileIndex 里，页面切换不重扫 ----
+  final FileIndex _index = FileIndex.instance;
 
-  /// 扫描取消标记：新一轮扫描或页面销毁时置 true，旧扫描尽快退出
-  bool _scanCancelled = false;
+  /// 应用下载目录。它在 `Android/data/<包名>/files/` 下，全盘遍历会跳过，
+  /// 必须作为额外根补扫——否则「全部文件」里永远看不到自己下载的东西。
+  String _downloadDir = '';
 
   String? _externalRoot;
   bool _allFilesOk = false;
@@ -78,6 +78,8 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
     super.initState();
     _app = context.read<AppState>();
     _app.addBackInterceptor(_handleSystemBack);
+    _app.addListener(_onAppNotify);
+    _index.addListener(_onIndexChanged);
     WidgetsBinding.instance.addObserver(this);
     _refreshAccess();
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -88,12 +90,27 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
 
   @override
   void dispose() {
-    _scanCancelled = true;
+    _app.removeListener(_onAppNotify);
+    _index.removeListener(_onIndexChanged);
     _app.removeBackInterceptor(_handleSystemBack);
     WidgetsBinding.instance.removeObserver(this);
     _searchCtrl.dispose();
     _searchFocus.dispose();
     super.dispose();
+  }
+
+  void _onIndexChanged() {
+    if (mounted) setState(() {});
+  }
+
+  /// AppState 的通知很密（下载进度 8Hz），这里只做一次廉价的判断：
+  /// 切到「文件」页且索引确实过期时才发起扫描。
+  void _onAppNotify() {
+    if (_view != _FilesView.storage) return;
+    if (_app.tabIndex != 1) return;
+    if (_externalRoot == null) return;
+    if (!_index.needsScan || _index.scanning) return;
+    _ensureIndex();
   }
 
   /// 系统返回的优先级：退多选 → 退搜索 → 退筛选 → 退下载目录视图 → 交给 HomeScreen。
@@ -126,17 +143,23 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
   Future<void> _refreshAccess() async {
     final ok = await StorageAccess.hasAllFilesAccess();
     final root = ok ? await StorageAccess.externalRoot() : null;
+    final downloadDir = (await appDownloadDir()).path;
     if (!mounted) return;
-    if (ok != _allFilesOk || root != _externalRoot) {
+    final changed = ok != _allFilesOk || root != _externalRoot;
+    if (changed || downloadDir != _downloadDir) {
       setState(() {
         _allFilesOk = ok;
         _externalRoot = root;
+        _downloadDir = downloadDir;
       });
     }
-    // 默认视图是全盘；拿到权限且还没扫过时，自动开始第一次扫描
-    if (ok && _view == _FilesView.storage && _storageFiles.isEmpty) {
-      _startStorageScan();
+    if (!ok) {
+      // 权限被收回：旧结果不再可信，清掉等下次授权
+      _index.reset();
+      return;
     }
+    // 首次进入 / 权限刚拿到 / 索引过期：交给 FileIndex 判断要不要真扫
+    if (_view == _FilesView.storage) _ensureIndex();
   }
 
   Future<void> _requestAccess() async {
@@ -149,50 +172,46 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
     // 设置页回来后由 didChangeAppLifecycleState 重新检查
   }
 
-  /// 切换到全盘视图并（重新）开始扫描。
+  /// 触发一次索引刷新。[force] 为 true 时忽略 TTL（菜单里的「重新扫描」）。
+  ///
+  /// 没权限时退回只扫下载目录：至少自己的产物能看到，不至于整页空白。
+  Future<void> _ensureIndex({bool force = false}) async {
+    final root = _externalRoot;
+    if (root != null && root.isNotEmpty) {
+      await _index.ensureFresh(
+        root: root,
+        extraRoots: _downloadDir.isEmpty ? const <String>[] : <String>[_downloadDir],
+        force: force,
+      );
+      return;
+    }
+    if (_downloadDir.isNotEmpty) {
+      await _index.ensureFresh(
+        root: _downloadDir,
+        extraRoots: const <String>[],
+        force: force,
+      );
+    }
+  }
+
+  /// 切换到全盘视图。已有索引就直接显示，只有过期才在后台补一轮。
   void _switchToStorage() {
-    _scanCancelled = true;
     setState(() {
       _view = _FilesView.storage;
       _filter = null;
       _clearSelection();
     });
-    _startStorageScan();
+    _ensureIndex();
   }
 
   /// 切换到下载目录视图（菜单入口）。
   void _switchToDownloads() {
-    _scanCancelled = true;
     setState(() {
       _view = _FilesView.downloads;
       _filter = null;
       _clearSelection();
     });
     _app.refreshLocalFiles();
-  }
-
-  /// 启动一次全盘扫描：旧扫描通过取消标记尽快退出，只有最新一轮写结果。
-  Future<void> _startStorageScan() async {
-    final root = _externalRoot;
-    if (root == null) return;
-    _scanCancelled = false;
-    setState(() {
-      _storageScanning = true;
-      _storageTruncated = false;
-      _storageIncomplete = false;
-    });
-    final result = await scanAllStorage(
-      root: root,
-      cancel: () => _scanCancelled,
-    );
-    if (!mounted || _scanCancelled) return;
-    setState(() {
-      _storageFiles = result.files;
-      _storageScanning = false;
-      _storageTruncated = result.truncated;
-      _storageIncomplete = !result.complete;
-      _storageErrors = result.errors;
-    });
   }
 
   Future<void> _loadResume() async {
@@ -206,29 +225,13 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
     _loadResume();
   }
 
-  /// 面板里改名 / 删除后，就地更新全盘列表里的那一条。
+  /// 面板里改名 / 删除后，就地更新索引里的那一条。
   ///
   /// 不重扫整个存储：真机上一次全盘扫描要几秒，改个文件名不该等它；
   /// 更早的条目已经不可信时，菜单里的「重新扫描」随时可以拉一次准确的。
   void _applyMoved(String from, String? to) {
     if (_view != _FilesView.storage) return;
-    final index = _storageFiles.indexWhere((f) => f.path == from);
-    if (index < 0) return;
-    final next = _storageFiles.toList();
-    if (to == null) {
-      next.removeAt(index);
-    } else {
-      final old = next[index];
-      final name = to.split(Platform.pathSeparator).last;
-      next[index] = LocalFile(
-        path: to,
-        name: name,
-        size: old.size,
-        modifiedAt: old.modifiedAt,
-        kind: LocalFile.kindOf(name),
-      );
-    }
-    setState(() => _storageFiles = next);
+    _index.applyMove(from, to);
   }
 
   void _clearSelection() {
@@ -258,7 +261,7 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
     );
   }
 
-  /// 点行的默认动作：视频直接播放，其它文件进文件管理面板。
+  /// 点行的默认动作：视频播放、图片看图、安装包装机，其余进文件管理面板。
   ///
   /// 全盘视图与下载目录共用同一套写操作：重命名与删除走 `AppState` 的统一方法，
   /// 删除先落回收站（并记下原目录），误删仍可撤销。
@@ -271,7 +274,110 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
       _app.openPlayer(url: file.path, title: file.title, local: true);
       return;
     }
-    _manageFiles(<String>[file.path]);
+    switch (file.kind) {
+      case LocalFileKind.image:
+        _openImage(file);
+        return;
+      case LocalFileKind.apk:
+        _installApk(file);
+        return;
+      default:
+        _manageFiles(<String>[file.path]);
+    }
+  }
+
+  /// 打开看图页：只把同一批图片传进去，左右滑动就有了上下文。
+  void _openImage(LocalFile file) {
+    final all = _view == _FilesView.storage ? _index.files : _app.localFiles;
+    final images = _visibleFiles(all)
+        .where((f) => f.kind == LocalFileKind.image && !f.isDir)
+        .toList();
+    if (images.isEmpty) {
+      _manageFiles(<String>[file.path]);
+      return;
+    }
+    final at = images.indexWhere((f) => f.path == file.path);
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ImageViewerPage(
+          files: images,
+          initialIndex: at < 0 ? 0 : at,
+        ),
+      ),
+    );
+  }
+
+  /// 点安装包：先确认再装。走原生 `ApkInstaller`——能静默就静默，
+  /// 否则复制到 `cache/shared` 用 FileProvider 拉起系统安装器。
+  Future<void> _installApk(LocalFile file) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('安装应用？', style: TextStyle(fontSize: 16)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(file.name, style: const TextStyle(fontSize: 13)),
+            const SizedBox(height: 6),
+            Text(
+              '${file.sizeText} · 安装前请确认来源可信',
+              style: const TextStyle(fontSize: 12),
+            ),
+          ],
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('安装'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    _app.showToast('正在准备安装包…');
+    final result = await ApkInstaller.install(file.path);
+    if (!mounted) return;
+    if (result.ok) {
+      _app.showHint(
+        result.silent ? result.message : '已打开系统安装器，请点「安装」确认',
+      );
+      return;
+    }
+    await _showInstallFailure(result);
+  }
+
+  Future<void> _showInstallFailure(InstallResult result) async {
+    final needsGrant = result.mode == 'system' &&
+        result.message.contains('授权');
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('安装没有开始', style: TextStyle(fontSize: 16)),
+        content: Text(
+          result.message.isEmpty ? '系统拒绝了这次安装' : result.message,
+          style: const TextStyle(fontSize: 12.5),
+        ),
+        actions: <Widget>[
+          if (needsGrant)
+            TextButton(
+              onPressed: () {
+                Navigator.of(ctx).pop();
+                ApkInstaller.openUnknownSourcesSettings();
+              },
+              child: const Text('去授权'),
+            ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
   }
 
   /// 打开文件管理面板，并把面板里的改名 / 删除回写到当前列表。
@@ -389,6 +495,21 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
     );
   }
 
+  /// 行菜单首项的图标与文案随类型走：视频播、图片看、安装包装。
+  IconData _primaryIcon(LocalFile file) => switch (file.kind) {
+        LocalFileKind.video => Icons.play_circle_outline,
+        LocalFileKind.image => Icons.image_outlined,
+        LocalFileKind.apk => Icons.android,
+        _ => Icons.info_outline,
+      };
+
+  String _primaryLabel(LocalFile file) => switch (file.kind) {
+        LocalFileKind.video => file.isPlaylist ? '文件信息' : '用 Nerelict 播放',
+        LocalFileKind.image => '查看图片',
+        LocalFileKind.apk => '安装',
+        _ => '文件信息',
+      };
+
   /// 行尾 `⋮`：所有管理动作集中在这里，列表本身不摊按钮。
   Future<void> _showRowMenu(LocalFile file) async {
     final p = paletteOf(context);
@@ -402,12 +523,9 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
             ListTile(
-              leading: Icon(
-                file.isPlayable ? Icons.play_circle_outline : Icons.info_outline,
-                size: 20,
-              ),
+              leading: Icon(_primaryIcon(file), size: 20),
               title: Text(
-                file.isPlayable ? '用 Nerelict 播放' : '文件信息',
+                _primaryLabel(file),
                 style: const TextStyle(fontSize: 13.5),
               ),
               onTap: () {
@@ -553,8 +671,9 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
             ));
     final p = paletteOf(context);
     final isStorage = _view == _FilesView.storage;
-    final files = isStorage ? _storageFiles : state.localFiles;
+    final files = isStorage ? _index.files : state.localFiles;
     final visible = _visibleFiles(files);
+    final scanning = isStorage && _index.scanning;
 
     // 缓存只为仍然存在的文件保留，避免删改后越积越多
     MediaProbe.instance.retainOnly(files.map((f) => f.path).toSet());
@@ -571,10 +690,18 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
         children: <Widget>[
           // 横幅自己订阅进度：只有这一小块按 8Hz 重建，列表不受影响
           if (anyActive) _ActiveDownloadsBanner(p: p, onOpen: _openDownloads),
+          // 扫描有缓存结果时只留一条 2px 进度线：列表照常可看可点，
+          // 不再整屏转圈——这是「后台扫」的观感来源
+          if (scanning && files.isNotEmpty)
+            LinearProgressIndicator(
+              minHeight: 2,
+              backgroundColor: p.border,
+              color: p.accent,
+            ),
           if (!isStorage && lastScanIncomplete) _ScanIncompleteBanner(p: p),
-          if (isStorage && _storageIncomplete)
-            _StorageIncompleteBanner(p: p, errors: _storageErrors),
-          if (isStorage && _storageTruncated)
+          if (isStorage && _index.incomplete)
+            _StorageIncompleteBanner(p: p, errors: _index.errors),
+          if (isStorage && _index.truncated)
             _StorageTruncatedBanner(p: p),
           _SearchField(
             controller: _searchCtrl,
@@ -608,7 +735,7 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
             p: p,
           ),
           Expanded(
-            child: isStorage && _storageScanning
+            child: scanning && files.isEmpty
                 ? Center(
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
@@ -715,7 +842,7 @@ class _FilesTabState extends State<FilesTab> with WidgetsBindingObserver {
                 break;
               case 'scan':
                 if (isStorage) {
-                  _startStorageScan();
+                  _ensureIndex(force: true);
                 } else {
                   state.refreshLocalFiles();
                   _loadResume();

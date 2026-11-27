@@ -27,6 +27,7 @@ import '../services/cookie_store.dart';
 import '../services/local_media_scanner.dart';
 import '../services/mp4_converter.dart';
 import '../services/network_status.dart';
+import '../services/file_index.dart';
 import '../services/playback_memory.dart';
 import '../services/resource_aggregator.dart';
 import '../services/storage_service.dart';
@@ -407,7 +408,11 @@ class AppState extends ChangeNotifier {
 
   bool _trashPurged = false;
 
-  Future<void> refreshLocalFiles() async {
+  Future<void> refreshLocalFiles({bool filesChanged = false}) async {
+    // 下载完成、改名、删除这类真改了磁盘的操作，把全盘索引标记为过期：
+    // 下次进「全部文件」会重扫一次，而不是等到 10 分钟的 TTL 兜底。
+    // 单纯切视图调用时不要置脏——那会变成「每次切页都重扫」。
+    if (filesChanged) FileIndex.instance.markDirty();
     // 每次进程生命周期里清一次过期回收站：删除先落 .trash，保留 7 天
     if (!_trashPurged) {
       _trashPurged = true;
@@ -449,7 +454,7 @@ class AppState extends ChangeNotifier {
     }
     await _syncFileSideStores(path, next);
     _closePlayerIfPlaying(path);
-    await refreshLocalFiles();
+    await refreshLocalFiles(filesChanged: true);
     _persistNow();
     return next;
   }
@@ -508,7 +513,7 @@ class AppState extends ChangeNotifier {
       await _syncFileSideStores(path, null);
       _closePlayerIfPlaying(path);
     }
-    await refreshLocalFiles();
+    await refreshLocalFiles(filesChanged: true);
     _persistNow();
     if (firstError != null) throw firstError;
     return trashed;
@@ -521,7 +526,7 @@ class AppState extends ChangeNotifier {
       final back = await FileTrash.restore(path);
       if (back != null) restored++;
     }
-    if (restored > 0) await refreshLocalFiles();
+    if (restored > 0) await refreshLocalFiles(filesChanged: true);
     return restored;
   }
 
@@ -953,7 +958,7 @@ class AppState extends ChangeNotifier {
         if (task.detached) return;
         await _exportIfNeeded(task);
         if (task.detached) return;
-        await refreshLocalFiles();
+        await refreshLocalFiles(filesChanged: true);
       }
     } finally {
       _running.remove(task.id);
@@ -1166,7 +1171,7 @@ class AppState extends ChangeNotifier {
       }
       await _exportIfNeeded(task, path: path);
       if (task.detached) return;
-      await refreshLocalFiles();
+      await refreshLocalFiles(filesChanged: true);
       if (task.detached) return;
       if (automatic) {
         showHint(deleteSource ? '已自动转换为 MP4，源文件已清理' : '已自动转换为 MP4');
@@ -1211,7 +1216,7 @@ class AppState extends ChangeNotifier {
         if (deleteSource) task.filePath = null;
       }
     }
-    await refreshLocalFiles();
+    await refreshLocalFiles(filesChanged: true);
     notifyListeners();
     _persistNow();
     return out;

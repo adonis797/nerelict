@@ -208,13 +208,13 @@ void main() {
 
   stdout.writeln('=== 9. 版本号与二级设置 ===');
   final pubspec = read('pubspec.yaml');
-  check(pubspec.contains('version: 0.5.0+35'), 'pubspec 基础版本为 0.5.0 / code 35');
+  check(pubspec.contains('version: 0.5.1+36'), 'pubspec 基础版本为 0.5.1 / code 36');
   final gradle = read('android/app/build.gradle.kts');
   check(gradle.contains('versionName = flutter.versionName'),
       '展示版本统一取 pubspec 三段版本');
   check(!gradle.contains('versionName = "0.3.9.0"'), '不再覆盖第四段展示版本');
   final settingsFile = read('lib/ui/settings_tab.dart');
-  check(settingsFile.contains("appVersion = '0.5.0'"), '设置页版本为 0.5.0');
+  check(settingsFile.contains("appVersion = '0.5.1'"), '设置页版本为 0.5.1');
   check(read('README.md').contains('v0.4.4'), 'README 版本号已同步');
   check(settingsFile.contains('_CategoryTile'), '设置改为分类入口');
   check(settingsFile.contains('_SettingsPage'), '存在二级设置页');
@@ -481,7 +481,7 @@ void main() {
 
   stdout.writeln('=== 23. 发版护栏、品牌命名与 0.4.1 资源 ===');
   // 已正式发布的最高 versionCode；每次 Release 后上调，防止忘记 +1 或复用旧码
-  const int publishedVersionCode = 34;
+  const int publishedVersionCode = 35;
   final pubspecText = read('pubspec.yaml');
   final settingsText = read('lib/ui/settings_tab.dart');
   final gradleText = read('android/app/build.gradle.kts');
@@ -492,7 +492,7 @@ void main() {
       .firstMatch(pubspecText);
   final semver = versionLine?.group(1) ?? '';
   final currentCode = int.tryParse(versionLine?.group(2) ?? '') ?? 0;
-  check(semver == '0.5.0', '当前展示版本为 0.5.0');
+  check(semver == '0.5.1', '当前展示版本为 0.5.1');
   check(currentCode > publishedVersionCode,
       'versionCode $currentCode 严格大于已发布最高值 $publishedVersionCode');
   check(settingsText.contains("appVersion = '$semver'"),
@@ -973,7 +973,8 @@ void main() {
   final files37 = read('lib/ui/files_tab.dart');
   check(files37.contains('_switchToStorage') && files37.contains('_switchToDownloads'),
       '全盘视图与下载目录视图之间可切换');
-  check(files37.contains('scanAllStorage'), '全盘视图走递归扫描器');
+  check(files37.contains('FileIndex') && files37.contains('_ensureIndex'),
+      '全盘视图走常驻索引，切页不再重扫');
   check(files37.contains('_AccessCard') && files37.contains('_requestAccess'),
       '未授权时给出引导卡');
   check(files37.contains('didChangeAppLifecycleState'),
@@ -997,6 +998,43 @@ void main() {
   final tabIdx = main37.indexOf('state.setTab(0)');
   check(backIdx > 0 && tabIdx > 0 && backIdx < tabIdx,
       '返回键先问页面状态，再退回浏览器标签');
+
+  stdout.writeln('=== 39. 文件索引：补扫下载目录 / 看图 / 装机 ===');
+  final scanner39 = read('lib/services/storage_scanner.dart');
+  check(scanner39.contains('extraRoots'), '全盘扫描支持额外根（应用下载目录在 Android/ 下）');
+  check(scanner39.contains('ctx.seen'), '主根与额外根重叠时按路径去重');
+  check(scanner39.contains('onChunk') && scanner39.contains('kScanChunkIntervalMs'),
+      '扫描过程中按节流推送增量结果');
+  check(scanner39.contains('depth: 1, includeNoise: includeNoise);'),
+      '额外根从 depth 1 起算，不被 .nomedia 规则误杀');
+  final index39 = read('lib/services/file_index.dart');
+  check(index39.contains('Duration ttl') && index39.contains('needsScan'),
+      '索引按 TTL 与 dirty 判断要不要重扫');
+  check(index39.contains('markDirty'), '文件变更可主动置脏');
+  check(index39.contains('applyMove'), '改名 / 删除就地回写，不触发重扫');
+  check(index39.contains('_inflight'), '同一时刻只跑一轮扫描（单飞）');
+  check(files37.contains('extraRoots:'), '下载目录作为额外根参与全盘扫描');
+  check(files37.contains('appDownloadDir'), '额外根取自应用自己的产物目录');
+  check(files37.contains('if (scanning && files.isNotEmpty)'),
+      '有缓存时只显示细进度条，不整屏转圈');
+  check(!files37.contains('_storageScanning'), '页面不再自己持有扫描状态');
+  check(files37.contains("_app.addListener(_onAppNotify)"),
+      '切回文件页时才按需触发刷新');
+  final viewer39 = read('lib/ui/image_viewer_page.dart');
+  check(viewer39.contains('PageView') && viewer39.contains('InteractiveViewer'),
+      '图片可左右翻页与双指缩放');
+  check(viewer39.contains('NeverScrollableScrollPhysics'),
+      '放大后禁用翻页手势，避免「想平移却翻页」');
+  check(viewer39.contains('getMaxScaleOnAxis'), '缩放倍数从变换矩阵读，不用手势累积值');
+  check(files37.contains('ImageViewerPage'), '点图片进看图页');
+  check(files37.contains('ApkInstaller.install'), '点安装包走原生安装通道');
+  check(files37.contains('openUnknownSourcesSettings'), '未授权时能给出去授权入口');
+  final state39 = read('lib/state/app_state.dart');
+  check(state39.contains('filesChanged: true'), '下载完成 / 改名 / 删除后把索引置脏');
+  check(state39.contains('refreshLocalFiles({bool filesChanged = false})'),
+      '单纯切视图不置脏，避免「每次切页都重扫」');
+  check(projectFile('tool/verify_files.dart').existsSync(),
+      '提供可运行的索引行为测试');
 
   // 通行证是 HttpOnly，只能让 WebView 自己发一次请求，读它的真实出站头。
   stdout.writeln('=== 38. WebView 代取通行证 ===');

@@ -39,10 +39,14 @@ class StorageScanResult {
 
 /// 递归扫描时的上下文：可取消标记、深度与计数。
 class _ScanContext {
-  _ScanContext({required this.cancel});
+  _ScanContext({required this.cancel, this.onChunk});
 
   /// 返回 true 表示要中止扫描
   final bool Function() cancel;
+
+  /// 增量回调：扫描过程中把「到目前为止的结果」交出去，界面可以先显示
+  /// 已扫到的部分，而不是等整轮结束。按 [kScanChunkIntervalMs] 节流。
+  final void Function(List<LocalFile> partial)? onChunk;
 
   /// 已进入的目录计数
   int dirs = 0;
@@ -61,7 +65,27 @@ class _ScanContext {
 
   /// 是否被取消
   bool cancelled = false;
+
+  /// 已收录的路径：主根与额外根可能重叠（下载目录既在存储里、
+  /// 又被单独加入），靠它保证同一个文件只出现一次。
+  final Set<String> seen = <String>{};
+
+  int _lastEmit = 0;
+
+  /// 把当前结果按节流频率交给调用方。
+  void emit(List<LocalFile> out) {
+    final cb = onChunk;
+    if (cb == null || out.isEmpty) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastEmit < kScanChunkIntervalMs) return;
+    _lastEmit = now;
+    cb(List<LocalFile>.of(out));
+  }
 }
+
+/// 增量结果的推送间隔。太密会让列表反复重排（几千条排序并不便宜），
+/// 太疏又看不出进展；400ms 大约每秒 2.5 次，视觉上像「慢慢填满」。
+const int kScanChunkIntervalMs = 400;
 
 /// 全盘递归扫描的默认上限。
 ///
@@ -119,6 +143,14 @@ const List<String> kStoragePriorityDirs = <String>[
 /// [includeNoise] 为 true 时关闭「缓存目录 / 分片」过滤，把原始文件也列出来，
 /// 供用户排查「我的文件怎么不见了」；默认 false。
 ///
+/// [extraRoots] 是**额外要扫的目录**，通常传本应用的下载目录。
+/// 它在 `Android/data/<包名>/files/` 下面，而 [kStorageSkipDirs] 会把
+/// `Android` 整个跳过（普通应用也读不到别人的私有目录），所以下载成品
+/// 在「全部文件」里一直是隐形的。这里显式补扫，并在结果里按路径去重。
+///
+/// [onChunk] 见 [_ScanContext.onChunk]：扫描过程中的增量结果，可用来
+/// 渐进填充界面。
+///
 /// 设计约束：
 /// - **异步分批**：每枚举一个目录就 `await` 一次，把控制权交还事件循环，
 ///   避免长时间占用 isolate 让 UI 掉帧；
@@ -132,15 +164,31 @@ Future<StorageScanResult> scanAllStorage({
   required String root,
   bool Function()? cancel,
   bool includeNoise = false,
+  List<String> extraRoots = const <String>[],
+  void Function(List<LocalFile> partial)? onChunk,
 }) async {
-  if (root.isEmpty) {
+  if (root.isEmpty && extraRoots.isEmpty) {
     return const StorageScanResult(
         files: [], complete: false, truncated: false, errors: 1);
   }
-  final ctx = _ScanContext(cancel: cancel ?? (() => false));
+  final ctx = _ScanContext(cancel: cancel ?? (() => false), onChunk: onChunk);
   final files = <LocalFile>[];
 
-  await _walk(Directory(root), files, ctx, depth: 1, includeNoise: includeNoise);
+  if (root.isNotEmpty) {
+    await _walk(Directory(root), files, ctx,
+        depth: 1, includeNoise: includeNoise);
+  }
+
+  // 额外根（应用自己的下载目录）单独走一遍：跳过规则里的 `Android`
+  // 只该拦住系统遍历，不该把本应用的产物一起挡在外面。
+  for (final extra in extraRoots) {
+    if (extra.isEmpty || ctx.cancelled) continue;
+    if (ctx.files >= kStorageScanMaxFiles) break;
+    final dir = Directory(extra);
+    if (!await dir.exists()) continue;
+    // 从 depth 1 起算：这样 `.nomedia` 检查不会作用在这个目录本身
+    await _walk(dir, files, ctx, depth: 1, includeNoise: includeNoise);
+  }
 
   return StorageScanResult(
     files: files,
@@ -231,6 +279,8 @@ Future<void> _walk(
     try {
       final stat = await file.stat();
       if (stat.size <= 0) continue;
+      // 主根与额外根可能覆盖同一路径：同一个文件只收一次
+      if (!ctx.seen.add(file.path)) continue;
       var kind = kindOfName(itemName);
       // 无扩展名或未知扩展名时读文件头魔数，把识别做准
       if (kind == LocalFileKind.other) {
@@ -249,6 +299,9 @@ Future<void> _walk(
       ctx.errors++;
     }
   }
+
+  // 目录处理完就交一次进度：界面能边扫边显示，用户不必盯着转圈
+  ctx.emit(out);
 
   // 用户目录优先：先扫 Download / DCIM / Movies 这些，冷门目录放到后面，
   // 这样即使真的撞上文件数上限，被截掉的也是最不可能是用户要找的东西。
